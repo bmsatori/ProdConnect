@@ -6,13 +6,35 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		2B13ADA02F3EDD54000099A9 /* FirebaseAuth in Frameworks */ = {isa = PBXBuildFile; productRef = 2B13AD9F2F3EDD54000099A9 /* FirebaseAuth */; };
+		2B13ADA22F3EDD59000099A9 /* FirebaseCore in Frameworks */ = {isa = PBXBuildFile; productRef = 2B13ADA12F3EDD59000099A9 /* FirebaseCore */; };
+		2B13ADA42F3EDD61000099A9 /* FirebaseStorage in Frameworks */ = {isa = PBXBuildFile; productRef = 2B13ADA32F3EDD61000099A9 /* FirebaseStorage */; };
+		2B13ADA62F3EDD77000099A9 /* FirebaseFirestore in Frameworks */ = {isa = PBXBuildFile; productRef = 2B13ADA52F3EDD77000099A9 /* FirebaseFirestore */; };
+		2B4DBBC02F2BF84900054E3F /* OneSignalFramework in Frameworks */ = {isa = PBXBuildFile; productRef = 2B4DBBBF2F2BF84900054E3F /* OneSignalFramework */; };
+		2B7E1A2F3C1F0A1100000001 /* ZIPFoundation in Frameworks */ = {isa = PBXBuildFile; productRef = 2B7E1A2F3C1F0A1100000002 /* ZIPFoundation */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		2BB0629A2EABF1CD008325B6 /* ProdConnect.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ProdConnect.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		2B550B372F3D6112006B8B3B /* Exceptions for "ProdConnect" folder in "ProdConnect" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				"GoogleService-Info (2).plist",
+			);
+			target = 2BB062992EABF1CD008325B6 /* ProdConnect */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		2BB0629C2EABF1CD008325B6 /* ProdConnect */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				2B550B372F3D6112006B8B3B /* Exceptions for "ProdConnect" folder in "ProdConnect" target */,
+			);
 			path = ProdConnect;
 			sourceTree = "<group>";
 		};
@@ -23,16 +45,30 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				2B4DBBC02F2BF84900054E3F /* OneSignalFramework in Frameworks */,
+				2B13ADA02F3EDD54000099A9 /* FirebaseAuth in Frameworks */,
+				2B13ADA22F3EDD59000099A9 /* FirebaseCore in Frameworks */,
+				2B13ADA42F3EDD61000099A9 /* FirebaseStorage in Frameworks */,
+				2B7E1A2F3C1F0A1100000001 /* ZIPFoundation in Frameworks */,
+				2B13ADA62F3EDD77000099A9 /* FirebaseFirestore in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		2B9664882F2710020001CCAE /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
 		2BB062912EABF1CD008325B6 = {
 			isa = PBXGroup;
 			children = (
 				2BB0629C2EABF1CD008325B6 /* ProdConnect */,
+				2B9664882F2710020001CCAE /* Frameworks */,
 				2BB0629B2EABF1CD008325B6 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -65,6 +101,12 @@
 			);
 			name = ProdConnect;
 			packageProductDependencies = (
+				2B4DBBBF2F2BF84900054E3F /* OneSignalFramework */,
+				2B7E1A2F3C1F0A1100000002 /* ZIPFoundation */,
+				2B13AD9F2F3EDD54000099A9 /* FirebaseAuth */,
+				2B13ADA12F3EDD59000099A9 /* FirebaseCore */,
+				2B13ADA32F3EDD61000099A9 /* FirebaseStorage */,
+				2B13ADA52F3EDD77000099A9 /* FirebaseFirestore */,
 			);
 			productName = ProdConnect;
 			productReference = 2BB0629A2EABF1CD008325B6 /* ProdConnect.app */;
@@ -77,8 +119,8 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
-				LastSwiftUpdateCheck = 2600;
-				LastUpgradeCheck = 2600;
+				LastSwiftUpdateCheck = 2620;
+				LastUpgradeCheck = 2620;
 				TargetAttributes = {
 					2BB062992EABF1CD008325B6 = {
 						CreatedOnToolsVersion = 26.0.1;
@@ -94,6 +136,11 @@
 			);
 			mainGroup = 2BB062912EABF1CD008325B6;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				2B4DBBBE2F2BF84900054E3F /* XCRemoteSwiftPackageReference "OneSignal-XCFramework" */,
+				2B7E1A2F3C1F0A1100000003 /* XCRemoteSwiftPackageReference "ZIPFoundation" */,
+				2B10F7752F3ECA32005857B8 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 2BB0629B2EABF1CD008325B6 /* Products */;
 			projectDirPath = "";
@@ -160,6 +207,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = QYP325K4J2;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -183,6 +231,7 @@
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
@@ -223,6 +272,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = QYP325K4J2;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -239,6 +289,7 @@
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				VALIDATE_PRODUCT = YES;
 			};
@@ -249,20 +300,23 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = ProdConnect/ProdConnect.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 5;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.6;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.0.2;
 				PRODUCT_BUNDLE_IDENTIFIER = Timer.ProdConnect;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -280,20 +334,23 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = ProdConnect/ProdConnect.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 5;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.6;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.0.2;
 				PRODUCT_BUNDLE_IDENTIFIER = Timer.ProdConnect;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -328,6 +385,66 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		2B10F7752F3ECA32005857B8 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/firebase/firebase-ios-sdk";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 12.9.0;
+			};
+		};
+		2B4DBBBE2F2BF84900054E3F /* XCRemoteSwiftPackageReference "OneSignal-XCFramework" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/OneSignal/OneSignal-XCFramework";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 5.4.0;
+			};
+		};
+		2B7E1A2F3C1F0A1100000003 /* XCRemoteSwiftPackageReference "ZIPFoundation" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/weichsel/ZIPFoundation";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.9.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		2B13AD9F2F3EDD54000099A9 /* FirebaseAuth */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 2B10F7752F3ECA32005857B8 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
+			productName = FirebaseAuth;
+		};
+		2B13ADA12F3EDD59000099A9 /* FirebaseCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 2B10F7752F3ECA32005857B8 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
+			productName = FirebaseCore;
+		};
+		2B13ADA32F3EDD61000099A9 /* FirebaseStorage */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 2B10F7752F3ECA32005857B8 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
+			productName = FirebaseStorage;
+		};
+		2B13ADA52F3EDD77000099A9 /* FirebaseFirestore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 2B10F7752F3ECA32005857B8 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
+			productName = FirebaseFirestore;
+		};
+		2B4DBBBF2F2BF84900054E3F /* OneSignalFramework */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 2B4DBBBE2F2BF84900054E3F /* XCRemoteSwiftPackageReference "OneSignal-XCFramework" */;
+			productName = OneSignalFramework;
+		};
+		2B7E1A2F3C1F0A1100000002 /* ZIPFoundation */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 2B7E1A2F3C1F0A1100000003 /* XCRemoteSwiftPackageReference "ZIPFoundation" */;
+			productName = ZIPFoundation;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 2BB062922EABF1CD008325B6 /* Project object */;
 }

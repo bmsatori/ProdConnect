@@ -1,0 +1,86 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isAdmin == true;
+    }
+
+    match /users/{userId} {
+      allow read: if isAdmin() || (isSignedIn() && request.auth.uid == userId)
+        || (isSignedIn() && resource.data.teamCode == getUserTeamCode())
+        || (isSignedIn() && resource.data.teamCode != null && normalizedTeamCode() != null
+            && resource.data.teamCode.lower() == normalizedTeamCode());
+      allow create: if isSignedIn() && request.auth.uid == userId;
+      allow update: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
+      allow delete: if isAdmin();
+    }
+
+    match /invites/{inviteId} {
+      allow read, create, update, delete: if isAdmin();
+    }
+
+    function getUserTeamCode() {
+      return isSignedIn() ?
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.teamCode : null;
+    }
+
+    function normalizedTeamCode() {
+      return getUserTeamCode() != null ? getUserTeamCode().lower() : null;
+    }
+
+    function belongsToUserTeam() {
+      return isSignedIn() && resource.data.teamCode == getUserTeamCode()
+        || (isSignedIn() && resource.data.teamCode != null && normalizedTeamCode() != null
+            && resource.data.teamCode.lower() == normalizedTeamCode());
+    }
+
+    match /teams/{teamId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+      
+      match /locations/{locationId} {
+        allow read, write: if isSignedIn() && teamId == getUserTeamCode();
+      }
+      
+      match /rooms/{roomId} {
+        allow read, write: if isSignedIn() && teamId == getUserTeamCode();
+      }
+    }
+
+    match /lessons/{lessonId} {
+      allow read, write: if belongsToUserTeam();
+      allow create: if isSignedIn() && request.resource.data.teamCode == getUserTeamCode();
+    }
+
+    match /checklists/{checklistId} {
+      allow read, write: if belongsToUserTeam();
+      allow create: if isSignedIn() && request.resource.data.teamCode == getUserTeamCode();
+    }
+
+    match /ideas/{ideaId} {
+      allow read, write: if belongsToUserTeam();
+      allow create: if isSignedIn() && request.resource.data.teamCode == getUserTeamCode();
+    }
+
+    match /channels/{channelId} {
+      allow read, write: if belongsToUserTeam();
+      allow create: if isSignedIn() && request.resource.data.teamCode == getUserTeamCode();
+    }
+
+    match /gear/{gearId} {
+      allow read, write: if belongsToUserTeam();
+      allow create: if isSignedIn() && request.resource.data.teamCode == getUserTeamCode();
+    }
+
+    match /patchsheet/{patchId} {
+      allow read, write: if belongsToUserTeam();
+      allow create: if isSignedIn() && request.resource.data.teamCode == getUserTeamCode();
+    }
+  }
+}
