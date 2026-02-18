@@ -2929,6 +2929,7 @@ struct LoginView: View {
     @State private var authAttemptID = UUID()
     @State private var showPasswordReset = false
     @State private var resetEmail = ""
+    @State private var autoLoginAttempted = false
 
     var body: some View {
         NavigationStack {
@@ -3022,6 +3023,18 @@ struct LoginView: View {
             } message: {
                 Text("Enter your email address to receive a password reset link.")
             }
+            .onAppear {
+                guard !autoLoginAttempted else { return }
+                autoLoginAttempted = true
+
+                let savedEmail = KeychainHelper.shared.read(for: "prodconnect_email") ?? ""
+                let savedPassword = KeychainHelper.shared.read(for: "prodconnect_password") ?? ""
+                guard !savedEmail.isEmpty, !savedPassword.isEmpty else { return }
+
+                email = savedEmail
+                password = savedPassword
+                submitAuth()
+            }
         }
     }
 
@@ -3080,6 +3093,8 @@ struct LoginView: View {
                 isAuthenticating = false
                 switch result {
                 case .success:
+                    KeychainHelper.shared.save(cleanEmail, for: "prodconnect_email")
+                    KeychainHelper.shared.save(cleanPassword, for: "prodconnect_password")
                     if store.user == nil {
                         errorMessage = "Signed in, but profile did not load. Please try again."
                     }
@@ -3128,7 +3143,7 @@ struct AccountView: View {
         return version.isEmpty ? "" : "v\(version)"
     }
 
-    private let actionButtonHeight: CGFloat = 48
+    private let actionButtonHeight: CGFloat = 40
     private let termsURLString = "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/"
     // Replace with your app's public privacy policy URL before App Store submission.
     private let privacyPolicyURLString = "https://bmsatori.github.io/prodconnect-privacy/"
@@ -3216,29 +3231,29 @@ struct AccountView: View {
                     Spacer()
                     
                     if store.user?.subscriptionTier == "free" {
-                        HStack(spacing: 12) {
+                        HStack(spacing: 8) {
                             Button(action: {
                                 showJoinTeamAlert = true
                             }) {
                                 Text("Join Team")
-                                    .fontWeight(.bold)
+                                    .font(.subheadline.weight(.semibold))
                                     .frame(maxWidth: .infinity)
-                                    .padding()
+                                    .frame(height: actionButtonHeight)
                                     .background(Color.green)
                                     .foregroundColor(.white)
-                                    .cornerRadius(12)
+                                    .cornerRadius(10)
                             }
                             
                             Button(action: {
                                 showSubscriptionOptions = true
                             }) {
                                 Text("Subscribe")
-                                    .fontWeight(.bold)
+                                    .font(.subheadline.weight(.semibold))
                                     .frame(maxWidth: .infinity)
-                                    .padding()
+                                    .frame(height: actionButtonHeight)
                                     .background(Color.blue)
                                     .foregroundColor(.white)
-                                    .cornerRadius(12)
+                                    .cornerRadius(10)
                             }
                         }
                         .padding(.horizontal)
@@ -3247,50 +3262,47 @@ struct AccountView: View {
                             showSubscriptionOptions = true
                         }) {
                             Text("Upgrade Subscription")
-                                .fontWeight(.bold)
+                                .font(.subheadline.weight(.semibold))
                                 .frame(maxWidth: .infinity)
-                                .padding()
+                                .frame(height: actionButtonHeight)
                                 .background(Color.blue)
                                 .foregroundColor(.white)
-                                .cornerRadius(12)
+                                .cornerRadius(10)
                         }
                         .padding(.horizontal)
                     }
 
-                    HStack(spacing: 12) {
+                    HStack(spacing: 8) {
                         Button(action: { showEditAccount = true }) {
                             Text("Edit Account")
-                                .fontWeight(.bold)
+                                .font(.subheadline.weight(.semibold))
                                 .frame(maxWidth: .infinity)
                                 .frame(height: actionButtonHeight)
-                                .padding()
                                 .background(Color.blue.opacity(0.7))
                                 .foregroundColor(.white)
-                                .cornerRadius(12)
+                                .cornerRadius(10)
                         }
 
                         NavigationLink {
                             ContactView()
                         } label: {
                             Text("Support")
-                                .fontWeight(.bold)
+                                .font(.subheadline.weight(.semibold))
                                 .frame(maxWidth: .infinity)
                                 .frame(height: actionButtonHeight)
-                                .padding()
                                 .background(Color.gray.opacity(0.25))
                                 .foregroundColor(.white)
-                                .cornerRadius(12)
+                                .cornerRadius(10)
                         }
 
                         Button(action: signOut) {
                             Text("Sign Out")
-                                .fontWeight(.bold)
+                                .font(.subheadline.weight(.semibold))
                                 .frame(maxWidth: .infinity)
                                 .frame(height: actionButtonHeight)
-                                .padding()
                                 .background(Color.red)
                                 .foregroundColor(.white)
-                                .cornerRadius(12)
+                                .cornerRadius(10)
                         }
                     }
                     .padding(.horizontal)
@@ -3302,14 +3314,13 @@ struct AccountView: View {
                                     .progressViewStyle(.circular)
                             }
                             Text(isDeletingAccount ? "Deleting Account..." : "Delete Account")
-                                .fontWeight(.bold)
+                                .font(.subheadline.weight(.semibold))
                         }
                         .frame(maxWidth: .infinity)
                         .frame(height: actionButtonHeight)
-                        .padding()
                         .background(Color.red.opacity(0.18))
                         .foregroundColor(.red)
-                        .cornerRadius(12)
+                        .cornerRadius(10)
                     }
                     .disabled(isDeletingAccount)
                     .padding(.horizontal)
@@ -5935,7 +5946,6 @@ struct ChatChannelDetailView: View {
     @State private var uploadProgress: Double = 0
     @State private var attachmentError: String?
     @State private var messageToEdit: ChatMessage?
-    @State private var editingText = ""
     @State private var messageToDelete: ChatMessage?
     @State private var showSettings = false
 
@@ -5981,8 +5991,9 @@ struct ChatChannelDetailView: View {
                         .contextMenu {
                             if canEdit(msg) {
                                 Button("Edit") {
-                                    editingText = msg.text
                                     messageToEdit = msg
+                                    newMessage = msg.text
+                                    clearPendingAttachment()
                                 }
                                 Button(role: .destructive) { messageToDelete = msg } label: {
                                     Text("Delete")
@@ -6037,20 +6048,27 @@ struct ChatChannelDetailView: View {
                     Image(systemName: "photo.on.rectangle")
                 }
                 .buttonStyle(.plain)
-                .disabled(!canSendMessages || isUploadingAttachment)
+                .disabled(!canSendMessages || isUploadingAttachment || messageToEdit != nil)
                 Button {
                     showFilePicker = true
                 } label: {
                     Image(systemName: "paperclip")
                 }
                 .buttonStyle(.plain)
-                .disabled(!canSendMessages || isUploadingAttachment)
+                .disabled(!canSendMessages || isUploadingAttachment || messageToEdit != nil)
                 TextField("Message", text: $newMessage)
                     .textFieldStyle(.roundedBorder)
-                Button("Send") {
+                if messageToEdit != nil {
+                    Button("Cancel") {
+                        messageToEdit = nil
+                        newMessage = ""
+                    }
+                    .buttonStyle(.borderless)
+                }
+                Button(messageToEdit == nil ? "Send" : "Save") {
                     sendMessage()
                 }
-                .disabled(!canSendMessages || isUploadingAttachment || (newMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && pendingAttachmentURL == nil))
+                .disabled(!canSendMessages || isUploadingAttachment || newMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             .padding()
             if isUploadingAttachment {
@@ -6080,9 +6098,6 @@ struct ChatChannelDetailView: View {
                 }
             }
         }
-        .onDisappear {
-            store.saveChannel(channel)
-        }
         .onChange(of: selectedPhotoItem) { newValue in
             guard let newValue else { return }
             Task { await loadPhotoAttachment(from: newValue) }
@@ -6090,29 +6105,6 @@ struct ChatChannelDetailView: View {
         .onReceive(store.$channels) { updated in
             if let refreshed = updated.first(where: { $0.id == channel.id }) {
                 channel = refreshed
-            }
-        }
-        .sheet(item: $messageToEdit) { msg in
-            NavigationStack {
-                Form {
-                    Section("Message") {
-                        TextEditor(text: $editingText)
-                            .frame(minHeight: 120)
-                    }
-                    Section {
-                        Button("Save") {
-                            updateMessage(msg, newText: editingText)
-                            messageToEdit = nil
-                        }
-                        .disabled(editingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    }
-                }
-                .navigationTitle("Edit Message")
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Cancel") { messageToEdit = nil }
-                    }
-                }
             }
         }
         .alert("Delete message?", isPresented: Binding(get: { messageToDelete != nil }, set: { if !$0 { messageToDelete = nil } })) {
@@ -6140,6 +6132,14 @@ struct ChatChannelDetailView: View {
     func sendMessage() {
         guard let author = store.user?.email else { return }
         let trimmedText = newMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let editingMessage = messageToEdit {
+            guard !trimmedText.isEmpty else { return }
+            updateMessage(editingMessage, newText: trimmedText)
+            messageToEdit = nil
+            newMessage = ""
+            return
+        }
 
         if let pendingName = pendingAttachmentName,
            let pendingKind = pendingAttachmentKind {
@@ -6185,9 +6185,15 @@ struct ChatChannelDetailView: View {
                             attachmentName: pendingName,
                             attachmentKind: pendingKind
                         )
-                        appendMessage(msg)
-                        newMessage = ""
-                        clearPendingAttachment()
+                        appendMessage(msg) { result in
+                            switch result {
+                            case .success:
+                                newMessage = ""
+                                clearPendingAttachment()
+                            case .failure(let error):
+                                attachmentError = "Message send failed: \(error.localizedDescription)"
+                            }
+                        }
                     case .failure(let error):
                         attachmentError = "Attachment upload failed: \(error.localizedDescription)"
                     }
@@ -6198,34 +6204,63 @@ struct ChatChannelDetailView: View {
 
         guard !trimmedText.isEmpty else { return }
         let msg = ChatMessage(author: author, text: trimmedText, timestamp: Date())
-        appendMessage(msg)
-        newMessage = ""
+        appendMessage(msg) { result in
+            switch result {
+            case .success:
+                newMessage = ""
+            case .failure(let error):
+                attachmentError = "Message send failed: \(error.localizedDescription)"
+            }
+        }
     }
 
-    private func appendMessage(_ msg: ChatMessage) {
-        channel.messages.append(msg)
-        if let idx = store.channels.firstIndex(where: { $0.id == channel.id }) {
-            store.channels[idx] = channel
+    private func appendMessage(_ msg: ChatMessage, completion: @escaping (Result<Void, Error>) -> Void) {
+        let updatedMessages = channel.messages + [msg]
+        persistMessages(updatedMessages) { result in
+            switch result {
+            case .success:
+                channel.messages = updatedMessages
+                if let idx = store.channels.firstIndex(where: { $0.id == channel.id }) {
+                    store.channels[idx] = channel
+                }
+                completion(.success(()))
+            case .failure(let error):
+                completion(.failure(error))
+            }
         }
-        store.saveChannel(channel)
     }
 
     private func updateMessage(_ msg: ChatMessage, newText: String) {
         guard let index = channel.messages.firstIndex(where: { $0.id == msg.id }) else { return }
-        channel.messages[index].text = newText
-        channel.messages[index].editedAt = Date()
-        if let idx = store.channels.firstIndex(where: { $0.id == channel.id }) {
-            store.channels[idx] = channel
+        var updatedMessages = channel.messages
+        updatedMessages[index].text = newText
+        updatedMessages[index].editedAt = Date()
+        persistMessages(updatedMessages) { result in
+            switch result {
+            case .success:
+                channel.messages = updatedMessages
+                if let idx = store.channels.firstIndex(where: { $0.id == channel.id }) {
+                    store.channels[idx] = channel
+                }
+            case .failure(let error):
+                attachmentError = "Update failed: \(error.localizedDescription)"
+            }
         }
-        store.saveChannel(channel)
     }
 
     private func deleteMessage(_ msg: ChatMessage) {
-        channel.messages.removeAll { $0.id == msg.id }
-        if let idx = store.channels.firstIndex(where: { $0.id == channel.id }) {
-            store.channels[idx] = channel
+        let updatedMessages = channel.messages.filter { $0.id != msg.id }
+        persistMessages(updatedMessages) { result in
+            switch result {
+            case .success:
+                channel.messages = updatedMessages
+                if let idx = store.channels.firstIndex(where: { $0.id == channel.id }) {
+                    store.channels[idx] = channel
+                }
+            case .failure(let error):
+                attachmentError = "Delete failed: \(error.localizedDescription)"
+            }
         }
-        store.saveChannel(channel)
     }
 
     private func canEdit(_ msg: ChatMessage) -> Bool {
@@ -6244,6 +6279,39 @@ struct ChatChannelDetailView: View {
         pendingAttachmentName = nil
         pendingAttachmentKind = nil
         pendingAttachmentData = nil
+    }
+
+    private func persistMessages(_ messages: [ChatMessage], completion: @escaping (Result<Void, Error>) -> Void) {
+        let payload = messages.map(messageDictionary)
+        store.db.collection("channels").document(channel.id).setData(["messages": payload], merge: true) { error in
+            if let error {
+                completion(.failure(error))
+            } else {
+                completion(.success(()))
+            }
+        }
+    }
+
+    private func messageDictionary(_ msg: ChatMessage) -> [String: Any] {
+        var dict: [String: Any] = [
+            "id": msg.id,
+            "author": msg.author,
+            "text": msg.text,
+            "timestamp": Timestamp(date: msg.timestamp)
+        ]
+        if let editedAt = msg.editedAt {
+            dict["editedAt"] = Timestamp(date: editedAt)
+        }
+        if let attachmentURL = msg.attachmentURL, !attachmentURL.isEmpty {
+            dict["attachmentURL"] = attachmentURL
+        }
+        if let attachmentName = msg.attachmentName, !attachmentName.isEmpty {
+            dict["attachmentName"] = attachmentName
+        }
+        if let attachmentKind = msg.attachmentKind {
+            dict["attachmentKind"] = attachmentKind.rawValue
+        }
+        return dict
     }
 
     private func loadPhotoAttachment(from item: PhotosPickerItem) async {

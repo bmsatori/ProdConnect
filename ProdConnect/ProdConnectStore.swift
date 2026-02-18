@@ -23,6 +23,7 @@ final class ProdConnectStore: ObservableObject {
     private var channelsListener: ListenerRegistration?
     private var lessonsListener: ListenerRegistration?
     private var gearListener: ListenerRegistration?
+    private var authStateListener: AuthStateDidChangeListenerHandle?
 
     @Published var gear: [GearItem] = []
     @Published var patchsheet: [PatchRow] = []
@@ -43,7 +44,30 @@ final class ProdConnectStore: ObservableObject {
     @Published var isAdmin = false
     @Published var teamCode: String?
 
-    private init() {}
+    private init() {
+        authStateListener = Auth.auth().addStateDidChangeListener { [weak self] _, authUser in
+            guard let self else { return }
+
+            guard let authUser else {
+                Task { @MainActor in
+                    self.user = nil
+                }
+                return
+            }
+
+            self.restoreSession(for: authUser)
+        }
+
+        if let authUser = Auth.auth().currentUser {
+            restoreSession(for: authUser)
+        }
+    }
+
+    deinit {
+        if let authStateListener {
+            Auth.auth().removeStateDidChangeListener(authStateListener)
+        }
+    }
 
     private func jsonSafeValue(_ value: Any) -> Any {
         switch value {
@@ -187,6 +211,8 @@ final class ProdConnectStore: ObservableObject {
     func signOut() {
         try? Auth.auth().signOut()
         OneSignal.logout()
+        KeychainHelper.shared.delete(for: "prodconnect_email")
+        KeychainHelper.shared.delete(for: "prodconnect_password")
         teamMembersListener?.remove()
         checklistsListener?.remove()
         ideasListener?.remove()
@@ -205,6 +231,69 @@ final class ProdConnectStore: ObservableObject {
         rooms = []
         teamCode = nil
         isAdmin = false
+    }
+
+    private func restoreSession(for authUser: FirebaseAuth.User) {
+        let fallbackProfile = UserProfile(
+            id: authUser.uid,
+            displayName: authUser.email?.components(separatedBy: "@").first ?? "User",
+            email: authUser.email ?? ""
+        )
+
+        Task { @MainActor in
+            self.user = fallbackProfile
+            self.teamCode = fallbackProfile.teamCode
+            self.isAdmin = fallbackProfile.isAdmin
+            if !fallbackProfile.email.isEmpty {
+                OneSignal.login(fallbackProfile.email)
+            }
+            self.listenToTeamData()
+        }
+
+        db.collection("users").document(authUser.uid).getDocument { snapshot, fetchError in
+            if let fetchError {
+                print("Session restore profile fetch failed:", fetchError.localizedDescription)
+                return
+            }
+
+            let profile: UserProfile
+            if let data = snapshot?.data() {
+                profile = UserProfile(
+                    id: authUser.uid,
+                    displayName: (data["displayName"] as? String) ?? authUser.email?.components(separatedBy: "@").first ?? "User",
+                    email: (data["email"] as? String) ?? authUser.email ?? "",
+                    teamCode: data["teamCode"] as? String,
+                    isAdmin: data["isAdmin"] as? Bool ?? false,
+                    isOwner: data["isOwner"] as? Bool ?? false,
+                    subscriptionTier: data["subscriptionTier"] as? String ?? "free",
+                    assignedCampus: data["assignedCampus"] as? String ?? "",
+                    canEditPatchsheet: data["canEditPatchsheet"] as? Bool ?? false,
+                    canEditTraining: data["canEditTraining"] as? Bool ?? false,
+                    canEditGear: data["canEditGear"] as? Bool ?? false,
+                    canEditIdeas: data["canEditIdeas"] as? Bool ?? false,
+                    canEditChecklists: data["canEditChecklists"] as? Bool ?? false,
+                    canSeeChat: data["canSeeChat"] as? Bool ?? true,
+                    canSeePatchsheet: data["canSeePatchsheet"] as? Bool ?? true,
+                    canSeeTraining: data["canSeeTraining"] as? Bool ?? true,
+                    canSeeGear: data["canSeeGear"] as? Bool ?? true,
+                    canSeeIdeas: data["canSeeIdeas"] as? Bool ?? true,
+                    canSeeChecklists: data["canSeeChecklists"] as? Bool ?? true
+                )
+            } else {
+                profile = fallbackProfile
+                self.save(profile, collection: "users", id: authUser.uid)
+            }
+
+            Task { @MainActor in
+                self.user = profile
+                self.teamCode = profile.teamCode
+                self.isAdmin = profile.isAdmin
+                if !profile.email.isEmpty {
+                    OneSignal.login(profile.email)
+                }
+                self.listenToTeamData()
+            }
+        }
     }
 
     func listenToTeamData() {
