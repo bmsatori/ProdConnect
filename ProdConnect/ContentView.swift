@@ -5882,15 +5882,24 @@ struct ChecklistRunView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var hasDueDate = false
     @State private var draftDueDate = Date()
+    @State private var isEditingChecklist = false
+    @State private var newChecklistItemText = ""
     var canEdit: Bool { store.canEditChecklists }
 
     var body: some View {
         Form {
+            Section(header: Text("Title")) {
+                if canEdit && isEditingChecklist {
+                    TextField("Checklist title", text: $template.title)
+                } else {
+                    Text(template.title)
+                }
+            }
             Section(header: Text("Progress")) {
                 ProgressView(value: progress)
             }
             Section(header: Text("Due Date")) {
-                if canEdit {
+                if canEdit && isEditingChecklist {
                     Toggle("Set due date", isOn: $hasDueDate)
                     if hasDueDate {
                         DatePicker("Due", selection: $draftDueDate, displayedComponents: [.date, .hourAndMinute])
@@ -5919,8 +5928,22 @@ struct ChecklistRunView: View {
                             Button(action: { toggleItem(&item) }) {
                                 Image(systemName: item.isDone ? "checkmark.circle.fill" : "circle")
                                     .foregroundColor(item.isDone ? .green : .secondary)
-                            }.buttonStyle(.plain)
-                            Text(item.text)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(!canEdit || !isEditingChecklist)
+                            if canEdit && isEditingChecklist {
+                                TextField("Checklist item", text: $item.text)
+                            } else {
+                                Text(item.text)
+                            }
+                            if canEdit && isEditingChecklist {
+                                Button(role: .destructive) {
+                                    deleteChecklistItem(id: item.id)
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
                         if item.isDone, let completedAt = item.completedAt {
                             let by = item.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -5937,23 +5960,49 @@ struct ChecklistRunView: View {
                     }
                 }
             }
+            if canEdit && isEditingChecklist {
+                Section(header: Text("Add Item")) {
+                    HStack {
+                        TextField("New checklist item", text: $newChecklistItemText)
+                        Button("Add") {
+                            let trimmed = newChecklistItemText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !trimmed.isEmpty else { return }
+                            template.items.append(ChecklistItem(text: trimmed))
+                            newChecklistItemText = ""
+                        }
+                        .disabled(newChecklistItemText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
+            }
             Section {
-                Button("Save & Close") {
-                    template.dueDate = hasDueDate ? draftDueDate : nil
-                    updateChecklistCompletionMetadata()
-                    store.saveChecklist(template)
+                Button(canEdit && isEditingChecklist ? "Save & Close" : "Close") {
+                    if canEdit && isEditingChecklist {
+                        template.dueDate = hasDueDate ? draftDueDate : nil
+                        updateChecklistCompletionMetadata()
+                        store.saveChecklist(template)
+                    }
                     dismiss()
                 }.buttonStyle(.borderedProminent)
             }
         }
         .navigationTitle(template.title)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if canEdit {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button(isEditingChecklist ? "Done" : "Edit") {
+                        isEditingChecklist.toggle()
+                    }
+                }
+            }
+        }
         .onAppear {
             // Ensure the system-provided back affordance is hidden and any left items removed
             // Unconditional diagnostic to ensure we see a log entry when this view appears
             DispatchQueue.main.async {
                 NSLog("[DIAG] ChecklistRunView onAppear fired")
             }
+            isEditingChecklist = false
             if let dueDate = template.dueDate {
                 hasDueDate = true
                 draftDueDate = dueDate
@@ -5961,6 +6010,7 @@ struct ChecklistRunView: View {
                 hasDueDate = false
                 draftDueDate = Date()
             }
+            newChecklistItemText = ""
         }
     }
 
@@ -5999,6 +6049,10 @@ struct ChecklistRunView: View {
         let displayName = store.user?.displayName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !displayName.isEmpty { return displayName }
         return store.user?.email ?? Auth.auth().currentUser?.email ?? "Unknown User"
+    }
+
+    private func deleteChecklistItem(id: String) {
+        template.items.removeAll { $0.id == id }
     }
 
     var progress: Double {
