@@ -10,6 +10,7 @@ import StoreKit
 import PhotosUI
 import OneSignalFramework
 import WebKit
+import SafariServices
 
 // NOTE: Preserved legacy block for reference, excluded from compilation to fix parser conflicts.
 /*
@@ -4994,10 +4995,9 @@ struct TrainingDetailView: View {
     var body: some View {
         VStack {
             if let urlString = lesson.urlString, !urlString.isEmpty {
-                if urlString.contains("youtube.com") || urlString.contains("youtu.be") {
-                    // YouTube link
-                    YouTubeWebView(urlString: urlString)
-                        .frame(height: 250)
+                if let youtubeURL = YouTubeURLHelper.watchURL(from: urlString) {
+                    InAppSafariView(url: youtubeURL)
+                        .frame(height: 320)
                 } else if let url = URL(string: urlString) {
                     // Local video
                     VideoPlayer(player: player)
@@ -5161,17 +5161,21 @@ struct AddTrainingView: View {
                                     }
                                 }
                             }
-                        } else {
-                            let lesson = TrainingLesson(
-                                title: title.isEmpty ? "Untitled" : title,
-                                category: category,
-                                teamCode: store.teamCode ?? "",
-                                durationSeconds: 0,
-                                urlString: youtubeLink
-                            )
-                            onSave(lesson)
-                            dismiss()
+                    } else {
+                        guard let normalizedYouTubeURL = YouTubeURLHelper.normalizedWatchURLString(from: youtubeLink) else {
+                            errorMsg = "Enter a valid YouTube video URL."
+                            return
                         }
+                        let lesson = TrainingLesson(
+                            title: title.isEmpty ? "Untitled" : title,
+                            category: category,
+                            teamCode: store.teamCode ?? "",
+                            durationSeconds: 0,
+                            urlString: normalizedYouTubeURL
+                        )
+                        onSave(lesson)
+                        dismiss()
+                    }
                     }
                     .disabled(title.trimmingCharacters(in: .whitespaces).isEmpty ||
                               (videoSource == "local" && localVideoURL == nil) ||
@@ -5737,19 +5741,47 @@ struct ChecklistsListView: View {
     @State private var showCreate = false
 
     var canEdit: Bool { store.canEditChecklists }
+    var activeChecklists: [ChecklistTemplate] {
+        store.checklists
+            .filter { !isChecklistCompleted($0) }
+            .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+    }
+    var completedChecklists: [ChecklistTemplate] {
+        store.checklists
+            .filter { isChecklistCompleted($0) }
+            .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+    }
 
     var body: some View {
         NavigationStack {
             VStack {
                 List {
-                    ForEach(store.checklists) { template in
-                        NavigationLink { ChecklistRunView(template: template) } label: {
-                            Text(template.title).font(.headline)
+                    if !activeChecklists.isEmpty {
+                        Section("Not Completed") {
+                            ForEach(activeChecklists) { template in
+                                checklistRow(template)
+                            }
+                            .onDelete { idx in
+                                guard canEdit else { return }
+                                for i in idx {
+                                    deleteChecklist(activeChecklists[i])
+                                }
+                            }
                         }
                     }
-                    .onDelete { idx in
-                        guard canEdit else { return }
-                        for i in idx { store.db.collection("checklists").document(store.checklists[i].id).delete() }
+
+                    if !completedChecklists.isEmpty {
+                        Section("Completed") {
+                            ForEach(completedChecklists) { template in
+                                checklistRow(template)
+                            }
+                            .onDelete { idx in
+                                guard canEdit else { return }
+                                for i in idx {
+                                    deleteChecklist(completedChecklists[i])
+                                }
+                            }
+                        }
                     }
                 }
                 .toolbar {
@@ -5769,31 +5801,146 @@ struct ChecklistsListView: View {
             .toolbarColorScheme(.dark, for: .navigationBar)
         }
     }
+
+    @ViewBuilder
+    private func checklistRow(_ template: ChecklistTemplate) -> some View {
+        NavigationLink { ChecklistRunView(template: template) } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(template.title).font(.headline)
+                if let dueDate = template.dueDate {
+                    Text("Due: \(dueDate.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption2)
+                        .foregroundColor(isChecklistCompleted(template) ? .secondary : (dueDate < Date() ? .red : .secondary))
+                }
+                if isChecklistCompleted(template) {
+                    if let completedAt = template.completedAt {
+                        let by = template.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if let by, !by.isEmpty {
+                            Text("Completed by \(by) on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        } else {
+                            Text("Completed on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    } else {
+                        Text("Completed")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+        }
+        .contextMenu {
+            if canEdit {
+                Button("Duplicate") {
+                    duplicateChecklist(template)
+                }
+                Button(role: .destructive) {
+                    deleteChecklist(template)
+                } label: {
+                    Text("Delete")
+                }
+            }
+        }
+    }
+
+    private func isChecklistCompleted(_ template: ChecklistTemplate) -> Bool {
+        !template.items.isEmpty && template.items.allSatisfy(\.isDone)
+    }
+
+    private func duplicateChecklist(_ template: ChecklistTemplate) {
+        guard canEdit else { return }
+        var copy = template
+        copy.id = UUID().uuidString
+        copy.title = "\(template.title) Copy"
+        copy.dueDate = nil
+        copy.completedAt = nil
+        copy.completedBy = nil
+        copy.items = template.items.map { item in
+            var newItem = item
+            newItem.id = UUID().uuidString
+            newItem.isDone = false
+            newItem.completedAt = nil
+            newItem.completedBy = nil
+            return newItem
+        }
+        copy.createdBy = Auth.auth().currentUser?.email
+        store.saveChecklist(copy)
+    }
+
+    private func deleteChecklist(_ template: ChecklistTemplate) {
+        guard canEdit else { return }
+        store.db.collection("checklists").document(template.id).delete()
+    }
 }
 
 struct ChecklistRunView: View {
     @EnvironmentObject var store: ProdConnectStore
     @State var template: ChecklistTemplate
     @Environment(\.dismiss) private var dismiss
+    @State private var hasDueDate = false
+    @State private var draftDueDate = Date()
+    var canEdit: Bool { store.canEditChecklists }
 
     var body: some View {
         Form {
             Section(header: Text("Progress")) {
                 ProgressView(value: progress)
             }
+            Section(header: Text("Due Date")) {
+                if canEdit {
+                    Toggle("Set due date", isOn: $hasDueDate)
+                    if hasDueDate {
+                        DatePicker("Due", selection: $draftDueDate, displayedComponents: [.date, .hourAndMinute])
+                    }
+                } else if let dueDate = template.dueDate {
+                    Text("Due: \(dueDate.formatted(date: .abbreviated, time: .shortened))")
+                        .foregroundColor(.secondary)
+                } else {
+                    Text("No due date")
+                        .foregroundColor(.secondary)
+                }
+            }
+            if let completedAt = template.completedAt {
+                Section(header: Text("Checklist Completion")) {
+                    if let completedBy = template.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !completedBy.isEmpty {
+                        Text("Completed by \(completedBy)")
+                    }
+                    Text("Completed on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
+                }
+            }
             Section {
                 ForEach($template.items) { $item in
-                    HStack {
-                        Button(action: { item.isDone.toggle() }) {
-                            Image(systemName: item.isDone ? "checkmark.circle.fill" : "circle")
-                                .foregroundColor(item.isDone ? .green : .secondary)
-                        }.buttonStyle(.plain)
-                        Text(item.text)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Button(action: { toggleItem(&item) }) {
+                                Image(systemName: item.isDone ? "checkmark.circle.fill" : "circle")
+                                    .foregroundColor(item.isDone ? .green : .secondary)
+                            }.buttonStyle(.plain)
+                            Text(item.text)
+                        }
+                        if item.isDone, let completedAt = item.completedAt {
+                            let by = item.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if let by, !by.isEmpty {
+                                Text("Checked by \(by) on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            } else {
+                                Text("Checked on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
                     }
                 }
             }
             Section {
                 Button("Save & Close") {
+                    template.dueDate = hasDueDate ? draftDueDate : nil
+                    updateChecklistCompletionMetadata()
                     store.saveChecklist(template)
                     dismiss()
                 }.buttonStyle(.borderedProminent)
@@ -5807,7 +5954,51 @@ struct ChecklistRunView: View {
             DispatchQueue.main.async {
                 NSLog("[DIAG] ChecklistRunView onAppear fired")
             }
+            if let dueDate = template.dueDate {
+                hasDueDate = true
+                draftDueDate = dueDate
+            } else {
+                hasDueDate = false
+                draftDueDate = Date()
+            }
         }
+    }
+
+    private func toggleItem(_ item: inout ChecklistItem) {
+        item.isDone.toggle()
+        if item.isDone {
+            item.completedAt = Date()
+            item.completedBy = completionUserLabel
+        } else {
+            item.completedAt = nil
+            item.completedBy = nil
+        }
+    }
+
+    private func updateChecklistCompletionMetadata() {
+        if template.items.isEmpty {
+            template.completedAt = nil
+            template.completedBy = nil
+            return
+        }
+
+        if template.items.allSatisfy(\.isDone) {
+            if template.completedAt == nil {
+                template.completedAt = Date()
+            }
+            if (template.completedBy ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                template.completedBy = completionUserLabel
+            }
+        } else {
+            template.completedAt = nil
+            template.completedBy = nil
+        }
+    }
+
+    private var completionUserLabel: String {
+        let displayName = store.user?.displayName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !displayName.isEmpty { return displayName }
+        return store.user?.email ?? Auth.auth().currentUser?.email ?? "Unknown User"
     }
 
     var progress: Double {
@@ -5821,6 +6012,8 @@ struct CreateChecklistView: View {
     @EnvironmentObject var store: ProdConnectStore
     @State private var title = ""
     @State private var itemsText = "Item 1\nItem 2"
+    @State private var hasDueDate = false
+    @State private var dueDate = Date()
 
     var onSave: (ChecklistTemplate) -> Void
 
@@ -5828,6 +6021,12 @@ struct CreateChecklistView: View {
         NavigationStack {
             Form {
                 TextField("Title", text: $title)
+                Section("Due Date") {
+                    Toggle("Set due date", isOn: $hasDueDate)
+                    if hasDueDate {
+                        DatePicker("Due", selection: $dueDate, displayedComponents: [.date, .hourAndMinute])
+                    }
+                }
                 Section("Items (one per line)") {
                     TextEditor(text: $itemsText).frame(minHeight: 120)
                 }
@@ -5843,6 +6042,7 @@ struct CreateChecklistView: View {
                             items: items
                         )
                         template.createdBy = Auth.auth().currentUser?.email
+                        template.dueDate = hasDueDate ? dueDate : nil
 
                         onSave(template)
                         dismiss()
@@ -6680,6 +6880,8 @@ struct ChecklistItem: Identifiable, Codable {
     var id: String = UUID().uuidString
     var text: String
     var isDone: Bool = false
+    var completedAt: Date? = nil
+    var completedBy: String? = nil
 }
 
 struct ChecklistTemplate: Identifiable, Codable {
@@ -6688,6 +6890,9 @@ struct ChecklistTemplate: Identifiable, Codable {
     var teamCode: String
     var items: [ChecklistItem] = []
     var createdBy: String? = nil
+    var dueDate: Date? = nil
+    var completedAt: Date? = nil
+    var completedBy: String? = nil
 }
 
 struct IdeaCard: Identifiable, Codable {
@@ -7277,7 +7482,7 @@ struct YouTubeWebView: UIViewRepresentable {
     }
 
     private func loadVideo(into webView: WKWebView) {
-        guard let videoID = Self.extractYouTubeID(from: urlString) else {
+        guard let videoID = YouTubeURLHelper.extractVideoID(from: urlString) else {
             let html = """
             <html><body style="margin:0;background:#000;color:#fff;font-family:-apple-system">
             <div style="padding:16px">Invalid YouTube URL</div>
@@ -7309,32 +7514,66 @@ struct YouTubeWebView: UIViewRepresentable {
         webView.loadHTMLString(html, baseURL: URL(string: "https://www.youtube.com"))
     }
 
-    private static func extractYouTubeID(from value: String) -> String? {
-        guard let components = URLComponents(string: value) else { return nil }
+    final class Coordinator: NSObject, WKNavigationDelegate {}
+}
+
+struct InAppSafariView: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> SFSafariViewController {
+        let controller = SFSafariViewController(url: url)
+        controller.preferredControlTintColor = .systemBlue
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: SFSafariViewController, context: Context) {}
+}
+
+enum YouTubeURLHelper {
+    static func extractVideoID(from value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard let components = URLComponents(string: trimmed) else { return nil }
         let host = components.host?.lowercased() ?? ""
 
         if host.contains("youtu.be") {
             let id = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            return id.isEmpty ? nil : id
+            return sanitizeVideoID(id)
         }
 
         if host.contains("youtube.com") {
-            if let videoID = components.queryItems?.first(where: { $0.name == "v" })?.value, !videoID.isEmpty {
-                return videoID
+            if let videoID = components.queryItems?.first(where: { $0.name == "v" })?.value {
+                return sanitizeVideoID(videoID)
             }
             let parts = components.path.split(separator: "/")
             if let embedIndex = parts.firstIndex(of: "embed"), parts.indices.contains(embedIndex + 1) {
-                return String(parts[embedIndex + 1])
+                return sanitizeVideoID(String(parts[embedIndex + 1]))
             }
             if let shortsIndex = parts.firstIndex(of: "shorts"), parts.indices.contains(shortsIndex + 1) {
-                return String(parts[shortsIndex + 1])
+                return sanitizeVideoID(String(parts[shortsIndex + 1]))
             }
         }
 
         return nil
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate {}
+    static func watchURL(from value: String) -> URL? {
+        guard let id = extractVideoID(from: value) else { return nil }
+        return URL(string: "https://www.youtube.com/watch?v=\(id)")
+    }
+
+    static func normalizedWatchURLString(from value: String) -> String? {
+        watchURL(from: value)?.absoluteString
+    }
+
+    private static func sanitizeVideoID(_ value: String) -> String? {
+        let id = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty else { return nil }
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+        guard id.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
+        guard id.count >= 10 && id.count <= 15 else { return nil }
+        return id
+    }
 }
 
 private extension TrainingDetailView {
