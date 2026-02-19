@@ -412,13 +412,21 @@ final class ProdConnectStore: ObservableObject {
 
     func saveGear(_ item: GearItem) {
         save(item, collection: "gear", id: item.id)
+        let location = item.location.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !location.isEmpty { saveLocation(location) }
+        let campus = item.campus.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !campus.isEmpty { saveLocation(campus) }
         if let index = gear.firstIndex(where: { $0.id == item.id }) {
             gear[index] = item
         } else {
             gear.append(item)
         }
     }
-    func savePatch(_ item: PatchRow) { save(item, collection: "patchsheet", id: item.id) }
+    func savePatch(_ item: PatchRow) {
+        save(item, collection: "patchsheet", id: item.id)
+        let campus = item.campus.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !campus.isEmpty { saveLocation(campus) }
+    }
     func saveLesson(_ item: TrainingLesson) {
         save(item, collection: "lessons", id: item.id)
         if let index = lessons.firstIndex(where: { $0.id == item.id }) {
@@ -470,6 +478,134 @@ final class ProdConnectStore: ObservableObject {
         guard let code = teamCode, !code.isEmpty else { return }
         db.collection("teams").document(code).collection("locations").document(location).delete()
         locations.removeAll { $0 == location }
+    }
+
+    func renameLocation(_ oldLocation: String, to newLocation: String, completion: ((Result<Void, Error>) -> Void)? = nil) {
+        guard let code = teamCode, !code.isEmpty else {
+            completion?(.failure(NSError(domain: "ProdConnect", code: 1, userInfo: [NSLocalizedDescriptionKey: "No valid team code."])))
+            return
+        }
+
+        let oldTrimmed = oldLocation.trimmingCharacters(in: .whitespacesAndNewlines)
+        let newTrimmed = newLocation.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !oldTrimmed.isEmpty, !newTrimmed.isEmpty else {
+            completion?(.failure(NSError(domain: "ProdConnect", code: 2, userInfo: [NSLocalizedDescriptionKey: "Campus name cannot be empty."])))
+            return
+        }
+        guard oldTrimmed.caseInsensitiveCompare(newTrimmed) != .orderedSame else {
+            completion?(.success(()))
+            return
+        }
+
+        let existing = Set(locations.map { $0.lowercased() })
+        if existing.contains(newTrimmed.lowercased()) {
+            completion?(.failure(NSError(domain: "ProdConnect", code: 3, userInfo: [NSLocalizedDescriptionKey: "A campus with that name already exists."])))
+            return
+        }
+
+        let locationsRef = db.collection("teams").document(code).collection("locations")
+        let locationBatch = db.batch()
+        locationBatch.setData([:], forDocument: locationsRef.document(newTrimmed))
+        locationBatch.deleteDocument(locationsRef.document(oldTrimmed))
+
+        func updateCollectionField(collection: String, field: String, done: @escaping (Error?) -> Void) {
+            db.collection(collection)
+                .whereField("teamCode", isEqualTo: code)
+                .whereField(field, isEqualTo: oldTrimmed)
+                .getDocuments { snapshot, error in
+                    if let error = error {
+                        done(error)
+                        return
+                    }
+
+                    let docs = snapshot?.documents ?? []
+                    guard !docs.isEmpty else {
+                        done(nil)
+                        return
+                    }
+
+                    let chunkSize = 400
+                    let chunks = stride(from: 0, to: docs.count, by: chunkSize).map {
+                        Array(docs[$0..<min($0 + chunkSize, docs.count)])
+                    }
+
+                    func commitChunk(_ index: Int) {
+                        if index >= chunks.count {
+                            done(nil)
+                            return
+                        }
+                        let batch = self.db.batch()
+                        for doc in chunks[index] {
+                            batch.updateData([field: newTrimmed], forDocument: doc.reference)
+                        }
+                        batch.commit { chunkError in
+                            if let chunkError = chunkError {
+                                done(chunkError)
+                            } else {
+                                commitChunk(index + 1)
+                            }
+                        }
+                    }
+
+                    commitChunk(0)
+                }
+        }
+
+        locationBatch.commit { locationError in
+            if let locationError = locationError {
+                completion?(.failure(locationError))
+                return
+            }
+
+            let group = DispatchGroup()
+            var firstError: Error?
+            let tasks: [(String, String)] = [
+                ("gear", "location"),
+                ("gear", "campus"),
+                ("patchsheet", "campus"),
+                ("users", "assignedCampus")
+            ]
+
+            for (collection, field) in tasks {
+                group.enter()
+                updateCollectionField(collection: collection, field: field) { err in
+                    if firstError == nil, let err = err { firstError = err }
+                    group.leave()
+                }
+            }
+
+            group.notify(queue: .main) {
+                if let idx = self.locations.firstIndex(where: { $0.caseInsensitiveCompare(oldTrimmed) == .orderedSame }) {
+                    self.locations[idx] = newTrimmed
+                    self.locations.sort()
+                }
+                self.gear = self.gear.map { item in
+                    var updated = item
+                    if updated.location.caseInsensitiveCompare(oldTrimmed) == .orderedSame { updated.location = newTrimmed }
+                    if updated.campus.caseInsensitiveCompare(oldTrimmed) == .orderedSame { updated.campus = newTrimmed }
+                    return updated
+                }
+                self.patchsheet = self.patchsheet.map { row in
+                    var updated = row
+                    if updated.campus.caseInsensitiveCompare(oldTrimmed) == .orderedSame { updated.campus = newTrimmed }
+                    return updated
+                }
+                self.teamMembers = self.teamMembers.map { member in
+                    var updated = member
+                    if updated.assignedCampus.caseInsensitiveCompare(oldTrimmed) == .orderedSame { updated.assignedCampus = newTrimmed }
+                    return updated
+                }
+                if self.user?.assignedCampus.caseInsensitiveCompare(oldTrimmed) == .orderedSame {
+                    self.user?.assignedCampus = newTrimmed
+                }
+
+                if let firstError = firstError {
+                    completion?(.failure(firstError))
+                } else {
+                    completion?(.success(()))
+                }
+            }
+        }
     }
 
     func deleteRoom(_ room: String) {

@@ -353,6 +353,9 @@ struct UsersView: View {
 struct GearTabView: View {
     @EnvironmentObject var store: ProdConnectStore
     @State private var searchText = ""
+    @State private var selectedCategory: String? = nil
+    @State private var selectedStatus: GearItem.GearStatus? = nil
+    @State private var selectedLocation: String? = nil
     @State private var showAddGear = false
     @State private var exportURL: URL?
     @State private var isExporting = false
@@ -362,14 +365,38 @@ struct GearTabView: View {
     @State private var showMergeResult = false
     @State private var duplicateGearGroupCount = 0
 
+    private var availableCategories: [String] {
+        Array(Set(store.gear.map { $0.category.trimmingCharacters(in: .whitespacesAndNewlines) }))
+            .filter { !$0.isEmpty }
+            .sorted()
+    }
+
+    private var availableLocations: [String] {
+        Array(Set(store.gear.map { $0.location.trimmingCharacters(in: .whitespacesAndNewlines) }))
+            .filter { !$0.isEmpty }
+            .sorted()
+    }
+
     private var filteredGear: [GearItem] {
+        var result = store.gear
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return store.gear }
-        return store.gear.filter {
-            $0.name.localizedCaseInsensitiveContains(query) ||
-            $0.category.localizedCaseInsensitiveContains(query) ||
-            $0.location.localizedCaseInsensitiveContains(query)
+        if !query.isEmpty {
+            result = result.filter {
+                $0.name.localizedCaseInsensitiveContains(query) ||
+                $0.category.localizedCaseInsensitiveContains(query) ||
+                $0.location.localizedCaseInsensitiveContains(query)
+            }
         }
+        if let selectedCategory {
+            result = result.filter { $0.category == selectedCategory }
+        }
+        if let selectedStatus {
+            result = result.filter { $0.status == selectedStatus }
+        }
+        if let selectedLocation {
+            result = result.filter { $0.location == selectedLocation }
+        }
+        return result
     }
 
     private func statusColor(_ status: GearItem.GearStatus) -> Color {
@@ -490,10 +517,92 @@ struct GearTabView: View {
         }
     }
 
+    private var filterBar: some View {
+        HStack(spacing: 12) {
+            categoryMenu
+            statusMenu
+            locationMenu
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+    }
+
+    private var categoryMenu: some View {
+        Menu {
+            Button("Clear") { selectedCategory = nil }
+            Divider()
+            if availableCategories.isEmpty {
+                Text("No categories")
+            } else {
+                ForEach(availableCategories, id: \.self) { category in
+                    Button(category) { selectedCategory = category }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "line.3.horizontal.decrease.circle")
+                Text(selectedCategory ?? "Category").lineLimit(1)
+            }
+            .font(.caption)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(selectedCategory != nil ? Color.blue : Color.gray.opacity(0.3))
+            .foregroundColor(.white)
+            .cornerRadius(8)
+        }
+    }
+
+    private var statusMenu: some View {
+        Menu {
+            Button("Clear") { selectedStatus = nil }
+            Divider()
+            ForEach(GearItem.GearStatus.allCases, id: \.self) { status in
+                Button(status.rawValue) { selectedStatus = status }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "checkmark.circle")
+                Text(selectedStatus?.rawValue ?? "Status").lineLimit(1)
+            }
+            .font(.caption)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(selectedStatus != nil ? Color.blue : Color.gray.opacity(0.3))
+            .foregroundColor(.white)
+            .cornerRadius(8)
+        }
+    }
+
+    private var locationMenu: some View {
+        Menu {
+            Button("Clear") { selectedLocation = nil }
+            Divider()
+            if availableLocations.isEmpty {
+                Text("No locations")
+            } else {
+                ForEach(availableLocations, id: \.self) { location in
+                    Button(location) { selectedLocation = location }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "mappin.circle")
+                Text(selectedLocation ?? "Location").lineLimit(1)
+            }
+            .font(.caption)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(selectedLocation != nil ? Color.blue : Color.gray.opacity(0.3))
+            .foregroundColor(.white)
+            .cornerRadius(8)
+        }
+    }
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
                 SearchBar(text: $searchText)
+                filterBar
                 List {
                     ForEach(filteredGear) { item in
                         NavigationLink(destination: GearDetailView(item: item).environmentObject(store)) {
@@ -1953,6 +2062,10 @@ struct ContentView: View {
 
     func saveGear(_ item: GearItem) { 
         save(item, collection: "gear")
+        let location = item.location.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !location.isEmpty { saveLocation(location) }
+        let campus = item.campus.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !campus.isEmpty { saveLocation(campus) }
     }
     func saveLesson(_ item: TrainingLesson) { save(item, collection: "lessons") }
     func saveChecklist(_ item: ChecklistTemplate) { 
@@ -1965,6 +2078,8 @@ struct ContentView: View {
     func savePatch(_ item: PatchRow) {
         // Persist to Firestore
         save(item, collection: "patchsheet")
+        let campus = item.campus.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !campus.isEmpty { saveLocation(campus) }
         // Optimistically update local state so UI reflects changes immediately
         DispatchQueue.main.async {
             if let idx = self.patchsheet.firstIndex(where: { $0.id == item.id }) {
@@ -2162,7 +2277,7 @@ struct ContentView: View {
             }
         }
     }
-    
+
     func deleteLocation(_ location: String) {
         guard let tc = teamCode, !tc.isEmpty else { return }
         db.collection("teams").document(tc).collection("locations").document(location).delete()
@@ -3966,247 +4081,370 @@ struct CustomizeView: View {
     @State private var audioPatchSheetLink = ""
     @State private var videoPatchSheetLink = ""
     @State private var lightingPatchSheetLink = ""
-    @State private var showError = false
-    @State private var errorMessage = ""
+    private struct ResultAlertData: Identifiable {
+        let id = UUID()
+        let title: String
+        let message: String
+    }
+
+    @State private var resultAlert: ResultAlertData? = nil
     @State private var isImporting = false
     @State private var showDeleteAllConfirmation = false
     @State private var showDeleteAudioConfirmation = false
     @State private var showDeleteLightingConfirmation = false
     @State private var showDeleteVideoConfirmation = false
     @State private var showImportHelp = false
+    @State private var showEditCampusSheet = false
+    @State private var editingCampusOriginal = ""
+    @State private var editingCampusName = ""
+    @State private var isRenamingCampus = false
 
-    var body: some View {
-        NavigationStack {
-            Form {
-            if store.user?.hasCampusRoomFeatures ?? false {
-                // Campus Management
-                Section {
-                    HStack {
-                        TextField("Add new campus", text: $newCampus)
-                            .textFieldStyle(.roundedBorder)
-                        Button(action: addCampus) {
-                            Image(systemName: "plus.circle.fill")
-                                .font(.title2)
-                                .foregroundColor(.blue)
-                        }
-                        .disabled(newCampus.trimmingCharacters(in: .whitespaces).isEmpty)
+    private func presentResultAlert(_ message: String, delay: TimeInterval = 0.2) {
+        let title = message.hasPrefix("✓") ? "Success" : "Error"
+        resultAlert = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            resultAlert = ResultAlertData(title: title, message: message)
+        }
+    }
+
+    @ViewBuilder
+    private var resultOverlay: some View {
+        if let alert = resultAlert {
+            ZStack {
+                Color.black.opacity(0.35)
+                    .ignoresSafeArea()
+
+                VStack(spacing: 12) {
+                    Text(alert.title)
+                        .font(.headline)
+                    Text(alert.message)
+                        .font(.subheadline)
+                        .multilineTextAlignment(.center)
+                    Button("OK") {
+                        resultAlert = nil
                     }
-                    .listRowBackground(Color.black)
-                    
-                    if !store.locations.isEmpty {
-                        ForEach(store.locations.sorted(), id: \.self) { campus in
-                            HStack {
-                                Image(systemName: "building.2")
-                                    .foregroundColor(.blue)
-                                    .frame(width: 24)
-                                Text(campus)
-                                    .foregroundColor(.white)
-                                Spacer()
-                            }
-                            .listRowBackground(Color.black)
-                        }
-                        .onDelete { indexSet in
-                            let sorted = store.locations.sorted()
-                            for index in indexSet {
-                                store.deleteLocation(sorted[index])
-                            }
-                        }
-                    } else {
-                        Text("No campuses added yet")
-                            .foregroundColor(.gray)
-                            .font(.caption)
-                            .listRowBackground(Color.black)
-                    }
-                } header: {
-                    Text("Campus Locations")
-                } footer: {
-                    Text("Swipe left on a campus to delete it")
-                        .font(.caption)
-                        .foregroundColor(.gray)
+                    .buttonStyle(.borderedProminent)
                 }
-                
-                // Rooms Management
-                Section {
-                    HStack {
-                        TextField("Add new room", text: $newRoom)
-                            .textFieldStyle(.roundedBorder)
-                        Button(action: addRoom) {
-                            Image(systemName: "plus.circle.fill")
-                                .font(.title2)
-                                .foregroundColor(.blue)
-                        }
-                        .disabled(newRoom.trimmingCharacters(in: .whitespaces).isEmpty)
-                    }
-                    .listRowBackground(Color.black)
-                    
-                    if !store.rooms.isEmpty {
-                        ForEach(store.rooms.sorted(), id: \.self) { room in
-                            HStack {
-                                Image(systemName: "door.left.hand.open")
-                                    .foregroundColor(.blue)
-                                    .frame(width: 24)
-                                Text(room)
-                                    .foregroundColor(.white)
-                                Spacer()
-                            }
-                            .listRowBackground(Color.black)
-                        }
-                        .onDelete { indexSet in
-                            let sorted = store.rooms.sorted()
-                            for index in indexSet {
-                                store.deleteRoom(sorted[index])
-                            }
-                        }
-                    } else {
-                        Text("No rooms added yet")
-                            .foregroundColor(.gray)
-                            .font(.caption)
-                            .listRowBackground(Color.black)
-                    }
-                } header: {
-                    Text("Room Names")
-                } footer: {
-                    Text("Swipe left on a room to delete it")
-                        .font(.caption)
-                        .foregroundColor(.gray)
+                .padding(16)
+                .frame(maxWidth: 320)
+                .background(Color(.systemBackground))
+                .cornerRadius(12)
+                .shadow(radius: 10)
+                .padding(.horizontal, 24)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var campusAndRoomsSection: some View {
+        if store.user?.hasCampusRoomFeatures ?? false {
+            campusSection
+            roomsSection
+        } else {
+            premiumCampusSection
+        }
+    }
+
+    private var campusSection: some View {
+        Section {
+            HStack {
+                TextField("Add new campus", text: $newCampus)
+                    .textFieldStyle(.roundedBorder)
+                Button(action: addCampus) {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.title2)
+                        .foregroundColor(.blue)
                 }
-            } else {
-                Section {
-                    HStack {
-                        Text("Campus & Rooms management")
-                        Spacer()
-                        Text("Premium")
-                            .font(.caption)
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Color.blue)
-                            .cornerRadius(4)
-                    }
+                .disabled(newCampus.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .listRowBackground(Color.black)
+
+            Button(action: syncGearLocationsToCampuses) {
+                HStack {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                    Text("Copy Locations from Gear")
                 }
             }
-            
-            Section(header:
-                HStack {
-                    Text("Import from Google Sheets")
-                    Spacer()
-                    Button(action: { showImportHelp = true }) {
-                        HStack(spacing: 4) {
-                            Image(systemName: "questionmark.circle")
-                            Text("Help")
+            .listRowBackground(Color.black)
+
+            if !store.locations.isEmpty {
+                ForEach(store.locations.sorted(), id: \.self) { campus in
+                    Button {
+                        editingCampusOriginal = campus
+                        editingCampusName = campus
+                        showEditCampusSheet = true
+                    } label: {
+                        HStack {
+                            Image(systemName: "building.2")
+                                .foregroundColor(.blue)
+                                .frame(width: 24)
+                            Text(campus)
+                                .foregroundColor(.white)
+                            Spacer()
+                            Image(systemName: "pencil")
+                                .foregroundColor(.gray)
                         }
-                        .font(.caption)
-                        .foregroundColor(.blue)
                     }
                     .buttonStyle(.plain)
+                    .listRowBackground(Color.black)
                 }
-            ) {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Paste your Google Sheet share link and tap Import")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    
-                    HStack {
-                        TextField("Gear sheet link", text: $gearSheetLink)
-                            .textFieldStyle(RoundedBorderTextFieldStyle())
-                        Button(action: importGearData) {
-                            if isImporting {
-                                ProgressView()
-                            } else {
-                                Image(systemName: "arrow.down.doc")
-                            }
-                        }
-                        .disabled(gearSheetLink.isEmpty || isImporting)
-                    }
-                    
-                    HStack {
-                        TextField("Audio patchsheet link", text: $audioPatchSheetLink)
-                            .textFieldStyle(RoundedBorderTextFieldStyle())
-                        Button(action: { importPatchData(category: "Audio", link: audioPatchSheetLink) }) {
-                            if isImporting {
-                                ProgressView()
-                            } else {
-                                Image(systemName: "arrow.down.doc")
-                            }
-                        }
-                        .disabled(audioPatchSheetLink.isEmpty || isImporting)
-                    }
-                    
-                    HStack {
-                        TextField("Video patchsheet link", text: $videoPatchSheetLink)
-                            .textFieldStyle(RoundedBorderTextFieldStyle())
-                        Button(action: { importPatchData(category: "Video", link: videoPatchSheetLink) }) {
-                            if isImporting {
-                                ProgressView()
-                            } else {
-                                Image(systemName: "arrow.down.doc")
-                            }
-                        }
-                        .disabled(videoPatchSheetLink.isEmpty || isImporting)
-                    }
-                    
-                    HStack {
-                        TextField("Lighting patchsheet link", text: $lightingPatchSheetLink)
-                            .textFieldStyle(RoundedBorderTextFieldStyle())
-                        Button(action: { importPatchData(category: "Lighting", link: lightingPatchSheetLink) }) {
-                            if isImporting {
-                                ProgressView()
-                            } else {
-                                Image(systemName: "arrow.down.doc")
-                            }
-                        }
-                        .disabled(lightingPatchSheetLink.isEmpty || isImporting)
+                .onDelete { indexSet in
+                    let sorted = store.locations.sorted()
+                    for index in indexSet {
+                        store.deleteLocation(sorted[index])
                     }
                 }
+            } else {
+                Text("No campuses added yet")
+                    .foregroundColor(.gray)
+                    .font(.caption)
+                    .listRowBackground(Color.black)
             }
-            
-            Section(header: Text("Reset")) {
-                Button(action: { showDeleteAllConfirmation = true }) {
+        } header: {
+            Text("Campus Locations")
+        } footer: {
+            Text("Swipe left on a campus to delete it")
+                .font(.caption)
+                .foregroundColor(.gray)
+        }
+    }
+
+    private var roomsSection: some View {
+        Section {
+            HStack {
+                TextField("Add new room", text: $newRoom)
+                    .textFieldStyle(.roundedBorder)
+                Button(action: addRoom) {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.title2)
+                        .foregroundColor(.blue)
+                }
+                .disabled(newRoom.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .listRowBackground(Color.black)
+
+            if !store.rooms.isEmpty {
+                ForEach(store.rooms.sorted(), id: \.self) { room in
                     HStack {
-                        Image(systemName: "trash.fill")
-                            .foregroundColor(.red)
-                        Text("Delete All Gear")
-                            .foregroundColor(.red)
+                        Image(systemName: "door.left.hand.open")
+                            .foregroundColor(.blue)
+                            .frame(width: 24)
+                        Text(room)
+                            .foregroundColor(.white)
+                        Spacer()
+                    }
+                    .listRowBackground(Color.black)
+                }
+                .onDelete { indexSet in
+                    let sorted = store.rooms.sorted()
+                    for index in indexSet {
+                        store.deleteRoom(sorted[index])
                     }
                 }
-                Button(action: { showDeleteAudioConfirmation = true }) {
-                    HStack {
-                        Image(systemName: "trash.fill")
-                            .foregroundColor(.red)
-                        Text("Delete Audio Patchsheet")
-                            .foregroundColor(.red)
+            } else {
+                Text("No rooms added yet")
+                    .foregroundColor(.gray)
+                    .font(.caption)
+                    .listRowBackground(Color.black)
+            }
+        } header: {
+            Text("Room Names")
+        } footer: {
+            Text("Swipe left on a room to delete it")
+                .font(.caption)
+                .foregroundColor(.gray)
+        }
+    }
+
+    private var premiumCampusSection: some View {
+        Section {
+            HStack {
+                Text("Campus & Rooms management")
+                Spacer()
+                Text("Premium")
+                    .font(.caption)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.blue)
+                    .cornerRadius(4)
+            }
+        }
+    }
+
+    private var importSection: some View {
+        Section(header:
+            HStack {
+                Text("Import from Google Sheets")
+                Spacer()
+                Button(action: { showImportHelp = true }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "questionmark.circle")
+                        Text("Help")
                     }
+                    .font(.caption)
+                    .foregroundColor(.blue)
                 }
-                Button(action: { showDeleteVideoConfirmation = true }) {
-                    HStack {
-                        Image(systemName: "trash.fill")
-                            .foregroundColor(.red)
-                        Text("Delete Video Patchsheet")
-                            .foregroundColor(.red)
+                .buttonStyle(.plain)
+            }
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Paste your Google Sheet share link and tap Import")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                HStack {
+                    TextField("Gear sheet link", text: $gearSheetLink)
+                        .textFieldStyle(RoundedBorderTextFieldStyle())
+                    Button(action: importGearData) {
+                        if isImporting {
+                            ProgressView()
+                        } else {
+                            Image(systemName: "arrow.down.doc")
+                        }
                     }
+                    .disabled(gearSheetLink.isEmpty || isImporting)
                 }
-                Button(action: { showDeleteLightingConfirmation = true }) {
-                    HStack {
-                        Image(systemName: "trash.fill")
-                            .foregroundColor(.red)
-                        Text("Delete Lighting Patchsheet")
-                            .foregroundColor(.red)
+
+                HStack {
+                    TextField("Audio patchsheet link", text: $audioPatchSheetLink)
+                        .textFieldStyle(RoundedBorderTextFieldStyle())
+                    Button(action: { importPatchData(category: "Audio", link: audioPatchSheetLink) }) {
+                        if isImporting {
+                            ProgressView()
+                        } else {
+                            Image(systemName: "arrow.down.doc")
+                        }
                     }
+                    .disabled(audioPatchSheetLink.isEmpty || isImporting)
+                }
+
+                HStack {
+                    TextField("Video patchsheet link", text: $videoPatchSheetLink)
+                        .textFieldStyle(RoundedBorderTextFieldStyle())
+                    Button(action: { importPatchData(category: "Video", link: videoPatchSheetLink) }) {
+                        if isImporting {
+                            ProgressView()
+                        } else {
+                            Image(systemName: "arrow.down.doc")
+                        }
+                    }
+                    .disabled(videoPatchSheetLink.isEmpty || isImporting)
+                }
+
+                HStack {
+                    TextField("Lighting patchsheet link", text: $lightingPatchSheetLink)
+                        .textFieldStyle(RoundedBorderTextFieldStyle())
+                    Button(action: { importPatchData(category: "Lighting", link: lightingPatchSheetLink) }) {
+                        if isImporting {
+                            ProgressView()
+                        } else {
+                            Image(systemName: "arrow.down.doc")
+                        }
+                    }
+                    .disabled(lightingPatchSheetLink.isEmpty || isImporting)
                 }
             }
         }
-        .navigationTitle("Customize")
-        .toolbarColorScheme(.dark, for: .navigationBar)
+    }
+
+    private var resetSection: some View {
+        Section(header: Text("Reset")) {
+            Button(action: { showDeleteAllConfirmation = true }) {
+                HStack {
+                    Image(systemName: "trash.fill")
+                        .foregroundColor(.red)
+                    Text("Delete All Gear")
+                        .foregroundColor(.red)
+                }
+            }
+            Button(action: { showDeleteAudioConfirmation = true }) {
+                HStack {
+                    Image(systemName: "trash.fill")
+                        .foregroundColor(.red)
+                    Text("Delete Audio Patchsheet")
+                        .foregroundColor(.red)
+                }
+            }
+            Button(action: { showDeleteVideoConfirmation = true }) {
+                HStack {
+                    Image(systemName: "trash.fill")
+                        .foregroundColor(.red)
+                    Text("Delete Video Patchsheet")
+                        .foregroundColor(.red)
+                }
+            }
+            Button(action: { showDeleteLightingConfirmation = true }) {
+                HStack {
+                    Image(systemName: "trash.fill")
+                        .foregroundColor(.red)
+                    Text("Delete Lighting Patchsheet")
+                        .foregroundColor(.red)
+                }
+            }
         }
+    }
+
+    private var customizeBaseView: some View {
+        NavigationStack {
+            Form {
+                campusAndRoomsSection
+                importSection
+                resetSection
+            }
+            .navigationTitle("Customize")
+            .toolbarColorScheme(.dark, for: .navigationBar)
+        }
+    }
+
+    private var customizeSheetedView: some View {
+        customizeBaseView
         .sheet(isPresented: $showImportHelp) {
             ImportHelpView()
         }
+        .sheet(isPresented: $showEditCampusSheet) {
+            editCampusSheetContent
+        }
+    }
+
+    private var editCampusSheetContent: some View {
+        NavigationStack {
+            Form {
+                Section("Campus Name") {
+                    TextField("Campus", text: $editingCampusName)
+                }
+            }
+            .navigationTitle("Edit Campus")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showEditCampusSheet = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save", action: saveCampusRename)
+                        .disabled(isRenamingCampus)
+                }
+            }
+            .overlay {
+                if isRenamingCampus {
+                    ZStack {
+                        Color.black.opacity(0.2).ignoresSafeArea()
+                        ProgressView("Saving...")
+                            .padding()
+                            .background(Color(.systemBackground))
+                            .cornerRadius(10)
+                    }
+                }
+            }
+        }
+    }
+
+    private var customizeFinalView: some View {
+        customizeSheetedView
         .alert("Delete All Gear?", isPresented: $showDeleteAllConfirmation) {
             Button("Cancel", role: .cancel) { }
             Button("Delete All", role: .destructive) {
                 store.deleteAllGear()
-                errorMessage = "✓ All gear has been deleted"
-                showError = true
+                presentResultAlert("✓ All gear has been deleted")
             }
         } message: {
             Text("Are you sure you want to delete all gear items? This cannot be undone.")
@@ -4215,8 +4453,7 @@ struct CustomizeView: View {
             Button("Cancel", role: .cancel) { }
             Button("Delete", role: .destructive) {
                 store.deletePatchesByCategory("Audio")
-                errorMessage = "✓ Audio patchsheet has been deleted"
-                showError = true
+                presentResultAlert("✓ Audio patchsheet has been deleted")
             }
         } message: {
             Text("Are you sure you want to delete all audio patches? This cannot be undone.")
@@ -4225,8 +4462,7 @@ struct CustomizeView: View {
             Button("Cancel", role: .cancel) { }
             Button("Delete", role: .destructive) {
                 store.deletePatchesByCategory("Lighting")
-                errorMessage = "✓ Lighting patchsheet has been deleted"
-                showError = true
+                presentResultAlert("✓ Lighting patchsheet has been deleted")
             }
         } message: {
             Text("Are you sure you want to delete all lighting patches? This cannot be undone.")
@@ -4235,37 +4471,58 @@ struct CustomizeView: View {
             Button("Cancel", role: .cancel) { }
             Button("Delete", role: .destructive) {
                 store.deletePatchesByCategory("Video")
-                errorMessage = "✓ Video patchsheet has been deleted"
-                showError = true
+                presentResultAlert("✓ Video patchsheet has been deleted")
             }
         } message: {
             Text("Are you sure you want to delete all video patches? This cannot be undone.")
         }
-        .alert(errorMessage.hasPrefix("✓") ? "Success" : "Error", isPresented: $showError) {
-            Button("OK") { }
-        } message: {
-            Text(errorMessage)
+        .overlay(resultOverlay)
+    }
+
+    var body: some View {
+        customizeFinalView
+    }
+
+    private func saveCampusRename() {
+        let updated = editingCampusName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !updated.isEmpty else {
+            presentResultAlert("Campus name cannot be empty.", delay: 0)
+            return
+        }
+        guard updated.caseInsensitiveCompare(editingCampusOriginal) != .orderedSame else {
+            showEditCampusSheet = false
+            return
+        }
+        isRenamingCampus = true
+        store.renameLocation(editingCampusOriginal, to: updated) { result in
+            DispatchQueue.main.async {
+                isRenamingCampus = false
+                switch result {
+                case .success:
+                    showEditCampusSheet = false
+                    presentResultAlert("✓ Campus renamed to '\(updated)'.", delay: 0)
+                case .failure(let error):
+                    presentResultAlert("Rename failed: \(error.localizedDescription)", delay: 0)
+                }
+            }
         }
     }
 
     private func addCampus() {
         let trimmed = newCampus.trimmingCharacters(in: .whitespaces)
         if trimmed.isEmpty {
-            errorMessage = "Campus name cannot be empty"
-            showError = true
+            presentResultAlert("Campus name cannot be empty", delay: 0)
             return
         }
         if store.locations.contains(trimmed) {
-            errorMessage = "This campus already exists"
-            showError = true
+            presentResultAlert("This campus already exists", delay: 0)
             return
         }
         print("DEBUG: Adding campus '\(trimmed)' for team \(store.teamCode ?? "NO_TEAM_CODE")")
         store.saveLocation(trimmed)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             print("DEBUG: After save, locations count = \(store.locations.count), locations = \(store.locations)")
-            errorMessage = "✓ Campus '\(trimmed)' added successfully"
-            showError = true
+            presentResultAlert("✓ Campus '\(trimmed)' added successfully", delay: 0)
         }
         newCampus = ""
     }
@@ -4273,23 +4530,43 @@ struct CustomizeView: View {
     private func addRoom() {
         let trimmed = newRoom.trimmingCharacters(in: .whitespaces)
         if trimmed.isEmpty {
-            errorMessage = "Room name cannot be empty"
-            showError = true
+            presentResultAlert("Room name cannot be empty", delay: 0)
             return
         }
         if store.rooms.contains(trimmed) {
-            errorMessage = "This room already exists"
-            showError = true
+            presentResultAlert("This room already exists", delay: 0)
             return
         }
         print("DEBUG: Adding room '\(trimmed)' for team \(store.teamCode ?? "NO_TEAM_CODE")")
         store.saveRoom(trimmed)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             print("DEBUG: After save, rooms count = \(store.rooms.count), rooms = \(store.rooms)")
-            errorMessage = "✓ Room '\(trimmed)' added successfully"
-            showError = true
+            presentResultAlert("✓ Room '\(trimmed)' added successfully", delay: 0)
         }
         newRoom = ""
+    }
+
+    private func syncGearLocationsToCampuses() {
+        var existing = Set(store.locations.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+        let source = Array(Set(store.gear.map { $0.location.trimmingCharacters(in: .whitespacesAndNewlines) }))
+            .filter { !$0.isEmpty }
+            .sorted()
+
+        var added = 0
+        for location in source {
+            let key = location.lowercased()
+            if !existing.contains(key) {
+                store.saveLocation(location)
+                existing.insert(key)
+                added += 1
+            }
+        }
+
+        if added == 0 {
+            presentResultAlert("No new locations to copy from Gear.", delay: 0)
+        } else {
+            presentResultAlert("✓ Added \(added) location(s) from Gear.", delay: 0)
+        }
     }
 
     private func importGearData() {
@@ -4297,27 +4574,28 @@ struct CustomizeView: View {
         let csvURL = convertGoogleSheetLinkToCSV(gearSheetLink)
         
         URLSession.shared.dataTask(with: csvURL) { data, _, error in
-            defer { DispatchQueue.main.async { isImporting = false } }
-            
             guard let data = data, error == nil else {
                 DispatchQueue.main.async {
-                    errorMessage = "Failed to fetch sheet: \(error?.localizedDescription ?? "Unknown error")"
-                    showError = true
+                    isImporting = false
+                    presentResultAlert("Failed to fetch sheet: \(error?.localizedDescription ?? "Unknown error")", delay: 0)
                 }
                 return
             }
             
-            guard let csvString = String(data: data, encoding: .utf8) else { return }
+            guard let csvString = String(data: data, encoding: .utf8) else {
+                DispatchQueue.main.async {
+                    isImporting = false
+                    presentResultAlert("Failed to decode CSV response.", delay: 0)
+                }
+                return
+            }
             let gearItems = parseGearCSV(csvString)
             
             DispatchQueue.main.async {
                 store.replaceAllGear(gearItems)
                 gearSheetLink = ""
-                errorMessage = "✓ Imported \(gearItems.count) gear items"
-                showError = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                    showError = false
-                }
+                isImporting = false
+                presentResultAlert("✓ Imported \(gearItems.count) gear items", delay: 0)
             }
         }.resume()
     }
@@ -4327,17 +4605,21 @@ struct CustomizeView: View {
         let csvURL = convertGoogleSheetLinkToCSV(link)
         
         URLSession.shared.dataTask(with: csvURL) { data, _, error in
-            defer { DispatchQueue.main.async { isImporting = false } }
-            
             guard let data = data, error == nil else {
                 DispatchQueue.main.async {
-                    errorMessage = "Failed to fetch sheet: \(error?.localizedDescription ?? "Unknown error")"
-                    showError = true
+                    isImporting = false
+                    presentResultAlert("Failed to fetch sheet: \(error?.localizedDescription ?? "Unknown error")", delay: 0)
                 }
                 return
             }
             
-            guard let csvString = String(data: data, encoding: .utf8) else { return }
+            guard let csvString = String(data: data, encoding: .utf8) else {
+                DispatchQueue.main.async {
+                    isImporting = false
+                    presentResultAlert("Failed to decode CSV response.", delay: 0)
+                }
+                return
+            }
             var patchRows = parsePatchCSV(csvString)
             
             // Filter or set category for imported patches
@@ -4350,11 +4632,8 @@ struct CustomizeView: View {
                 else if category == "Video" { videoPatchSheetLink = "" }
                 else if category == "Lighting" { lightingPatchSheetLink = "" }
                 
-                errorMessage = "✓ Imported \(patchRows.count) \(category) patches"
-                showError = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                    showError = false
-                }
+                isImporting = false
+                presentResultAlert("✓ Imported \(patchRows.count) \(category) patches", delay: 0)
             }
         }.resume()
     }
@@ -4839,7 +5118,17 @@ struct EditPatchView: View {
                     TextField("Output", text: $patch.output).disabled(!canEdit)
                 }
                 
-                TextField("Campus", text: $patch.campus).disabled(!canEdit)
+                if store.locations.isEmpty {
+                    TextField("Campus", text: $patch.campus).disabled(!canEdit)
+                } else {
+                    Picker("Campus", selection: $patch.campus) {
+                        Text("Select campus").tag("")
+                        ForEach(store.locations.sorted(), id: \.self) { campus in
+                            Text(campus).tag(campus)
+                        }
+                    }
+                    .disabled(!canEdit)
+                }
                 TextField("Room", text: $patch.room).disabled(!canEdit)
             }
         }
@@ -5202,6 +5491,7 @@ struct GearDetailView: View {
     @State private var isUploadingImage = false
     @State private var uploadProgress: Double = 0
     @State private var imageError: String?
+    @State private var pendingAutoSave: DispatchWorkItem?
 
     var canEdit: Bool { store.canEditGear }
 
@@ -5320,11 +5610,14 @@ struct GearDetailView: View {
             }
 
             Section {
-                Button("Save Changes") {
-                    store.saveGear(item)
-                    dismiss() // <-- automatically go back
+                if canEdit {
+                    Text("Changes auto-save")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
-                .disabled(!canEdit)
+                Button("Done") {
+                    dismiss()
+                }
             }
         }
         .navigationTitle(item.name)
@@ -5332,6 +5625,37 @@ struct GearDetailView: View {
             guard let newValue, canEdit else { return }
             Task { await loadAndUploadImage(from: newValue) }
         }
+        .onChange(of: item.name) { _ in scheduleAutoSave() }
+        .onChange(of: item.serialNumber) { _ in scheduleAutoSave() }
+        .onChange(of: item.assetId) { _ in scheduleAutoSave() }
+        .onChange(of: item.category) { _ in scheduleAutoSave() }
+        .onChange(of: item.location) { _ in scheduleAutoSave() }
+        .onChange(of: item.status) { _ in scheduleAutoSave() }
+        .onChange(of: item.installDate) { _ in scheduleAutoSave() }
+        .onChange(of: item.purchaseDate) { _ in scheduleAutoSave() }
+        .onChange(of: item.purchasedFrom) { _ in scheduleAutoSave() }
+        .onChange(of: item.cost) { _ in scheduleAutoSave() }
+        .onChange(of: item.maintenanceIssue) { _ in scheduleAutoSave() }
+        .onChange(of: item.maintenanceCost) { _ in scheduleAutoSave() }
+        .onChange(of: item.maintenanceRepairDate) { _ in scheduleAutoSave() }
+        .onChange(of: item.maintenanceNotes) { _ in scheduleAutoSave() }
+        .onChange(of: item.imageURL) { _ in scheduleAutoSave() }
+        .onDisappear {
+            guard canEdit else { return }
+            pendingAutoSave?.cancel()
+            store.saveGear(item)
+        }
+    }
+
+    private func scheduleAutoSave() {
+        guard canEdit else { return }
+        pendingAutoSave?.cancel()
+        let snapshot = item
+        let work = DispatchWorkItem {
+            store.saveGear(snapshot)
+        }
+        pendingAutoSave = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
     }
 
     private func loadAndUploadImage(from item: PhotosPickerItem) async {
@@ -5428,7 +5752,16 @@ struct AddGearView: View {
                             }
                         }
                     }
-                    TextField("Campus", text: $campus)
+                    if store.locations.isEmpty {
+                        TextField("Campus", text: $campus)
+                    } else {
+                        Picker("Campus", selection: $campus) {
+                            Text("Select campus").tag("")
+                            ForEach(store.locations.sorted(), id: \.self) { loc in
+                                Text(loc).tag(loc)
+                            }
+                        }
+                    }
                     Picker("Status", selection: $status) {
                         ForEach(GearItem.GearStatus.allCases, id: \.self) { status in
                             Text(status.rawValue).tag(status)
@@ -7473,6 +7806,12 @@ struct MainTabView: View {
 }
 
 struct MoreTabView: View {
+    @EnvironmentObject var store: ProdConnectStore
+
+    private var canSeeCustomize: Bool {
+        store.user?.isAdmin == true || store.user?.isOwner == true
+    }
+
     var body: some View {
         NavigationStack {
             List {
@@ -7486,10 +7825,12 @@ struct MoreTabView: View {
                 } label: {
                     Text("Ideas")
                 }
-                NavigationLink {
-                    CustomizeView()
-                } label: {
-                    Text("Customize")
+                if canSeeCustomize {
+                    NavigationLink {
+                        CustomizeView()
+                    } label: {
+                        Text("Customize")
+                    }
                 }
                 NavigationLink {
                     AccountView()
