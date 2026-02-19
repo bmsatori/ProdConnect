@@ -11,6 +11,8 @@ import PhotosUI
 import OneSignalFramework
 import WebKit
 import SafariServices
+import AVFoundation
+import Vision
 
 // NOTE: Preserved legacy block for reference, excluded from compilation to fix parser conflicts.
 /*
@@ -364,6 +366,10 @@ struct GearTabView: View {
     @State private var mergeResultMessage = ""
     @State private var showMergeResult = false
     @State private var duplicateGearGroupCount = 0
+    @State private var showSerialScanner = false
+    @State private var isRecognizingSerial = false
+    @State private var showScanAlert = false
+    @State private var scanAlertMessage = ""
 
     private var availableCategories: [String] {
         Array(Set(store.gear.map { $0.category.trimmingCharacters(in: .whitespacesAndNewlines) }))
@@ -381,10 +387,13 @@ struct GearTabView: View {
         var result = store.gear
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !query.isEmpty {
+            let normalizedQuery = query.lowercased()
             result = result.filter {
                 $0.name.localizedCaseInsensitiveContains(query) ||
                 $0.category.localizedCaseInsensitiveContains(query) ||
-                $0.location.localizedCaseInsensitiveContains(query)
+                $0.location.localizedCaseInsensitiveContains(query) ||
+                $0.serialNumber.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedQuery ||
+                $0.assetId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedQuery
             }
         }
         if let selectedCategory {
@@ -517,6 +526,23 @@ struct GearTabView: View {
         }
     }
 
+    private var searchControls: some View {
+        HStack(spacing: 8) {
+            SearchBar(text: $searchText)
+
+            Button(action: requestCameraAccessAndPresentScanner) {
+                Image(systemName: "camera.viewfinder")
+                    .font(.headline)
+                    .frame(width: 40, height: 40)
+                    .background(Color.blue.opacity(0.15))
+                    .foregroundColor(.blue)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+            .accessibilityLabel("Scan serial number")
+        }
+        .padding(.trailing)
+    }
+
     private var filterBar: some View {
         HStack(spacing: 12) {
             categoryMenu
@@ -598,10 +624,163 @@ struct GearTabView: View {
         }
     }
 
+    private func requestCameraAccessAndPresentScanner() {
+        guard UIImagePickerController.isSourceTypeAvailable(.camera) else {
+            scanAlertMessage = "Camera is not available on this device."
+            showScanAlert = true
+            return
+        }
+
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            showSerialScanner = true
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { granted in
+                DispatchQueue.main.async {
+                    if granted {
+                        showSerialScanner = true
+                    } else {
+                        scanAlertMessage = "Camera access is required to scan serial numbers."
+                        showScanAlert = true
+                    }
+                }
+            }
+        case .denied, .restricted:
+            scanAlertMessage = "Camera access is off. Enable it in Settings to scan serial numbers."
+            showScanAlert = true
+        @unknown default:
+            scanAlertMessage = "Unable to access camera right now."
+            showScanAlert = true
+        }
+    }
+
+    private func recognizeSerial(from image: UIImage, scanAreaInPreview: CGRect, previewSize: CGSize) {
+        guard let croppedImage = croppedImage(
+            from: image,
+            normalizedRectInPreview: scanAreaInPreview,
+            previewSize: previewSize
+        ),
+              let cgImage = croppedImage.cgImage else {
+            scanAlertMessage = "Could not read the captured image."
+            showScanAlert = true
+            return
+        }
+
+        isRecognizingSerial = true
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = false
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            do {
+                try handler.perform([request])
+                let observations = request.results ?? []
+                let textLines = observations.compactMap { $0.topCandidates(1).first?.string }
+                let bestCandidate = bestSerialCandidate(from: textLines)
+
+                DispatchQueue.main.async {
+                    isRecognizingSerial = false
+                    if let serial = bestCandidate {
+                        searchText = serial
+                    } else {
+                        scanAlertMessage = "No serial number text was detected. Try again with better lighting."
+                        showScanAlert = true
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    isRecognizingSerial = false
+                    scanAlertMessage = "Scan failed: \(error.localizedDescription)"
+                    showScanAlert = true
+                }
+            }
+        }
+    }
+
+    private func normalizedImage(_ image: UIImage) -> UIImage {
+        guard image.imageOrientation != .up else { return image }
+        UIGraphicsBeginImageContextWithOptions(image.size, false, image.scale)
+        image.draw(in: CGRect(origin: .zero, size: image.size))
+        let normalized = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+        return normalized ?? image
+    }
+
+    private func croppedImage(
+        from image: UIImage,
+        normalizedRectInPreview: CGRect,
+        previewSize: CGSize
+    ) -> UIImage? {
+        let uprightImage = normalizedImage(image)
+        guard let cgImage = uprightImage.cgImage else { return nil }
+        guard previewSize.width > 0, previewSize.height > 0 else { return nil }
+
+        let imageSize = CGSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height))
+        let scale = max(previewSize.width / imageSize.width, previewSize.height / imageSize.height)
+        let displayedSize = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+        let displayedOrigin = CGPoint(
+            x: (previewSize.width - displayedSize.width) / 2,
+            y: (previewSize.height - displayedSize.height) / 2
+        )
+
+        let scanRectInPreview = CGRect(
+            x: normalizedRectInPreview.origin.x * previewSize.width,
+            y: normalizedRectInPreview.origin.y * previewSize.height,
+            width: normalizedRectInPreview.size.width * previewSize.width,
+            height: normalizedRectInPreview.size.height * previewSize.height
+        )
+
+        let scanRectInImage = CGRect(
+            x: (scanRectInPreview.origin.x - displayedOrigin.x) / scale,
+            y: (scanRectInPreview.origin.y - displayedOrigin.y) / scale,
+            width: scanRectInPreview.size.width / scale,
+            height: scanRectInPreview.size.height / scale
+        )
+        let fullRect = CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height)
+        let cropRect = CGRect(
+            x: scanRectInImage.origin.x,
+            y: scanRectInImage.origin.y,
+            width: scanRectInImage.size.width,
+            height: scanRectInImage.size.height
+        )
+        .integral
+        .intersection(fullRect)
+
+        guard cropRect.width > 1, cropRect.height > 1,
+              let cropped = cgImage.cropping(to: cropRect) else { return nil }
+
+        return UIImage(cgImage: cropped, scale: uprightImage.scale, orientation: .up)
+    }
+
+    private func bestSerialCandidate(from lines: [String]) -> String? {
+        let tokens = lines
+            .flatMap { $0.components(separatedBy: .whitespacesAndNewlines) }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .map { token in
+                token.replacingOccurrences(
+                    of: "[^A-Za-z0-9\\-_.]",
+                    with: "",
+                    options: .regularExpression
+                )
+            }
+            .filter { token in
+                token.count >= 4 && token.rangeOfCharacter(from: .decimalDigits) != nil
+            }
+
+        if let bestToken = tokens.max(by: { $0.count < $1.count }) {
+            return bestToken
+        }
+
+        return lines
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty && $0.rangeOfCharacter(from: .decimalDigits) != nil }
+    }
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                SearchBar(text: $searchText)
+                searchControls
                 filterBar
                 List {
                     ForEach(filteredGear) { item in
@@ -636,6 +815,14 @@ struct GearTabView: View {
                 }
                 .environmentObject(store)
             }
+            .sheet(isPresented: $showSerialScanner) {
+                SerialCameraCaptureView { image, scanAreaInPreview, previewSize in
+                    showSerialScanner = false
+                    recognizeSerial(from: image, scanAreaInPreview: scanAreaInPreview, previewSize: previewSize)
+                } onCancel: {
+                    showSerialScanner = false
+                }
+            }
             .sheet(isPresented: Binding(get: { exportURL != nil }, set: { if !$0 { exportURL = nil } })) {
                 if let url = exportURL {
                     ShareSheet(items: [url])
@@ -652,12 +839,190 @@ struct GearTabView: View {
             } message: {
                 Text(mergeResultMessage)
             }
+            .alert("Serial Scan", isPresented: $showScanAlert) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(scanAlertMessage)
+            }
+            .overlay {
+                if isRecognizingSerial {
+                    ZStack {
+                        Color.black.opacity(0.25).ignoresSafeArea()
+                        ProgressView("Reading serial number...")
+                            .padding(16)
+                            .background(Color(.systemBackground))
+                            .cornerRadius(12)
+                    }
+                }
+            }
             .onAppear {
                 refreshDuplicateGroupCount()
             }
             .onReceive(store.$gear) { _ in
                 refreshDuplicateGroupCount()
             }
+        }
+    }
+}
+
+struct SerialCameraCaptureView: UIViewControllerRepresentable {
+    private let defaultScanArea = CGRect(x: 0.08, y: 0.40, width: 0.84, height: 0.20)
+    let onCapture: (UIImage, CGRect, CGSize) -> Void
+    let onCancel: () -> Void
+
+    func makeUIViewController(context: Context) -> ScannerHostViewController {
+        ScannerHostViewController(
+            scanAreaNormalized: defaultScanArea,
+            onCapture: onCapture,
+            onCancel: onCancel
+        )
+    }
+
+    func updateUIViewController(_ uiViewController: ScannerHostViewController, context: Context) {}
+}
+
+final class ScannerHostViewController: UIViewController, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
+    private let scanAreaNormalized: CGRect
+    private let onCapture: (UIImage, CGRect, CGSize) -> Void
+    private let onCancel: () -> Void
+
+    private let picker = UIImagePickerController()
+    private let maskLayer = CAShapeLayer()
+    private let boxLayer = CAShapeLayer()
+    private let guideLineLayer = CAShapeLayer()
+    private let instructionLabel = UILabel()
+    private let captureButton = UIButton(type: .system)
+    private let cancelButton = UIButton(type: .system)
+    private var isCapturing = false
+
+    init(
+        scanAreaNormalized: CGRect,
+        onCapture: @escaping (UIImage, CGRect, CGSize) -> Void,
+        onCancel: @escaping () -> Void
+    ) {
+        self.scanAreaNormalized = scanAreaNormalized
+        self.onCapture = onCapture
+        self.onCancel = onCancel
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+
+        picker.sourceType = .camera
+        picker.cameraCaptureMode = .photo
+        picker.showsCameraControls = false
+        picker.allowsEditing = false
+        picker.delegate = self
+
+        addChild(picker)
+        picker.view.frame = view.bounds
+        picker.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(picker.view)
+        picker.didMove(toParent: self)
+
+        maskLayer.fillRule = .evenOdd
+        maskLayer.fillColor = UIColor.black.withAlphaComponent(0.45).cgColor
+        view.layer.addSublayer(maskLayer)
+
+        boxLayer.strokeColor = UIColor.systemYellow.cgColor
+        boxLayer.fillColor = UIColor.clear.cgColor
+        boxLayer.lineWidth = 2
+        boxLayer.lineDashPattern = [8, 6]
+        view.layer.addSublayer(boxLayer)
+
+        guideLineLayer.strokeColor = UIColor.systemYellow.withAlphaComponent(0.9).cgColor
+        guideLineLayer.lineWidth = 1.5
+        view.layer.addSublayer(guideLineLayer)
+
+        instructionLabel.text = "Align serial number inside the box"
+        instructionLabel.textColor = .white
+        instructionLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        instructionLabel.textAlignment = .center
+        view.addSubview(instructionLabel)
+
+        captureButton.setTitle("Capture", for: .normal)
+        captureButton.setTitleColor(.black, for: .normal)
+        captureButton.titleLabel?.font = .systemFont(ofSize: 18, weight: .bold)
+        captureButton.backgroundColor = UIColor.white.withAlphaComponent(0.95)
+        captureButton.layer.cornerRadius = 28
+        captureButton.layer.borderWidth = 2
+        captureButton.layer.borderColor = UIColor.black.withAlphaComponent(0.18).cgColor
+        captureButton.addTarget(self, action: #selector(capturePressed), for: .touchUpInside)
+        view.addSubview(captureButton)
+
+        cancelButton.setTitle("Cancel", for: .normal)
+        cancelButton.setTitleColor(.white, for: .normal)
+        cancelButton.titleLabel?.font = .systemFont(ofSize: 17, weight: .semibold)
+        cancelButton.addTarget(self, action: #selector(cancelPressed), for: .touchUpInside)
+        view.addSubview(cancelButton)
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        picker.view.frame = view.bounds
+
+        let layoutBounds = view.bounds
+        let scanUIBounds = CGRect(
+            x: 0,
+            y: 0,
+            width: layoutBounds.width,
+            height: max(layoutBounds.height - 190, layoutBounds.height * 0.72)
+        )
+        let scanRect = CGRect(
+            x: scanUIBounds.width * scanAreaNormalized.origin.x,
+            y: scanUIBounds.height * scanAreaNormalized.origin.y,
+            width: scanUIBounds.width * scanAreaNormalized.size.width,
+            height: scanUIBounds.height * scanAreaNormalized.size.height
+        )
+
+        let outerPath = UIBezierPath(rect: scanUIBounds)
+        outerPath.append(UIBezierPath(roundedRect: scanRect, cornerRadius: 14))
+        maskLayer.path = outerPath.cgPath
+        boxLayer.path = UIBezierPath(roundedRect: scanRect, cornerRadius: 14).cgPath
+
+        let linePath = UIBezierPath()
+        linePath.move(to: CGPoint(x: scanRect.minX + 12, y: scanRect.midY))
+        linePath.addLine(to: CGPoint(x: scanRect.maxX - 12, y: scanRect.midY))
+        guideLineLayer.path = linePath.cgPath
+
+        instructionLabel.frame = CGRect(x: 24, y: scanRect.minY - 42, width: scanUIBounds.width - 48, height: 24)
+        captureButton.frame = CGRect(x: (layoutBounds.width - 150) / 2, y: layoutBounds.height - 92, width: 150, height: 56)
+        cancelButton.frame = CGRect(x: 18, y: 52, width: 80, height: 36)
+    }
+
+    @objc private func capturePressed() {
+        guard !isCapturing else { return }
+        isCapturing = true
+        captureButton.isEnabled = false
+        captureButton.alpha = 0.55
+        picker.takePicture()
+    }
+
+    @objc private func cancelPressed() {
+        onCancel()
+    }
+
+    func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+        onCancel()
+    }
+
+    func imagePickerController(
+        _ picker: UIImagePickerController,
+        didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey : Any]
+    ) {
+        isCapturing = false
+        captureButton.isEnabled = true
+        captureButton.alpha = 1.0
+        if let image = info[.originalImage] as? UIImage {
+            onCapture(image, scanAreaNormalized, view.bounds.size)
+        } else {
+            onCancel()
         }
     }
 }
