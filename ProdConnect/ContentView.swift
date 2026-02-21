@@ -460,47 +460,37 @@ struct GearTabView: View {
         guard !filteredGear.isEmpty else { return }
         isExporting = true
 
-        // Spreadsheet-friendly XML that opens in Excel/Numbers; saved with .xlsx per current app expectation.
-        var rows = ""
-        for item in filteredGear {
-            rows += """
-            <Row>
-            <Cell><Data ss:Type="String">\(item.name.xmlEscaped)</Data></Cell>
-            <Cell><Data ss:Type="String">\(item.category.xmlEscaped)</Data></Cell>
-            <Cell><Data ss:Type="String">\(item.status.rawValue.xmlEscaped)</Data></Cell>
-            <Cell><Data ss:Type="String">\(item.location.xmlEscaped)</Data></Cell>
-            <Cell><Data ss:Type="String">\(item.serialNumber.xmlEscaped)</Data></Cell>
-            <Cell><Data ss:Type="String">\(item.maintenanceNotes.xmlEscaped)</Data></Cell>
-            </Row>
-            """
+        let header = [
+            "Name",
+            "Category",
+            "Status",
+            "Location",
+            "Campus",
+            "Serial Number",
+            "Asset ID",
+            "Purchased From",
+            "Notes"
+        ].map(\.csvEscaped).joined(separator: ",")
+
+        let rows = filteredGear.map { item in
+            [
+                item.name,
+                item.category,
+                item.status.rawValue,
+                item.location,
+                item.campus,
+                item.serialNumber,
+                item.assetId,
+                item.purchasedFrom,
+                item.maintenanceNotes
+            ].map(\.csvEscaped).joined(separator: ",")
         }
 
-        let xml = """
-        <?xml version="1.0"?>
-        <?mso-application progid="Excel.Sheet"?>
-        <Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
-         xmlns:o="urn:schemas-microsoft-com:office:office"
-         xmlns:x="urn:schemas-microsoft-com:office:excel"
-         xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
-        <Worksheet ss:Name="Gear">
-        <Table>
-        <Row>
-        <Cell><Data ss:Type="String">Name</Data></Cell>
-        <Cell><Data ss:Type="String">Category</Data></Cell>
-        <Cell><Data ss:Type="String">Status</Data></Cell>
-        <Cell><Data ss:Type="String">Location</Data></Cell>
-        <Cell><Data ss:Type="String">Serial</Data></Cell>
-        <Cell><Data ss:Type="String">Notes</Data></Cell>
-        </Row>
-        \(rows)
-        </Table>
-        </Worksheet>
-        </Workbook>
-        """
-
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("GearExport.xlsx")
+        // Add UTF-8 BOM so Excel reliably detects UTF-8.
+        let csv = "\u{FEFF}" + ([header] + rows).joined(separator: "\n")
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("GearExport.csv")
         do {
-            try xml.write(to: url, atomically: true, encoding: .utf8)
+            try csv.write(to: url, atomically: true, encoding: .utf8)
             exportURL = url
         } catch {
             mergeResultMessage = "Export failed: \(error.localizedDescription)"
@@ -2296,15 +2286,7 @@ struct ContentView: View {
     func listenToTeamMembers() {
         guard let current = user else { return }
         listenerRegistration?.remove()
-        
-        // For free accounts, only show themselves
-        if current.subscriptionTier == "free" {
-            DispatchQueue.main.async {
-                self.teamMembers = [current]
-            }
-            return
-        }
-        
+
         self.db.collection("users")
             .whereField("teamCode", isEqualTo: current.teamCode ?? "")
             .getDocuments { snapshot, error in
@@ -3624,125 +3606,125 @@ struct AccountView: View {
         return version.isEmpty ? "" : "v\(version)"
     }
 
-    private let actionButtonHeight: CGFloat = 40
+    private let actionButtonHeight: CGFloat = 34
     private let termsURLString = "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/"
     // Replace with your app's public privacy policy URL before App Store submission.
     private let privacyPolicyURLString = "https://bmsatori.github.io/prodconnect-privacy/"
+    
+    private var effectiveSubscriptionTier: String {
+        let ownTier = store.user?.subscriptionTier.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "free"
+        let teamCode = store.user?.teamCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !teamCode.isEmpty else { return ownTier }
+
+        let teamMembers = store.teamMembers.filter {
+            ($0.teamCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") == teamCode
+        }
+        if teamMembers.contains(where: { $0.subscriptionTier.lowercased() == "premium" }) { return "premium" }
+        if ownTier == "premium" { return "premium" }
+        if teamMembers.contains(where: { $0.subscriptionTier.lowercased() == "basic" }) { return "basic" }
+        if ownTier == "basic" { return "basic" }
+        return "free"
+    }
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 16) {
-                if isLoading {
-                    ProgressView("Loading account...")
-                } else {
-                    VStack(spacing: 8) {
-                        Text(displayName)
-                            .font(.title)
-                            .fontWeight(.bold)
+        VStack(spacing: 16) {
+            if isLoading {
+                ProgressView("Loading account...")
+            } else {
+                VStack(spacing: 8) {
+                    Text(displayName)
+                        .font(.title)
+                        .fontWeight(.bold)
+                        .foregroundColor(.white)
+
+                    Text(email)
+                        .font(.subheadline)
+                        .foregroundColor(.gray)
+
+                    if isAdmin {
+                        Text("Admin")
+                            .font(.caption)
+                            .padding(6)
+                            .background(Color.blue.opacity(0.2))
+                            .cornerRadius(8)
                             .foregroundColor(.white)
-                        
-                        Text(email)
-                            .font(.subheadline)
-                            .foregroundColor(.gray)
-                        
-                        if isAdmin {
-                            Text("Admin")
-                                .font(.caption)
-                                .padding(6)
-                                .background(Color.blue.opacity(0.2))
-                                .cornerRadius(8)
-                                .foregroundColor(.white)
-                        }
                     }
-                    .padding(.top, 20)
-                    
-                    Divider()
-                        .background(Color.gray)
-                        .padding(.vertical, 10)
-                    
-                    VStack(alignment: .leading, spacing: 12) {
+                }
+                .padding(.top, 20)
+
+                Divider()
+                    .background(Color.gray)
+                    .padding(.vertical, 10)
+
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Text("Subscription Level:")
+                            .foregroundColor(.white)
+                            .fontWeight(.medium)
+                        Spacer()
+                        Text(effectiveSubscriptionTier.capitalized)
+                            .foregroundColor(.white)
+                            .fontWeight(.medium)
+                    }
+
+                    // Only show Team Code for non-free users
+                    if effectiveSubscriptionTier != "free" {
                         HStack {
-                            Text("Subscription Level:")
+                            Text("Team Code:")
                                 .foregroundColor(.white)
                                 .fontWeight(.medium)
                             Spacer()
-                            Text(store.user?.subscriptionTier.capitalized ?? "Free")
+                            Text(teamCode)
                                 .foregroundColor(.white)
                                 .fontWeight(.medium)
                         }
-                        
-                        // Only show Team Code for non-free users
-                        if store.user?.subscriptionTier != "free" {
-                            HStack {
-                                Text("Team Code:")
-                                    .foregroundColor(.white)
-                                    .fontWeight(.medium)
-                                Spacer()
-                                Text(teamCode)
-                                    .foregroundColor(.white)
-                                    .fontWeight(.medium)
-                            }
-                        }
-                        
+                    }
+
+                    HStack {
+                        Text("Role:")
+                            .foregroundColor(.white)
+                            .fontWeight(.medium)
+                        Spacer()
+                        let roleLabel = isAdmin ? (store.user?.isOwner == true ? "Owner" : "Admin") : "Basic"
+                        Text(roleLabel)
+                            .foregroundColor(isAdmin ? .green : .white)
+                            .fontWeight(.medium)
+                    }
+
+                    if !appVersionText.isEmpty {
                         HStack {
-                            Text("Role:")
+                            Text("App Version:")
                                 .foregroundColor(.white)
                                 .fontWeight(.medium)
                             Spacer()
-                            let roleLabel = isAdmin ? (store.user?.isOwner == true ? "Owner" : "Admin") : "Basic"
-                            Text(roleLabel)
-                                .foregroundColor(isAdmin ? .green : .white)
+                            Text(appVersionText)
+                                .foregroundColor(.gray)
                                 .fontWeight(.medium)
                         }
-
-                        if !appVersionText.isEmpty {
-                            HStack {
-                                Text("App Version:")
-                                    .foregroundColor(.white)
-                                    .fontWeight(.medium)
-                                Spacer()
-                                Text(appVersionText)
-                                    .foregroundColor(.gray)
-                                    .fontWeight(.medium)
-                            }
-                        }
                     }
-                    .padding(.horizontal)
+                }
+                .padding(.horizontal)
 
-                    Spacer()
-                    
-                    if store.user?.subscriptionTier == "free" {
-                        HStack(spacing: 8) {
-                            Button(action: {
-                                showJoinTeamAlert = true
-                            }) {
-                                Text("Join Team")
-                                    .font(.subheadline.weight(.semibold))
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: actionButtonHeight)
-                                    .background(Color.green)
-                                    .foregroundColor(.white)
-                                    .cornerRadius(10)
-                            }
-                            
-                            Button(action: {
-                                showSubscriptionOptions = true
-                            }) {
-                                Text("Subscribe")
-                                    .font(.subheadline.weight(.semibold))
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: actionButtonHeight)
-                                    .background(Color.blue)
-                                    .foregroundColor(.white)
-                                    .cornerRadius(10)
-                            }
+                Spacer()
+
+                if effectiveSubscriptionTier == "free" {
+                    HStack(spacing: 8) {
+                        Button(action: {
+                            showJoinTeamAlert = true
+                        }) {
+                            Text("Join Team")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .frame(height: actionButtonHeight)
+                                .background(Color.green)
+                                .foregroundColor(.white)
+                                .cornerRadius(10)
                         }
-                        .padding(.horizontal)
-                    } else if store.user?.subscriptionTier == "basic", store.user?.isAdmin == true {
+
                         Button(action: {
                             showSubscriptionOptions = true
                         }) {
-                            Text("Upgrade Subscription")
+                            Text("Subscribe")
                                 .font(.subheadline.weight(.semibold))
                                 .frame(maxWidth: .infinity)
                                 .frame(height: actionButtonHeight)
@@ -3750,51 +3732,66 @@ struct AccountView: View {
                                 .foregroundColor(.white)
                                 .cornerRadius(10)
                         }
-                        .padding(.horizontal)
-                    }
-
-                    HStack(spacing: 8) {
-                        Button(action: { showEditAccount = true }) {
-                            Text("Edit Account")
-                                .font(.subheadline.weight(.semibold))
-                                .frame(maxWidth: .infinity)
-                                .frame(height: actionButtonHeight)
-                                .background(Color.blue.opacity(0.7))
-                                .foregroundColor(.white)
-                                .cornerRadius(10)
-                        }
-
-                        NavigationLink {
-                            ContactView()
-                        } label: {
-                            Text("Support")
-                                .font(.subheadline.weight(.semibold))
-                                .frame(maxWidth: .infinity)
-                                .frame(height: actionButtonHeight)
-                                .background(Color.gray.opacity(0.25))
-                                .foregroundColor(.white)
-                                .cornerRadius(10)
-                        }
-
-                        Button(action: signOut) {
-                            Text("Sign Out")
-                                .font(.subheadline.weight(.semibold))
-                                .frame(maxWidth: .infinity)
-                                .frame(height: actionButtonHeight)
-                                .background(Color.red)
-                                .foregroundColor(.white)
-                                .cornerRadius(10)
-                        }
                     }
                     .padding(.horizontal)
+                } else if effectiveSubscriptionTier == "basic", store.user?.isAdmin == true {
+                    Button(action: {
+                        showSubscriptionOptions = true
+                    }) {
+                        Text("Upgrade Subscription")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .frame(height: actionButtonHeight)
+                            .background(Color.blue)
+                            .foregroundColor(.white)
+                            .cornerRadius(10)
+                    }
+                    .padding(.horizontal)
+                }
+
+                HStack(spacing: 8) {
+                    Button(action: { showEditAccount = true }) {
+                        Text("Edit Account")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .frame(height: actionButtonHeight)
+                            .background(Color.blue.opacity(0.7))
+                            .foregroundColor(.white)
+                            .cornerRadius(10)
+                    }
+
+                    Button(action: signOut) {
+                        Text("Sign Out")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .frame(height: actionButtonHeight)
+                            .background(Color.red)
+                            .foregroundColor(.white)
+                            .cornerRadius(10)
+                    }
+                }
+                .padding(.horizontal)
+
+                HStack(spacing: 8) {
+                    NavigationLink {
+                        ContactView()
+                    } label: {
+                        Text("Support")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .frame(height: actionButtonHeight)
+                            .background(Color.gray.opacity(0.25))
+                            .foregroundColor(.white)
+                            .cornerRadius(10)
+                    }
 
                     Button(action: { showDeleteAccountStep1 = true }) {
-                        HStack {
+                        HStack(spacing: 6) {
                             if isDeletingAccount {
                                 ProgressView()
                                     .progressViewStyle(.circular)
                             }
-                            Text(isDeletingAccount ? "Deleting Account..." : "Delete Account")
+                            Text(isDeletingAccount ? "Deleting..." : "Delete")
                                 .font(.subheadline.weight(.semibold))
                         }
                         .frame(maxWidth: .infinity)
@@ -3804,98 +3801,95 @@ struct AccountView: View {
                         .cornerRadius(10)
                     }
                     .disabled(isDeletingAccount)
-                    .padding(.horizontal)
                 }
-                
-                if let errorMessage = errorMessage {
-                    Text(errorMessage)
-                        .foregroundColor(.red)
-                        .padding()
-                }
+                .padding(.horizontal)
             }
-            .navigationTitle("Account")
-            .onAppear {
-                loadUserInfo()
-                Task {
-                    await IAPManager.shared.fetchProducts()
-                }
+
+            if let errorMessage = errorMessage {
+                Text(errorMessage)
+                    .foregroundColor(.red)
+                    .padding()
             }
-            .alert("Join Team", isPresented: $showJoinTeamAlert) {
-                TextField("Team Code", text: $joinTeamCode)
-                Button("Cancel", role: .cancel) {
-                    joinTeamCode = ""
-                }
-                Button("Join", action: joinTeam)
-                    .disabled(joinTeamCode.trimmingCharacters(in: .whitespaces).isEmpty || isJoiningTeam)
-            } message: {
-                Text("Enter the team code to join an existing team.")
+        }
+        .navigationTitle("Account")
+        .onAppear {
+            loadUserInfo()
+        }
+        .alert("Join Team", isPresented: $showJoinTeamAlert) {
+            TextField("Team Code", text: $joinTeamCode)
+            Button("Cancel", role: .cancel) {
+                joinTeamCode = ""
             }
-            .sheet(isPresented: $showSubscriptionOptions) {
-                SubscriptionOptionsSheet(
-                    termsURLString: termsURLString,
-                    privacyPolicyURLString: privacyPolicyURLString,
-                    onPurchaseBasic: {
-                        do {
-                            try await IAPManager.shared.purchaseSubscriptionWithError(for: store)
-                            showSubscriptionOptions = false
-                        } catch {
-                            purchaseError = error.localizedDescription
-                            showPurchaseError = true
-                        }
-                    },
-                    onPurchasePremium: {
-                        do {
-                            try await IAPManager.shared.purchasePremiumWithError(productID: "Premium1", for: store)
-                            showSubscriptionOptions = false
-                        } catch {
-                            purchaseError = error.localizedDescription
-                            showPurchaseError = true
-                        }
+            Button("Join", action: joinTeam)
+                .disabled(joinTeamCode.trimmingCharacters(in: .whitespaces).isEmpty || isJoiningTeam)
+        } message: {
+            Text("Enter the team code to join an existing team.")
+        }
+        .sheet(isPresented: $showSubscriptionOptions) {
+            SubscriptionOptionsSheet(
+                termsURLString: termsURLString,
+                privacyPolicyURLString: privacyPolicyURLString,
+                onPurchaseBasic: {
+                    do {
+                        try await IAPManager.shared.purchaseSubscriptionWithError(for: store)
+                        showSubscriptionOptions = false
+                    } catch {
+                        purchaseError = error.localizedDescription
+                        showPurchaseError = true
                     }
-                )
+                },
+                onPurchasePremium: {
+                    do {
+                        try await IAPManager.shared.purchasePremiumWithError(productID: "Premium1", for: store)
+                        showSubscriptionOptions = false
+                    } catch {
+                        purchaseError = error.localizedDescription
+                        showPurchaseError = true
+                    }
+                }
+            )
+            .environmentObject(store)
+        }
+        .alert("Purchase Error", isPresented: $showPurchaseError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(purchaseError ?? "Unknown error")
+        }
+        .sheet(isPresented: $showEditAccount, onDismiss: loadUserInfo) {
+            EditAccountView()
                 .environmentObject(store)
+        }
+        .confirmationDialog("Delete Account?", isPresented: $showDeleteAccountStep1, titleVisibility: .visible) {
+            Button("Continue", role: .destructive) {
+                deleteConfirmationText = ""
+                showDeleteAccountStep2 = true
             }
-            .alert("Purchase Error", isPresented: $showPurchaseError) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text(purchaseError ?? "Unknown error")
-            }
-            .sheet(isPresented: $showEditAccount, onDismiss: loadUserInfo) {
-                EditAccountView()
-                    .environmentObject(store)
-            }
-            .confirmationDialog("Delete Account?", isPresented: $showDeleteAccountStep1, titleVisibility: .visible) {
-                Button("Continue", role: .destructive) {
-                    deleteConfirmationText = ""
-                    showDeleteAccountStep2 = true
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("This starts account deletion. You will confirm one more time on the next screen.")
-            }
-            .sheet(isPresented: $showDeleteAccountStep2) {
-                NavigationStack {
-                    Form {
-                        Section("Confirm Deletion") {
-                            Text("Type DELETE below to permanently delete your account.")
-                                .font(.footnote)
-                                .foregroundColor(.secondary)
-                            TextField("Type DELETE", text: $deleteConfirmationText)
-                                .textInputAutocapitalization(.characters)
-                                .autocorrectionDisabled(true)
-                        }
-                        Section {
-                            Button("Delete My Account", role: .destructive) {
-                                performAccountDeletion()
-                            }
-                            .disabled(deleteConfirmationText != "DELETE" || isDeletingAccount)
-                        }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This starts account deletion. You will confirm one more time on the next screen.")
+        }
+        .sheet(isPresented: $showDeleteAccountStep2) {
+            NavigationStack {
+                Form {
+                    Section("Confirm Deletion") {
+                        Text("Type DELETE below to permanently delete your account.")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                        TextField("Type DELETE", text: $deleteConfirmationText)
+                            .textInputAutocapitalization(.characters)
+                            .autocorrectionDisabled(true)
                     }
-                    .navigationTitle("Delete Account")
-                    .toolbar {
-                        ToolbarItem(placement: .cancellationAction) {
-                            Button("Cancel") { showDeleteAccountStep2 = false }
+                    Section {
+                        Button("Delete My Account", role: .destructive) {
+                            performAccountDeletion()
                         }
+                        .disabled(deleteConfirmationText != "DELETE" || isDeletingAccount)
+                    }
+                }
+                .navigationTitle("Delete Account")
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") { showDeleteAccountStep2 = false }
                     }
                 }
             }
@@ -3995,41 +3989,63 @@ struct AccountView: View {
             return
         }
 
+        NSLog("[DIAG] AccountView loadUserInfo start uid=%@", user.uid)
+        isLoading = true
         email = user.email ?? "Unknown"
-        
+
+        let fallbackDisplayName = email.components(separatedBy: "@").first ?? "User"
+        let fallbackTeamCode = "N/A"
+
+        // Fail-safe so account screen cannot remain blocked forever.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+            if self.isLoading {
+                NSLog("[DIAG] AccountView loadUserInfo timeout fallback")
+                self.displayName = fallbackDisplayName
+                self.teamCode = fallbackTeamCode
+                self.isAdmin = self.store.user?.isAdmin ?? false
+                self.isLoading = false
+            }
+        }
+
         // Use store's user data if available, otherwise fetch from Firestore
         if let storeUser = store.user {
-            displayName = storeUser.displayName ?? email.components(separatedBy: "@").first ?? "User"
+            displayName = storeUser.displayName
             teamCode = storeUser.teamCode ?? "N/A"
             isAdmin = storeUser.isAdmin
             isLoading = false
+            NSLog("[DIAG] AccountView loadUserInfo using store.user")
             return
         }
-        
-        // Fetch display name from Firestore
-        store.db.collection("users").whereField("email", isEqualTo: email).getDocuments { snapshot, error in
+
+        // Fetch profile directly by uid to avoid slow/blocked query paths.
+        store.db.collection("users").document(user.uid).getDocument { snapshot, error in
             DispatchQueue.main.async {
                 if let error = error {
+                    NSLog("[DIAG] AccountView loadUserInfo firestore error: %@", error.localizedDescription)
                     self.errorMessage = "Error loading user: \(error.localizedDescription)"
-                    self.isLoading = false
-                    return
-                }
-
-                guard let doc = snapshot?.documents.first else {
-                    self.displayName = email.components(separatedBy: "@").first ?? "User"
-                    self.teamCode = "N/A"
+                    self.displayName = fallbackDisplayName
+                    self.teamCode = fallbackTeamCode
                     self.isAdmin = false
                     self.isLoading = false
                     return
                 }
 
-                let data = doc.data()
+                guard let data = snapshot?.data() else {
+                    NSLog("[DIAG] AccountView loadUserInfo missing user doc")
+                    self.displayName = fallbackDisplayName
+                    self.teamCode = fallbackTeamCode
+                    self.isAdmin = false
+                    self.isLoading = false
+                    return
+                }
+
                 self.displayName = (data["displayName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
                     ?? (data["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-                    ?? email.components(separatedBy: "@").first ?? "User"
-                self.teamCode = data["teamCode"] as? String ?? "N/A"
+                    ?? fallbackDisplayName
+                self.teamCode = data["teamCode"] as? String ?? fallbackTeamCode
                 self.isAdmin = data["isAdmin"] as? Bool ?? false
                 self.isLoading = false
+                NSLog("[DIAG] AccountView loadUserInfo completed")
             }
         }
     }
@@ -5629,6 +5645,11 @@ struct TrainingListView: View {
 }
 
 private extension String {
+    var csvEscaped: String {
+        let escaped = self.replacingOccurrences(of: "\"", with: "\"\"")
+        return "\"\(escaped)\""
+    }
+
     var xmlEscaped: String {
         self
             .replacingOccurrences(of: "&", with: "&amp;")
@@ -6575,6 +6596,11 @@ struct ChecklistsListView: View {
 }
 
 struct ChecklistRunView: View {
+    private enum MentionTarget: Equatable {
+        case existingItem(String)
+        case newItem
+    }
+
     @EnvironmentObject var store: ProdConnectStore
     @State var template: ChecklistTemplate
     @Environment(\.dismiss) private var dismiss
@@ -6582,6 +6608,8 @@ struct ChecklistRunView: View {
     @State private var draftDueDate = Date()
     @State private var isEditingChecklist = false
     @State private var newChecklistItemText = ""
+    @State private var activeMentionTarget: MentionTarget? = nil
+    @State private var activeMentionQuery: String = ""
     var canEdit: Bool { store.canEditChecklists }
 
     var body: some View {
@@ -6622,17 +6650,27 @@ struct ChecklistRunView: View {
             Section {
                 ForEach($template.items) { $item in
                     VStack(alignment: .leading, spacing: 4) {
+                        if canEdit && isEditingChecklist {
+                            inlineMentionSuggestions(for: .existingItem(item.id))
+                        }
                         HStack {
-                            Button(action: { toggleItem(&item) }) {
+                            Button(action: { toggleItem(itemID: item.id) }) {
                                 Image(systemName: item.isDone ? "checkmark.circle.fill" : "circle")
                                     .foregroundColor(item.isDone ? .green : .secondary)
                             }
                             .buttonStyle(.plain)
-                            .disabled(!canEdit || !isEditingChecklist)
+                            .disabled(!canEdit)
                             if canEdit && isEditingChecklist {
-                                TextField("Checklist item", text: $item.text)
+                                TextField("Checklist item", text: Binding(
+                                    get: { item.text },
+                                    set: { newValue in
+                                        item.text = newValue
+                                        updateMentionContext(for: newValue, target: .existingItem(item.id))
+                                        persistChecklistDraft()
+                                    }
+                                ))
                             } else {
-                                Text(item.text)
+                                Text(displayChecklistText(item.text))
                             }
                             if canEdit && isEditingChecklist {
                                 Button(role: .destructive) {
@@ -6643,33 +6681,61 @@ struct ChecklistRunView: View {
                                 .buttonStyle(.plain)
                             }
                         }
+                        let assignedMembers = mentionedMembers(in: item.text)
+                        if !assignedMembers.isEmpty {
+                            Text("Assigned to \(assignedMembers.map(displayName(for:)).joined(separator: ", "))")
+                                .font(.caption2.weight(.regular))
+                                .foregroundColor(.secondary)
+                                .padding(.leading, 28)
+                        }
                         if item.isDone, let completedAt = item.completedAt {
                             let by = item.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines)
                             if let by, !by.isEmpty {
                                 Text("Checked by \(by) on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
                                     .font(.caption2)
                                     .foregroundColor(.secondary)
+                                    .padding(.leading, 28)
                             } else {
                                 Text("Checked on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
                                     .font(.caption2)
                                     .foregroundColor(.secondary)
+                                    .padding(.leading, 28)
                             }
                         }
                     }
+                    .padding(.vertical, 4)
+                    .padding(.horizontal, 6)
+                    .background(isAssignedToCurrentUser(item: item) ? Color.yellow.opacity(0.20) : Color.clear)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
                 }
             }
             if canEdit && isEditingChecklist {
                 Section(header: Text("Add Item")) {
+                    inlineMentionSuggestions(for: .newItem)
                     HStack {
-                        TextField("New checklist item", text: $newChecklistItemText)
+                        TextField("New checklist item", text: Binding(
+                            get: { newChecklistItemText },
+                            set: { newValue in
+                                newChecklistItemText = newValue
+                                updateMentionContext(for: newValue, target: .newItem)
+                            }
+                        ))
                         Button("Add") {
                             let trimmed = newChecklistItemText.trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !trimmed.isEmpty else { return }
                             template.items.append(ChecklistItem(text: trimmed))
                             newChecklistItemText = ""
+                            activeMentionTarget = nil
+                            activeMentionQuery = ""
+                            persistChecklistDraft()
                         }
                         .disabled(newChecklistItemText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
+                }
+                Section {
+                    Text("Tip: tag users in an item like @alex to assign it.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
             }
             Section {
@@ -6700,6 +6766,7 @@ struct ChecklistRunView: View {
             DispatchQueue.main.async {
                 NSLog("[DIAG] ChecklistRunView onAppear fired")
             }
+            store.listenToTeamMembers()
             isEditingChecklist = false
             if let dueDate = template.dueDate {
                 hasDueDate = true
@@ -6709,18 +6776,63 @@ struct ChecklistRunView: View {
                 draftDueDate = Date()
             }
             newChecklistItemText = ""
+            activeMentionTarget = nil
+            activeMentionQuery = ""
+        }
+        .onDisappear {
+            if canEdit && isEditingChecklist {
+                template.dueDate = hasDueDate ? draftDueDate : nil
+                persistChecklistDraft()
+            }
         }
     }
 
-    private func toggleItem(_ item: inout ChecklistItem) {
-        item.isDone.toggle()
-        if item.isDone {
-            item.completedAt = Date()
-            item.completedBy = completionUserLabel
-        } else {
-            item.completedAt = nil
-            item.completedBy = nil
+    @ViewBuilder
+    private func inlineMentionSuggestions(for target: MentionTarget) -> some View {
+        if activeMentionTarget == target {
+            let suggestions = mentionSuggestions(for: activeMentionQuery)
+            if !suggestions.isEmpty {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(suggestions.prefix(6)) { member in
+                        Button {
+                            applyMention(member, to: target)
+                        } label: {
+                            Text(displayName(for: member))
+                                .font(.subheadline)
+                                .foregroundColor(.primary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 7)
+                        }
+                        .buttonStyle(.plain)
+                        if member.id != suggestions.prefix(6).last?.id {
+                            Divider()
+                        }
+                    }
+                }
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.secondary.opacity(0.25), lineWidth: 1)
+                )
+                .padding(.leading, 28)
+                .padding(.bottom, 4)
+            }
         }
+    }
+
+    private func toggleItem(itemID: String) {
+        guard let idx = template.items.firstIndex(where: { $0.id == itemID }) else { return }
+        template.items[idx].isDone.toggle()
+        if template.items[idx].isDone {
+            template.items[idx].completedAt = Date()
+            template.items[idx].completedBy = completionUserLabel
+        } else {
+            template.items[idx].completedAt = nil
+            template.items[idx].completedBy = nil
+        }
+        persistChecklistDraft()
     }
 
     private func updateChecklistCompletionMetadata() {
@@ -6751,11 +6863,154 @@ struct ChecklistRunView: View {
 
     private func deleteChecklistItem(id: String) {
         template.items.removeAll { $0.id == id }
+        persistChecklistDraft()
     }
 
     var progress: Double {
         guard !template.items.isEmpty else { return 0 }
         return Double(template.items.filter { $0.isDone }.count) / Double(template.items.count)
+    }
+
+    private func displayName(for member: UserProfile) -> String {
+        let trimmed = member.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        return member.email.components(separatedBy: "@").first ?? member.email
+    }
+
+    private func mentionTokens(in text: String) -> Set<String> {
+        let pattern = "(?<!\\S)@([A-Za-z0-9._-]+)"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let nsText = text as NSString
+        let range = NSRange(location: 0, length: nsText.length)
+        let matches = regex.matches(in: text, options: [], range: range)
+        var tokens: Set<String> = []
+        for match in matches where match.numberOfRanges > 1 {
+            let token = nsText.substring(with: match.range(at: 1))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            if !token.isEmpty { tokens.insert(token) }
+        }
+        return tokens
+    }
+
+    private func displayChecklistText(_ text: String) -> String {
+        let pattern = "(?<!\\S)@[A-Za-z0-9._-]+"
+        let nsText = text as NSString
+        let fullRange = NSRange(location: 0, length: nsText.length)
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+        var cleaned = regex.stringByReplacingMatches(in: text, options: [], range: fullRange, withTemplate: "")
+        cleaned = cleaned.replacingOccurrences(of: "\\s{2,}", with: " ", options: .regularExpression)
+        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func mentionMatchTokens(for member: UserProfile) -> Set<String> {
+        let email = member.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var tokens: Set<String> = []
+        if !email.isEmpty {
+            tokens.insert(email)
+            if let localPart = email.split(separator: "@").first, !localPart.isEmpty {
+                tokens.insert(String(localPart))
+            }
+        }
+        let name = displayName(for: member)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if !name.isEmpty {
+            tokens.insert(name)
+            tokens.insert(name.replacingOccurrences(of: " ", with: ""))
+            tokens.insert(name.replacingOccurrences(of: " ", with: "."))
+            tokens.insert(name.replacingOccurrences(of: " ", with: "_"))
+            tokens.insert(name.replacingOccurrences(of: " ", with: "-"))
+        }
+        return tokens
+    }
+
+    private func mentionedMembers(in text: String) -> [UserProfile] {
+        let tags = mentionTokens(in: text)
+        guard !tags.isEmpty else { return [] }
+        var seen: Set<String> = []
+        return store.teamMembers
+            .filter { member in
+                let match = !mentionMatchTokens(for: member).isDisjoint(with: tags)
+                if !match { return false }
+                let id = member.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                if seen.contains(id) { return false }
+                seen.insert(id)
+                return true
+            }
+            .sorted { displayName(for: $0).localizedCaseInsensitiveCompare(displayName(for: $1)) == .orderedAscending }
+    }
+
+    private func isAssignedToCurrentUser(item: ChecklistItem) -> Bool {
+        guard let current = store.user else { return false }
+        let tags = mentionTokens(in: item.text)
+        if tags.isEmpty { return false }
+        return !mentionMatchTokens(for: current).isDisjoint(with: tags)
+    }
+
+    private func mentionSuggestions(for query: String) -> [UserProfile] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return store.teamMembers
+            .filter { member in
+                let email = member.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if q.isEmpty { return true }
+                let name = displayName(for: member).lowercased()
+                let localPart = email.split(separator: "@").first.map(String.init) ?? ""
+                return name.contains(q) || email.contains(q) || localPart.contains(q)
+            }
+            .sorted { displayName(for: $0).localizedCaseInsensitiveCompare(displayName(for: $1)) == .orderedAscending }
+    }
+
+    private func currentMentionContext(in text: String) -> (range: Range<String.Index>, query: String)? {
+        guard let atIndex = text.lastIndex(of: "@") else { return nil }
+        if atIndex != text.startIndex {
+            let previous = text[text.index(before: atIndex)]
+            if !previous.isWhitespace { return nil }
+        }
+        let queryStart = text.index(after: atIndex)
+        let queryPart = text[queryStart...]
+        if queryPart.contains(where: { $0.isWhitespace }) { return nil }
+        return (atIndex..<text.endIndex, String(queryPart))
+    }
+
+    private func updateMentionContext(for text: String, target: MentionTarget) {
+        if let context = currentMentionContext(in: text) {
+            activeMentionTarget = target
+            activeMentionQuery = context.query
+        } else if activeMentionTarget == target {
+            activeMentionTarget = nil
+            activeMentionQuery = ""
+        }
+    }
+
+    private func mentionToken(for member: UserProfile) -> String {
+        let name = displayName(for: member).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !name.isEmpty {
+            return name.lowercased().replacingOccurrences(of: " ", with: ".")
+        }
+        let email = member.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return email.split(separator: "@").first.map(String.init) ?? "user"
+    }
+
+    private func applyMention(_ member: UserProfile, to target: MentionTarget) {
+        let token = "@\(mentionToken(for: member)) "
+        switch target {
+        case .newItem:
+            guard let context = currentMentionContext(in: newChecklistItemText) else { return }
+            newChecklistItemText.replaceSubrange(context.range, with: token)
+            updateMentionContext(for: newChecklistItemText, target: .newItem)
+        case .existingItem(let id):
+            guard let idx = template.items.firstIndex(where: { $0.id == id }) else { return }
+            guard let context = currentMentionContext(in: template.items[idx].text) else { return }
+            template.items[idx].text.replaceSubrange(context.range, with: token)
+            updateMentionContext(for: template.items[idx].text, target: .existingItem(id))
+            persistChecklistDraft()
+        }
+    }
+
+    private func persistChecklistDraft() {
+        updateChecklistCompletionMetadata()
+        store.saveChecklist(template)
     }
 }
 
@@ -6819,11 +7074,81 @@ struct CreateChecklistView: View {
 struct ChatListView: View {
     @EnvironmentObject var store: ProdConnectStore
     @State private var showCreate = false
+    @State private var selectedDirectChannel: ChatChannel?
     var isAdmin: Bool { store.user?.isAdmin == true }
-    private var channelsToShow: [ChatChannel] {
+    private var currentEmail: String? {
+        store.user?.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+    private var visibleChannels: [ChatChannel] {
         if isAdmin { return store.channels }
         guard let email = store.user?.email else { return [] }
         return store.channels.filter { !$0.isHidden && !$0.hiddenUserEmails.contains(email) }
+    }
+    private var channelsToShow: [ChatChannel] {
+        visibleChannels
+            .filter { $0.kind != .direct }
+            .sorted { lhs, rhs in
+                if lhs.position != rhs.position { return lhs.position < rhs.position }
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
+    }
+    private var directChannelsToShow: [ChatChannel] {
+        guard let currentEmail else { return [] }
+        let raw = visibleChannels
+            .filter { $0.kind == .direct }
+            .filter { channel in
+                let participants = channel.participantEmails.map {
+                    $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                }
+                return participants.isEmpty || participants.contains(currentEmail)
+            }
+
+        // Deduplicate historical direct channels with the same participant set.
+        var uniqueByParticipants: [String: ChatChannel] = [:]
+        for channel in raw {
+            let key = participantKey(for: channel, currentEmail: currentEmail)
+            if let existing = uniqueByParticipants[key] {
+                let existingTime = existing.lastMessageAt ?? existing.messages.last?.timestamp ?? .distantPast
+                let incomingTime = channel.lastMessageAt ?? channel.messages.last?.timestamp ?? .distantPast
+                if incomingTime > existingTime {
+                    uniqueByParticipants[key] = channel
+                }
+            } else {
+                uniqueByParticipants[key] = channel
+            }
+        }
+
+        return Array(uniqueByParticipants.values)
+            .sorted { lhs, rhs in
+                if let l = lhs.lastMessageAt, let r = rhs.lastMessageAt, l != r { return l > r }
+                if lhs.messages.count != rhs.messages.count { return lhs.messages.count > rhs.messages.count }
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
+    }
+    private var directMessageUsersToShow: [UserProfile] {
+        guard let currentEmail else { return [] }
+        let existingOneToOneRecipients = Set(
+            directChannelsToShow.compactMap { channel -> String? in
+                let participants = channel.participantEmails
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                    .filter { !$0.isEmpty }
+                guard participants.count == 2, participants.contains(currentEmail) else { return nil }
+                return participants.first(where: { $0 != currentEmail })
+            }
+        )
+        return store.teamMembers
+            .filter {
+                let email = $0.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                return email != currentEmail && !existingOneToOneRecipients.contains(email)
+            }
+            .sorted { lhs, rhs in
+                let lhsName = lhs.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                let rhsName = rhs.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !lhsName.isEmpty && !rhsName.isEmpty {
+                    return lhsName.localizedCaseInsensitiveCompare(rhsName) == .orderedAscending
+                }
+                return lhs.email.localizedCaseInsensitiveCompare(rhs.email) == .orderedAscending
+            }
     }
 
     var body: some View {
@@ -6841,14 +7166,18 @@ struct ChatListView: View {
                         }
                         .onMove { indices, newOffset in
                             guard isAdmin else { return }
-                            store.channels.move(fromOffsets: indices, toOffset: newOffset)
-                            let orderedIds = store.channels.map { $0.id }
-                            store.updateChannelOrder(orderedIds: orderedIds)
+                            var reordered = channelsToShow
+                            reordered.move(fromOffsets: indices, toOffset: newOffset)
+                            for (idx, item) in reordered.enumerated() {
+                                var updated = item
+                                updated.position = idx
+                                store.saveChannel(updated)
+                            }
                         }
                         .onDelete { idx in
                             guard isAdmin else { return }
                             for i in idx {
-                                let id = store.channels[i].id
+                                let id = channelsToShow[i].id
                                 store.db.collection("channels").document(id).delete()
                             }
                         }
@@ -6857,6 +7186,33 @@ struct ChatListView: View {
                         Text("Channels")
                             .font(.title2)
                             .fontWeight(.bold)
+                            .foregroundColor(.primary)
+                            .textCase(nil)
+                    }
+                    Section {
+                        ForEach(directChannelsToShow) { channel in
+                            NavigationLink {
+                                ChatChannelDetailView(channel: channel)
+                            } label: {
+                                Text(directMessageTitle(for: channel))
+                                    .font(.headline)
+                            }
+                        }
+                        ForEach(directMessageUsersToShow) { member in
+                            Button {
+                                openOrCreateDirectMessage(with: [member])
+                            } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(displayName(for: member))
+                                        .font(.headline)
+                                        .foregroundColor(.primary)
+                                }
+                            }
+                        }
+                    } header: {
+                        Text("Direct Messages")
+                            .font(.title3)
+                            .fontWeight(.semibold)
                             .foregroundColor(.primary)
                             .textCase(nil)
                     }
@@ -6876,10 +7232,93 @@ struct ChatListView: View {
                 .sheet(isPresented: $showCreate) {
                     CreateChannelView()
                 }
+                .navigationDestination(
+                    isPresented: Binding(
+                        get: { selectedDirectChannel != nil },
+                        set: { isPresented in
+                            if !isPresented { selectedDirectChannel = nil }
+                        }
+                    )
+                ) {
+                    if let channel = selectedDirectChannel {
+                        ChatChannelDetailView(channel: channel)
+                    }
+                }
             }
             .navigationTitle("Chat")
             .toolbarColorScheme(.dark, for: .navigationBar)
         }
+    }
+
+    private func displayName(for member: UserProfile) -> String {
+        let trimmed = member.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        return member.email.components(separatedBy: "@").first ?? member.email
+    }
+
+    private func directMessageTitle(for channel: ChatChannel) -> String {
+        guard let currentEmail else { return channel.name }
+        let participants = channel.participantEmails
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty && $0 != currentEmail }
+        if participants.isEmpty { return channel.name }
+
+        let names = participants.map { email in
+            if let member = store.teamMembers.first(where: {
+                $0.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == email
+            }) {
+                return displayName(for: member)
+            }
+            return email.components(separatedBy: "@").first ?? email
+        }
+        let uniqueNames = Array(NSOrderedSet(array: names)) as? [String] ?? names
+        return uniqueNames.joined(separator: ", ")
+    }
+
+    private func participantKey(for channel: ChatChannel, currentEmail: String) -> String {
+        let participants = channel.participantEmails
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+        if participants.isEmpty {
+            return "legacy:\(channel.id)"
+        }
+        let normalized = Array(Set(participants)).sorted()
+        return normalized.joined(separator: "|")
+    }
+
+    private func openOrCreateDirectMessage(with members: [UserProfile]) {
+        guard let teamCode = store.teamCode else { return }
+        guard let currentEmail = currentEmail else { return }
+        let recipients = members
+            .map { $0.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty && $0 != currentEmail }
+        guard !recipients.isEmpty else { return }
+
+        let participants = Array(Set(recipients + [currentEmail])).sorted()
+        if let existing = store.channels.first(where: { channel in
+            channel.kind == .direct && channel.participantEmails.map { $0.lowercased() }.sorted() == participants
+        }) {
+            selectedDirectChannel = existing
+            return
+        }
+
+        let dmName = "Direct Message"
+
+        let newChannel = ChatChannel(
+            name: dmName,
+            teamCode: teamCode,
+            position: 0,
+            isReadOnly: false,
+            isHidden: false,
+            readOnlyUserEmails: [],
+            hiddenUserEmails: [],
+            messages: [],
+            kind: .direct,
+            participantEmails: participants,
+            lastMessageAt: nil
+        )
+        store.saveChannel(newChannel)
+        selectedDirectChannel = newChannel
     }
 }
 
@@ -6900,10 +7339,40 @@ struct ChatChannelDetailView: View {
     @State private var messageToEdit: ChatMessage?
     @State private var messageToDelete: ChatMessage?
     @State private var showSettings = false
+    @State private var showAddParticipants = false
 
     private let maxAttachmentBytes = 100 * 1024 * 1024
+    private let maxMentionSuggestions = 8
 
     private var isAdmin: Bool { store.user?.isAdmin == true }
+    private var isDirectMessage: Bool { channel.kind == .direct }
+    private var channelTitle: String {
+        guard isDirectMessage else { return channel.name }
+        let participants = channel.participantEmails
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+        guard !participants.isEmpty else { return channel.name }
+
+        let currentEmail = store.user?.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let names = participants
+            .filter { $0 != currentEmail }
+            .map { email in
+            if let member = store.teamMembers.first(where: {
+                $0.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == email
+            }) {
+                return displayName(for: member)
+            }
+            if let current = store.user,
+               current.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == email {
+                return displayName(for: current)
+            }
+            return email.components(separatedBy: "@").first ?? email
+        }
+
+        let uniqueNames = Array(NSOrderedSet(array: names)) as? [String] ?? names
+        if uniqueNames.isEmpty { return channel.name }
+        return uniqueNames.joined(separator: ", ")
+    }
     private var canSendMessages: Bool {
         if isAdmin { return true }
         guard let email = store.user?.email else { return false }
@@ -6935,8 +7404,13 @@ struct ChatChannelDetailView: View {
                                         .foregroundColor(.secondary)
                                 }
                             }
+                            let isMentioned = isCurrentUserMentioned(in: msg.text)
                             if !msg.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                                 Text(msg.text)
+                                    .padding(.horizontal, isMentioned ? 8 : 0)
+                                    .padding(.vertical, isMentioned ? 6 : 0)
+                                    .background(isMentioned ? Color.yellow.opacity(0.22) : Color.clear)
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
                             }
                             attachmentView(for: msg)
                         }
@@ -6995,32 +7469,67 @@ struct ChatChannelDetailView: View {
                 }
             }
             .padding(.horizontal)
-            HStack(spacing: 8) {
-                PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
-                    Image(systemName: "photo.on.rectangle")
-                }
-                .buttonStyle(.plain)
-                .disabled(!canSendMessages || isUploadingAttachment || messageToEdit != nil)
-                Button {
-                    showFilePicker = true
-                } label: {
-                    Image(systemName: "paperclip")
-                }
-                .buttonStyle(.plain)
-                .disabled(!canSendMessages || isUploadingAttachment || messageToEdit != nil)
-                TextField("Message", text: $newMessage)
-                    .textFieldStyle(.roundedBorder)
-                if messageToEdit != nil {
-                    Button("Cancel") {
-                        messageToEdit = nil
-                        newMessage = ""
+            VStack(spacing: 6) {
+                if let context = currentMentionContext(in: newMessage) {
+                    let suggestions = mentionSuggestions(for: context.query)
+                    if !suggestions.isEmpty {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 0) {
+                                ForEach(suggestions.prefix(maxMentionSuggestions)) { member in
+                                    Button {
+                                        applyMention(member, context: context)
+                                    } label: {
+                                        HStack {
+                                            Text(displayName(for: member))
+                                                .foregroundColor(.primary)
+                                            Spacer()
+                                        }
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 8)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                    if member.id != suggestions.prefix(maxMentionSuggestions).last?.id {
+                                        Divider()
+                                    }
+                                }
+                            }
+                        }
+                        .frame(maxHeight: 180)
+                        .background(Color(.systemBackground))
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                        )
                     }
-                    .buttonStyle(.borderless)
                 }
-                Button(messageToEdit == nil ? "Send" : "Save") {
-                    sendMessage()
+                HStack(spacing: 8) {
+                    PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
+                        Image(systemName: "photo.on.rectangle")
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!canSendMessages || isUploadingAttachment || messageToEdit != nil)
+                    Button {
+                        showFilePicker = true
+                    } label: {
+                        Image(systemName: "paperclip")
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!canSendMessages || isUploadingAttachment || messageToEdit != nil)
+                    TextField("Message", text: $newMessage)
+                        .textFieldStyle(.roundedBorder)
+                    if messageToEdit != nil {
+                        Button("Cancel") {
+                            messageToEdit = nil
+                            newMessage = ""
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                    Button(messageToEdit == nil ? "Send" : "Save") {
+                        sendMessage()
+                    }
+                    .disabled(!canSendMessages || isUploadingAttachment || newMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                .disabled(!canSendMessages || isUploadingAttachment || newMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             .padding()
             if isUploadingAttachment {
@@ -7040,9 +7549,14 @@ struct ChatChannelDetailView: View {
                     .padding(.bottom, 6)
             }
         }
-        .navigationTitle(channel.name)
+        .navigationTitle(channelTitle)
         .toolbar {
-            if isAdmin {
+            if isDirectMessage {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Add") { showAddParticipants = true }
+                }
+            }
+            if isAdmin && !isDirectMessage {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button { showSettings = true } label: {
                         Image(systemName: "slider.horizontal.3")
@@ -7070,8 +7584,16 @@ struct ChatChannelDetailView: View {
         } message: {
             Text("This action cannot be undone.")
         }
-        .sheet(isPresented: $showSettings) {
+        .sheet(isPresented: Binding(
+            get: { showSettings && !isDirectMessage },
+            set: { showSettings = $0 }
+        )) {
             ChannelSettingsView(channel: $channel)
+        }
+        .sheet(isPresented: $showAddParticipants) {
+            DirectMessagePickerView(initialSelectedIDs: selectedParticipantIDsForPicker()) { selectedMembers in
+                updateDirectMessageParticipants(with: selectedMembers)
+            }
         }
         .sheet(isPresented: $showFilePicker) {
             ChatFilePicker { url in
@@ -7172,6 +7694,7 @@ struct ChatChannelDetailView: View {
             switch result {
             case .success:
                 channel.messages = updatedMessages
+                channel.lastMessageAt = updatedMessages.last?.timestamp
                 if let idx = store.channels.firstIndex(where: { $0.id == channel.id }) {
                     store.channels[idx] = channel
                 }
@@ -7191,6 +7714,7 @@ struct ChatChannelDetailView: View {
             switch result {
             case .success:
                 channel.messages = updatedMessages
+                channel.lastMessageAt = updatedMessages.last?.timestamp
                 if let idx = store.channels.firstIndex(where: { $0.id == channel.id }) {
                     store.channels[idx] = channel
                 }
@@ -7206,6 +7730,7 @@ struct ChatChannelDetailView: View {
             switch result {
             case .success:
                 channel.messages = updatedMessages
+                channel.lastMessageAt = updatedMessages.last?.timestamp
                 if let idx = store.channels.firstIndex(where: { $0.id == channel.id }) {
                     store.channels[idx] = channel
                 }
@@ -7235,7 +7760,8 @@ struct ChatChannelDetailView: View {
 
     private func persistMessages(_ messages: [ChatMessage], completion: @escaping (Result<Void, Error>) -> Void) {
         let payload = messages.map(messageDictionary)
-        store.db.collection("channels").document(channel.id).setData(["messages": payload], merge: true) { error in
+        let lastMessageAtValue: Any = messages.last.map { Timestamp(date: $0.timestamp) } ?? NSNull()
+        store.db.collection("channels").document(channel.id).setData(["messages": payload, "lastMessageAt": lastMessageAtValue], merge: true) { error in
             if let error {
                 completion(.failure(error))
             } else {
@@ -7407,6 +7933,154 @@ struct ChatChannelDetailView: View {
             }
         }
     }
+
+    private func isCurrentUserMentioned(in text: String) -> Bool {
+        guard !isDirectMessage else { return false }
+        let mentions = extractMentionTokens(from: text)
+        guard !mentions.isEmpty else { return false }
+        let currentTokens = mentionMatchTokensForCurrentUser()
+        return !mentions.isDisjoint(with: currentTokens)
+    }
+
+    private func extractMentionTokens(from text: String) -> Set<String> {
+        let pattern = "(?<!\\S)@([A-Za-z0-9._-]+)"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let nsText = text as NSString
+        let range = NSRange(location: 0, length: nsText.length)
+        let matches = regex.matches(in: text, options: [], range: range)
+        var tokens: Set<String> = []
+        for match in matches where match.numberOfRanges > 1 {
+            let token = nsText.substring(with: match.range(at: 1))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            if !token.isEmpty {
+                tokens.insert(token)
+            }
+        }
+        return tokens
+    }
+
+    private func mentionMatchTokensForCurrentUser() -> Set<String> {
+        guard let emailRaw = store.user?.email else { return [] }
+        let email = emailRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !email.isEmpty else { return [] }
+
+        var tokens: Set<String> = [email]
+        if let localPart = email.split(separator: "@").first, !localPart.isEmpty {
+            tokens.insert(String(localPart))
+        }
+
+        let currentDisplayName: String = {
+            if let member = store.teamMembers.first(where: { $0.email.lowercased() == email }) {
+                return member.displayName
+            }
+            return store.user?.displayName ?? ""
+        }()
+
+        let displayName = currentDisplayName
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if !displayName.isEmpty {
+            tokens.insert(displayName)
+            tokens.insert(displayName.replacingOccurrences(of: " ", with: ""))
+            tokens.insert(displayName.replacingOccurrences(of: " ", with: "."))
+            tokens.insert(displayName.replacingOccurrences(of: " ", with: "_"))
+            tokens.insert(displayName.replacingOccurrences(of: " ", with: "-"))
+            let parts = displayName.split { $0 == " " || $0 == "." || $0 == "_" || $0 == "-" }
+            for part in parts where !part.isEmpty {
+                tokens.insert(String(part))
+            }
+        }
+
+        return tokens
+    }
+
+    private func mentionSuggestions(for query: String) -> [UserProfile] {
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let currentEmail = store.user?.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return store.teamMembers
+            .filter { member in
+                let email = member.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if let currentEmail, email == currentEmail { return false }
+                if trimmedQuery.isEmpty { return true }
+                let name = displayName(for: member).lowercased()
+                let localPart = email.split(separator: "@").first.map(String.init) ?? ""
+                return name.contains(trimmedQuery) || email.contains(trimmedQuery) || localPart.contains(trimmedQuery)
+            }
+            .sorted { lhs, rhs in
+                displayName(for: lhs).localizedCaseInsensitiveCompare(displayName(for: rhs)) == .orderedAscending
+            }
+    }
+
+    private func currentMentionContext(in text: String) -> (range: Range<String.Index>, query: String)? {
+        guard let atIndex = text.lastIndex(of: "@") else { return nil }
+        if atIndex != text.startIndex {
+            let previous = text[text.index(before: atIndex)]
+            if !previous.isWhitespace { return nil }
+        }
+        let queryStart = text.index(after: atIndex)
+        let queryPart = text[queryStart...]
+        if queryPart.contains(where: { $0.isWhitespace }) { return nil }
+        return (atIndex..<text.endIndex, String(queryPart))
+    }
+
+    private func applyMention(_ member: UserProfile, context: (range: Range<String.Index>, query: String)) {
+        let mention = "@\(mentionToken(for: member))"
+        newMessage.replaceSubrange(context.range, with: "\(mention) ")
+    }
+
+    private func mentionToken(for member: UserProfile) -> String {
+        let name = displayName(for: member).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !name.isEmpty {
+            return name
+                .lowercased()
+                .replacingOccurrences(of: " ", with: ".")
+        }
+        let email = member.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return email.split(separator: "@").first.map(String.init) ?? "user"
+    }
+
+    private func displayName(for member: UserProfile) -> String {
+        let trimmed = member.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        return member.email.components(separatedBy: "@").first ?? member.email
+    }
+
+    private func selectedParticipantIDsForPicker() -> Set<String> {
+        let currentEmail = store.user?.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let selectedIDs = store.teamMembers.compactMap { member -> String? in
+            let email = member.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if email == currentEmail { return nil }
+            return channel.participantEmails.map { $0.lowercased() }.contains(email) ? member.id : nil
+        }
+        return Set(selectedIDs)
+    }
+
+    private func updateDirectMessageParticipants(with members: [UserProfile]) {
+        guard isDirectMessage else { return }
+        guard let currentEmail = store.user?.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else { return }
+        let recipients = members
+            .map { $0.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty && $0 != currentEmail }
+        guard !recipients.isEmpty else { return }
+
+        let participants = Array(Set(recipients + [currentEmail])).sorted()
+        if participants == channel.participantEmails.map({ $0.lowercased() }).sorted() {
+            return
+        }
+
+        if let existing = store.channels.first(where: {
+            $0.id != channel.id &&
+            $0.kind == .direct &&
+            $0.participantEmails.map { $0.lowercased() }.sorted() == participants
+        }) {
+            channel = existing
+            return
+        }
+
+        channel.participantEmails = participants
+        store.saveChannel(channel)
+    }
 }
 
 struct ChannelSettingsView: View {
@@ -7472,6 +8146,133 @@ struct ChannelSettingsView: View {
     }
 }
 
+struct DirectMessagePickerView: View {
+    @EnvironmentObject var store: ProdConnectStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var searchText = ""
+    @State private var selectedMemberIDs: Set<String> = []
+    private let initialSelectedIDs: Set<String>
+    var onSelect: ([UserProfile]) -> Void
+
+    init(initialSelectedIDs: Set<String> = [], onSelect: @escaping ([UserProfile]) -> Void) {
+        self.initialSelectedIDs = initialSelectedIDs
+        self.onSelect = onSelect
+        _selectedMemberIDs = State(initialValue: initialSelectedIDs)
+    }
+
+    private var currentEmail: String {
+        store.user?.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+    }
+
+    private var allMembers: [UserProfile] {
+        store.teamMembers
+            .filter { $0.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != currentEmail }
+            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
+    private var members: [UserProfile] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return allMembers }
+        return allMembers.filter { member in
+            let name = member.displayName.lowercased()
+            let email = member.email.lowercased()
+            return name.contains(query) || email.contains(query)
+        }
+    }
+
+    private var selectedMembers: [UserProfile] {
+        allMembers.filter { selectedMemberIDs.contains($0.id) }
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 10) {
+                if !selectedMembers.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(selectedMembers) { member in
+                                HStack(spacing: 6) {
+                                    Text(displayName(for: member))
+                                        .font(.caption)
+                                        .foregroundColor(.primary)
+                                    Button {
+                                        selectedMemberIDs.remove(member.id)
+                                    } label: {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .foregroundColor(.secondary)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(Color.secondary.opacity(0.14))
+                                .clipShape(Capsule())
+                            }
+                        }
+                    }
+                    .padding(.horizontal)
+                }
+
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundColor(.secondary)
+                    TextField("Add users", text: $searchText)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .padding(.horizontal)
+
+                List(members) { member in
+                    Button {
+                        if selectedMemberIDs.contains(member.id) {
+                            selectedMemberIDs.remove(member.id)
+                        } else {
+                            selectedMemberIDs.insert(member.id)
+                        }
+                    } label: {
+                        HStack {
+                            Text(displayName(for: member))
+                                .foregroundColor(.primary)
+                            Spacer()
+                            if selectedMemberIDs.contains(member.id) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundColor(.blue)
+                            } else {
+                                Image(systemName: "circle")
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .navigationTitle("New Direct Message")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Start") {
+                        onSelect(selectedMembers)
+                        dismiss()
+                    }
+                    .disabled(selectedMemberIDs.isEmpty)
+                }
+            }
+        }
+    }
+
+    private func displayName(for member: UserProfile) -> String {
+        let trimmed = member.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        return member.email.components(separatedBy: "@").first ?? member.email
+    }
+}
+
 struct ChatFilePicker: UIViewControllerRepresentable {
     var onPick: (URL) -> Void
 
@@ -7530,7 +8331,8 @@ struct CreateChannelView: View {
                             teamCode: store.teamCode ?? "",
                             position: position,
                             isReadOnly: isReadOnly,
-                            isHidden: isHidden
+                            isHidden: isHidden,
+                            kind: .group
                         )
                         store.saveChannel(newChannel)
                         dismiss()
@@ -7596,6 +8398,107 @@ struct UserProfile: Identifiable, Codable {
     var canSeeIdeas: Bool = true
     var canSeeChecklists: Bool = true
     // Add other fields as needed
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case displayName
+        case email
+        case teamCode
+        case isAdmin
+        case isOwner
+        case subscriptionTier
+        case assignedCampus
+        case canEditPatchsheet
+        case canEditTraining
+        case canEditGear
+        case canEditIdeas
+        case canEditChecklists
+        case canSeeChat
+        case canSeePatchsheet
+        case canSeeTraining
+        case canSeeGear
+        case canSeeIdeas
+        case canSeeChecklists
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        displayName: String,
+        email: String,
+        teamCode: String? = nil,
+        isAdmin: Bool = false,
+        isOwner: Bool = false,
+        subscriptionTier: String = "free",
+        assignedCampus: String = "",
+        canEditPatchsheet: Bool = false,
+        canEditTraining: Bool = false,
+        canEditGear: Bool = false,
+        canEditIdeas: Bool = false,
+        canEditChecklists: Bool = false,
+        canSeeChat: Bool = true,
+        canSeePatchsheet: Bool = true,
+        canSeeTraining: Bool = true,
+        canSeeGear: Bool = true,
+        canSeeIdeas: Bool = true,
+        canSeeChecklists: Bool = true
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.email = email
+        self.teamCode = teamCode
+        self.isAdmin = isAdmin
+        self.isOwner = isOwner
+        self.subscriptionTier = subscriptionTier
+        self.assignedCampus = assignedCampus
+        self.canEditPatchsheet = canEditPatchsheet
+        self.canEditTraining = canEditTraining
+        self.canEditGear = canEditGear
+        self.canEditIdeas = canEditIdeas
+        self.canEditChecklists = canEditChecklists
+        self.canSeeChat = canSeeChat
+        self.canSeePatchsheet = canSeePatchsheet
+        self.canSeeTraining = canSeeTraining
+        self.canSeeGear = canSeeGear
+        self.canSeeIdeas = canSeeIdeas
+        self.canSeeChecklists = canSeeChecklists
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enum LegacyCodingKeys: String, CodingKey {
+            case subriptionTier
+        }
+        let legacyContainer = try decoder.container(keyedBy: LegacyCodingKeys.self)
+
+        let decodedEmail = try container.decodeIfPresent(String.self, forKey: .email)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let fallbackName = decodedEmail.components(separatedBy: "@").first ?? "User"
+        let decodedName = try container.decodeIfPresent(String.self, forKey: .displayName)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        email = decodedEmail
+        displayName = decodedName.isEmpty ? fallbackName : decodedName
+        teamCode = try container.decodeIfPresent(String.self, forKey: .teamCode)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        isAdmin = try container.decodeIfPresent(Bool.self, forKey: .isAdmin) ?? false
+        isOwner = try container.decodeIfPresent(Bool.self, forKey: .isOwner) ?? false
+        let decodedSubscriptionTier = try container.decodeIfPresent(String.self, forKey: .subscriptionTier)
+        let legacyDecodedSubscriptionTier = try legacyContainer.decodeIfPresent(String.self, forKey: .subriptionTier)
+        subscriptionTier = decodedSubscriptionTier ?? legacyDecodedSubscriptionTier ?? "free"
+        assignedCampus = try container.decodeIfPresent(String.self, forKey: .assignedCampus) ?? ""
+        canEditPatchsheet = try container.decodeIfPresent(Bool.self, forKey: .canEditPatchsheet) ?? false
+        canEditTraining = try container.decodeIfPresent(Bool.self, forKey: .canEditTraining) ?? false
+        canEditGear = try container.decodeIfPresent(Bool.self, forKey: .canEditGear) ?? false
+        canEditIdeas = try container.decodeIfPresent(Bool.self, forKey: .canEditIdeas) ?? false
+        canEditChecklists = try container.decodeIfPresent(Bool.self, forKey: .canEditChecklists) ?? false
+        canSeeChat = try container.decodeIfPresent(Bool.self, forKey: .canSeeChat) ?? true
+        canSeePatchsheet = try container.decodeIfPresent(Bool.self, forKey: .canSeePatchsheet) ?? true
+        canSeeTraining = try container.decodeIfPresent(Bool.self, forKey: .canSeeTraining) ?? true
+        canSeeGear = try container.decodeIfPresent(Bool.self, forKey: .canSeeGear) ?? true
+        canSeeIdeas = try container.decodeIfPresent(Bool.self, forKey: .canSeeIdeas) ?? true
+        canSeeChecklists = try container.decodeIfPresent(Bool.self, forKey: .canSeeChecklists) ?? true
+    }
 
     enum Role {
         case free
@@ -7669,6 +8572,89 @@ struct ChatChannel: Identifiable, Codable {
     var readOnlyUserEmails: [String] = []
     var hiddenUserEmails: [String] = []
     var messages: [ChatMessage] = []
+    var kind: ChatChannelKind = .group
+    var participantEmails: [String] = []
+    var lastMessageAt: Date? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case teamCode
+        case position
+        case isReadOnly
+        case isHidden
+        case readOnlyUserEmails
+        case hiddenUserEmails
+        case messages
+        case kind
+        case participantEmails
+        case lastMessageAt
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        name: String,
+        teamCode: String,
+        position: Int = 0,
+        isReadOnly: Bool = false,
+        isHidden: Bool = false,
+        readOnlyUserEmails: [String] = [],
+        hiddenUserEmails: [String] = [],
+        messages: [ChatMessage] = [],
+        kind: ChatChannelKind = .group,
+        participantEmails: [String] = [],
+        lastMessageAt: Date? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.teamCode = teamCode
+        self.position = position
+        self.isReadOnly = isReadOnly
+        self.isHidden = isHidden
+        self.readOnlyUserEmails = readOnlyUserEmails
+        self.hiddenUserEmails = hiddenUserEmails
+        self.messages = messages
+        self.kind = kind
+        self.participantEmails = participantEmails
+        self.lastMessageAt = lastMessageAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? "Channel"
+        teamCode = try container.decodeIfPresent(String.self, forKey: .teamCode) ?? ""
+        position = try container.decodeIfPresent(Int.self, forKey: .position) ?? 0
+        isReadOnly = try container.decodeIfPresent(Bool.self, forKey: .isReadOnly) ?? false
+        isHidden = try container.decodeIfPresent(Bool.self, forKey: .isHidden) ?? false
+        readOnlyUserEmails = try container.decodeIfPresent([String].self, forKey: .readOnlyUserEmails) ?? []
+        hiddenUserEmails = try container.decodeIfPresent([String].self, forKey: .hiddenUserEmails) ?? []
+        messages = try container.decodeIfPresent([ChatMessage].self, forKey: .messages) ?? []
+        kind = try container.decodeIfPresent(ChatChannelKind.self, forKey: .kind) ?? .group
+        participantEmails = try container.decodeIfPresent([String].self, forKey: .participantEmails) ?? []
+        lastMessageAt = try container.decodeIfPresent(Date.self, forKey: .lastMessageAt)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(teamCode, forKey: .teamCode)
+        try container.encode(position, forKey: .position)
+        try container.encode(isReadOnly, forKey: .isReadOnly)
+        try container.encode(isHidden, forKey: .isHidden)
+        try container.encode(readOnlyUserEmails, forKey: .readOnlyUserEmails)
+        try container.encode(hiddenUserEmails, forKey: .hiddenUserEmails)
+        try container.encode(messages, forKey: .messages)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(participantEmails, forKey: .participantEmails)
+        try container.encodeIfPresent(lastMessageAt, forKey: .lastMessageAt)
+    }
+}
+
+enum ChatChannelKind: String, Codable {
+    case group
+    case direct
 }
 
 struct ChatMessage: Identifiable, Codable {
@@ -7724,6 +8710,7 @@ struct MainTabView: View {
         @State private var field2 = ""
         @State private var field3 = ""
         @State private var selectedCampus: String = ""
+        @State private var showCampusDialog = false
         private let categories = ["Audio", "Video", "Lighting"]
         
         private var assignedCampus: String {
@@ -7753,10 +8740,8 @@ struct MainTabView: View {
                         .pickerStyle(SegmentedPickerStyle())
                         Spacer()
                         if canSelectCampus {
-                            Menu {
-                                ForEach(store.locations, id: \.self) { campus in
-                                    Button(campus) { selectedCampus = campus }
-                                }
+                            Button {
+                                showCampusDialog = true
                             } label: {
                                 HStack {
                                     Text(selectedCampus.isEmpty ? "Campus" : selectedCampus)
@@ -7779,6 +8764,15 @@ struct MainTabView: View {
                         }
                     }
                     .padding([.horizontal, .top])
+                    .confirmationDialog("Select Campus", isPresented: $showCampusDialog, titleVisibility: .visible) {
+                        ForEach(store.locations.sorted(), id: \.self) { campus in
+                            Button(campus) { selectedCampus = campus }
+                        }
+                        if !selectedCampus.isEmpty {
+                            Button("Clear", role: .destructive) { selectedCampus = "" }
+                        }
+                        Button("Cancel", role: .cancel) {}
+                    }
                     List(filteredPatches) { patch in
                         NavigationLink(destination: PatchDetailView(patch: patch)) {
                             VStack(alignment: .leading) {

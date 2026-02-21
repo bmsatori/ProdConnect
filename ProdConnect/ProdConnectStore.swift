@@ -23,6 +23,8 @@ final class ProdConnectStore: ObservableObject {
     private var channelsListener: ListenerRegistration?
     private var lessonsListener: ListenerRegistration?
     private var gearListener: ListenerRegistration?
+    private var locationsListener: ListenerRegistration?
+    private var roomsListener: ListenerRegistration?
     private var authStateListener: AuthStateDidChangeListenerHandle?
 
     @Published var gear: [GearItem] = []
@@ -106,6 +108,28 @@ final class ProdConnectStore: ObservableObject {
         } catch {
             print("Save error (\(collection)):", error)
         }
+    }
+
+    private func teamCodeVariants(for rawCode: String) -> [String] {
+        let trimmed = rawCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        var variants: [String] = [trimmed]
+        let upper = trimmed.uppercased()
+        let lower = trimmed.lowercased()
+        if !variants.contains(upper) { variants.append(upper) }
+        if !variants.contains(lower) { variants.append(lower) }
+        return variants
+    }
+
+    private func queryForUsersTeamCode(collection: String, code: String) -> Query {
+        let variants = teamCodeVariants(for: code)
+        guard let first = variants.first else {
+            return db.collection(collection).whereField("teamCode", isEqualTo: code)
+        }
+        if variants.count == 1 {
+            return db.collection(collection).whereField("teamCode", isEqualTo: first)
+        }
+        return db.collection(collection).whereField("teamCode", in: variants)
     }
 
     func signIn(email: String, password: String, completion: @escaping (Result<Void, Error>) -> Void) {
@@ -219,6 +243,8 @@ final class ProdConnectStore: ObservableObject {
         channelsListener?.remove()
         lessonsListener?.remove()
         gearListener?.remove()
+        locationsListener?.remove()
+        roomsListener?.remove()
         user = nil
         gear = []
         patchsheet = []
@@ -303,16 +329,19 @@ final class ProdConnectStore: ObservableObject {
         channelsListener?.remove()
         lessonsListener?.remove()
         gearListener?.remove()
+        locationsListener?.remove()
+        roomsListener?.remove()
 
         guard let code = teamCode, !code.isEmpty else {
             if let user {
                 teamMembers = [user]
             }
+            locations = []
+            rooms = []
             return
         }
 
-        teamMembersListener = db.collection("users")
-            .whereField("teamCode", isEqualTo: code)
+        teamMembersListener = queryForUsersTeamCode(collection: "users", code: code)
             .addSnapshotListener { snapshot, _ in
                 guard let docs = snapshot?.documents else { return }
                 let members: [UserProfile] = docs.compactMap { doc in
@@ -394,16 +423,39 @@ final class ProdConnectStore: ObservableObject {
                     self.gear = values
                 }
             }
+
+        locationsListener = db.collection("teams")
+            .document(code)
+            .collection("locations")
+            .addSnapshotListener { snapshot, _ in
+                let values = (snapshot?.documents ?? []).map(\.documentID).sorted()
+                DispatchQueue.main.async {
+                    self.locations = values
+                }
+            }
+
+        roomsListener = db.collection("teams")
+            .document(code)
+            .collection("rooms")
+            .addSnapshotListener { snapshot, _ in
+                let values = (snapshot?.documents ?? []).map(\.documentID).sorted()
+                DispatchQueue.main.async {
+                    self.rooms = values
+                }
+            }
     }
 
     func listenToTeamMembers() {
         teamMembersListener?.remove()
         guard let code = teamCode, !code.isEmpty else { return }
-        teamMembersListener = db.collection("users")
-            .whereField("teamCode", isEqualTo: code)
+        teamMembersListener = queryForUsersTeamCode(collection: "users", code: code)
             .addSnapshotListener { snapshot, _ in
                 guard let docs = snapshot?.documents else { return }
-                let members = docs.compactMap { try? $0.data(as: UserProfile.self) }
+                let members: [UserProfile] = docs.compactMap { doc in
+                    var data = doc.data()
+                    data["id"] = doc.documentID
+                    return self.decodeDocument(data, as: UserProfile.self)
+                }
                 DispatchQueue.main.async {
                     self.teamMembers = members
                 }
