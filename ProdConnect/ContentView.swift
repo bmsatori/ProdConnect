@@ -1325,8 +1325,14 @@ struct ContentView: View {
         }
     }
 
-    var canEditIdeas: Bool { user != nil }
-    var canEditChecklists: Bool { user != nil }
+    var canEditIdeas: Bool {
+        guard let user = user else { return false }
+        return user.isAdmin || user.isOwner || user.canEditIdeas
+    }
+    var canEditChecklists: Bool {
+        guard let user = user else { return false }
+        return user.isAdmin || user.isOwner || user.canEditChecklists
+    }
 
     var canEditTraining: Bool {
         guard let user = user else { return false }
@@ -1335,7 +1341,7 @@ struct ContentView: View {
 
     var canSeeTrainingTab: Bool {
         guard let user = user else { return false }
-        return user.subscriptionTier.lowercased() != "free" || user.isAdmin
+        return user.isAdmin || user.isOwner || user.canSeeTraining
     }
 
     // ...existing code...
@@ -7441,6 +7447,7 @@ struct ChatChannelDetailView: View {
                     }
                 }
                 .onAppear {
+                    store.setActiveChatChannel(channel.id)
                     if let lastMsg = channel.messages.last {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                             proxy.scrollTo(lastMsg.id, anchor: .bottom)
@@ -7450,6 +7457,9 @@ struct ChatChannelDetailView: View {
                     UIApplication.shared.applicationIconBadgeNumber = 0
                     UNUserNotificationCenter.current().removeAllDeliveredNotifications()
                     store.listenToTeamMembers()
+                }
+                .onDisappear {
+                    store.setActiveChatChannel(nil)
                 }
             }
             HStack {
@@ -8687,6 +8697,8 @@ struct ShareSheet: UIViewControllerRepresentable {
 }
 
 struct MainTabView: View {
+    @EnvironmentObject var store: ProdConnectStore
+
     // Restored ChatChannelListView wrapper
     struct ChatChannelListView: View {
         @EnvironmentObject var store: ProdConnectStore
@@ -9138,24 +9150,52 @@ struct MainTabView: View {
             }
         }
     }
+    private var isPrivilegedUser: Bool {
+        store.user?.isAdmin == true || store.user?.isOwner == true
+    }
+
+    private var canSeeChatTab: Bool {
+        isPrivilegedUser || store.user?.canSeeChat == true
+    }
+
+    private var canSeePatchsheetTab: Bool {
+        isPrivilegedUser || store.user?.canSeePatchsheet == true
+    }
+
+    private var canSeeTrainingMainTab: Bool {
+        isPrivilegedUser || store.user?.canSeeTraining == true
+    }
+
+    private var canSeeGearTab: Bool {
+        isPrivilegedUser || store.user?.canSeeGear == true
+    }
+
     var body: some View {
         TabView {
-            ChatListView()
-                .tabItem {
-                    Label("Chat", systemImage: "message")
-                }
-            PatchsheetView()
-                .tabItem {
-                    Label("Patchsheet", systemImage: "square.grid.3x2")
-                }
-            TrainingListView()
-                .tabItem {
-                    Label("Training", systemImage: "graduationcap")
-                }
-            GearTabView()
-                .tabItem {
-                    Label("Gear", systemImage: "shippingbox")
-                }
+            if canSeeChatTab {
+                ChatListView()
+                    .tabItem {
+                        Label("Chat", systemImage: "message")
+                    }
+            }
+            if canSeePatchsheetTab {
+                PatchsheetView()
+                    .tabItem {
+                        Label("Patchsheet", systemImage: "square.grid.3x2")
+                    }
+            }
+            if canSeeTrainingMainTab {
+                TrainingListView()
+                    .tabItem {
+                        Label("Training", systemImage: "graduationcap")
+                    }
+            }
+            if canSeeGearTab {
+                GearTabView()
+                    .tabItem {
+                        Label("Gear", systemImage: "shippingbox")
+                    }
+            }
             MoreTabView()
                 .tabItem {
                     Label("More", systemImage: "ellipsis")
@@ -9167,22 +9207,42 @@ struct MainTabView: View {
 struct MoreTabView: View {
     @EnvironmentObject var store: ProdConnectStore
 
-    private var canSeeCustomize: Bool {
+    private var isPrivilegedUser: Bool {
         store.user?.isAdmin == true || store.user?.isOwner == true
+    }
+
+    private var canSeeCustomize: Bool {
+        isPrivilegedUser
+    }
+
+    private var canSeeIdeas: Bool {
+        isPrivilegedUser || store.user?.canSeeIdeas == true
+    }
+
+    private var canSeeChecklists: Bool {
+        isPrivilegedUser || store.user?.canSeeChecklists == true
+    }
+
+    private var canManageUsers: Bool {
+        isPrivilegedUser
     }
 
     var body: some View {
         NavigationStack {
             List {
-                NavigationLink {
-                    ChecklistsListView()
-                } label: {
-                    Text("Checklist")
+                if canSeeChecklists {
+                    NavigationLink {
+                        ChecklistsListView()
+                    } label: {
+                        Text("Checklist")
+                    }
                 }
-                NavigationLink {
-                    IdeasListView()
-                } label: {
-                    Text("Ideas")
+                if canSeeIdeas {
+                    NavigationLink {
+                        IdeasListView()
+                    } label: {
+                        Text("Ideas")
+                    }
                 }
                 if canSeeCustomize {
                     NavigationLink {
@@ -9196,10 +9256,12 @@ struct MoreTabView: View {
                 } label: {
                     Text("Account")
                 }
-                NavigationLink {
-                    UsersView()
-                } label: {
-                    Text("Users")
+                if canManageUsers {
+                    NavigationLink {
+                        UsersView()
+                    } label: {
+                        Text("Users")
+                    }
                 }
             }
             .navigationTitle("More")

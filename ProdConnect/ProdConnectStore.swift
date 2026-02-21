@@ -4,6 +4,8 @@ import Combine
 import FirebaseFirestore
 import FirebaseAuth
 import OneSignalFramework
+import UserNotifications
+import UIKit
 
 @MainActor
 final class ProdConnectStore: ObservableObject {
@@ -26,6 +28,8 @@ final class ProdConnectStore: ObservableObject {
     private var locationsListener: ListenerRegistration?
     private var roomsListener: ListenerRegistration?
     private var authStateListener: AuthStateDidChangeListenerHandle?
+    private var hasInitializedChannelsSnapshot = false
+    private var activeChatChannelID: String?
 
     @Published var gear: [GearItem] = []
     @Published var patchsheet: [PatchRow] = []
@@ -37,12 +41,30 @@ final class ProdConnectStore: ObservableObject {
     @Published var teamMembers: [UserProfile] = []
     @Published var locations: [String] = []
     @Published var rooms: [String] = []
-    @Published var canEditPatchsheet = false
-    @Published var canSeeChat = true
-    @Published var canSeeTrainingTab = true
-    @Published var canEditGear = true
-    @Published var canEditIdeas = true
-    @Published var canEditChecklists = true
+    var canEditPatchsheet: Bool {
+        guard let user else { return false }
+        return user.isAdmin || user.isOwner || user.canEditPatchsheet
+    }
+    var canSeeChat: Bool {
+        guard let user else { return false }
+        return user.isAdmin || user.isOwner || user.canSeeChat
+    }
+    var canSeeTrainingTab: Bool {
+        guard let user else { return false }
+        return user.isAdmin || user.isOwner || user.canSeeTraining
+    }
+    var canEditGear: Bool {
+        guard let user else { return false }
+        return user.isAdmin || user.isOwner || user.canEditGear
+    }
+    var canEditIdeas: Bool {
+        guard let user else { return false }
+        return user.isAdmin || user.isOwner || user.canEditIdeas
+    }
+    var canEditChecklists: Bool {
+        guard let user else { return false }
+        return user.isAdmin || user.isOwner || user.canEditChecklists
+    }
     @Published var isAdmin = false
     @Published var teamCode: String?
 
@@ -257,6 +279,8 @@ final class ProdConnectStore: ObservableObject {
         rooms = []
         teamCode = nil
         isAdmin = false
+        activeChatChannelID = nil
+        hasInitializedChannelsSnapshot = false
     }
 
     private func restoreSession(for authUser: FirebaseAuth.User) {
@@ -331,6 +355,7 @@ final class ProdConnectStore: ObservableObject {
         gearListener?.remove()
         locationsListener?.remove()
         roomsListener?.remove()
+        hasInitializedChannelsSnapshot = false
 
         guard let code = teamCode, !code.isEmpty else {
             if let user {
@@ -392,7 +417,9 @@ final class ProdConnectStore: ObservableObject {
                     return self.decodeDocument(data, as: ChatChannel.self)
                 }
                 DispatchQueue.main.async {
-                    self.channels = values.sorted { $0.position < $1.position }
+                    let sorted = values.sorted { $0.position < $1.position }
+                    self.processIncomingChatNotifications(previous: self.channels, latest: sorted)
+                    self.channels = sorted
                 }
             }
 
@@ -443,6 +470,72 @@ final class ProdConnectStore: ObservableObject {
                     self.rooms = values
                 }
             }
+    }
+
+    func setActiveChatChannel(_ channelID: String?) {
+        activeChatChannelID = channelID
+    }
+
+    private func processIncomingChatNotifications(previous: [ChatChannel], latest: [ChatChannel]) {
+        guard hasInitializedChannelsSnapshot else {
+            hasInitializedChannelsSnapshot = true
+            return
+        }
+        guard let currentEmail = user?.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !currentEmail.isEmpty else { return }
+
+        let previousByID = Dictionary(uniqueKeysWithValues: previous.map { ($0.id, $0) })
+        for channel in latest {
+            guard let latestMessage = channel.messages.last else { continue }
+            if latestMessage.author.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == currentEmail {
+                continue
+            }
+
+            if channel.id == activeChatChannelID, UIApplication.shared.applicationState == .active {
+                continue
+            }
+
+            if channel.kind == .direct {
+                let participants = channel.participantEmails.map {
+                    $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                }
+                if !participants.isEmpty && !participants.contains(currentEmail) {
+                    continue
+                }
+            } else if !isAdmin {
+                if channel.isHidden || channel.hiddenUserEmails.contains(where: {
+                    $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == currentEmail
+                }) {
+                    continue
+                }
+            }
+
+            let previousMessage = previousByID[channel.id]?.messages.last
+            if let previousMessage, previousMessage.id == latestMessage.id {
+                continue
+            }
+
+            scheduleLocalChatNotification(for: latestMessage, channelName: channel.name, channelID: channel.id)
+        }
+    }
+
+    private func scheduleLocalChatNotification(for message: ChatMessage, channelName: String, channelID: String) {
+        let content = UNMutableNotificationContent()
+        content.title = channelName.isEmpty ? "Chat" : channelName
+        let sender = teamMembers.first(where: {
+            $0.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            == message.author.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        })?.displayName ?? (message.author.components(separatedBy: "@").first ?? "User")
+        content.body = "\(sender): \(message.text)"
+        content.sound = .default
+        content.userInfo = ["channelId": channelID]
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 0.2, repeats: false)
+        let request = UNNotificationRequest(
+            identifier: "chat-\(channelID)-\(message.id)",
+            content: content,
+            trigger: trigger
+        )
+        UNUserNotificationCenter.current().add(request)
     }
 
     func listenToTeamMembers() {
