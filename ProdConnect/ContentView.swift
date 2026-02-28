@@ -1076,6 +1076,10 @@ struct ContentView: View {
     @State private var rooms: [String] = []
     @State private var statusColor: (GearItem.GearStatus) -> Color = { _ in .gray }
     @State private var XLSXExportError: Error? = nil
+    @State private var lessonAssignedToCurrentUserIDs: Set<String> = []
+    @State private var hasPrimedLessonAssignmentState = false
+    @State private var checklistMentionedItemState: [String: Set<String>] = [:]
+    @State private var hasPrimedChecklistMentionState = false
     // Removed invalid top-level property wrappers for StorageReference and StorageMetadata
     // ...existing code...
     private struct MergePreviewGroupRow: View {
@@ -1153,10 +1157,10 @@ struct ContentView: View {
     private var filterBar: some View {
         HStack(spacing: 12) {
             categoryMenu
-            statusMenu
             if !availableLocations.isEmpty {
                 locationMenu
             }
+            statusMenu
         }
         .padding(.horizontal)
         .padding(.vertical, 8)
@@ -1496,6 +1500,10 @@ struct ContentView: View {
         channels = []
         patchsheet = []
         teamMembers = []
+        lessonAssignedToCurrentUserIDs = []
+        hasPrimedLessonAssignmentState = false
+        checklistMentionedItemState = [:]
+        hasPrimedChecklistMentionState = false
         listenerRegistration?.remove()
     }
 
@@ -2115,8 +2123,9 @@ struct ContentView: View {
                     }
                 }
                 DispatchQueue.main.async {
-                        self.lessons = decoded
-                    }
+                    self.processLessonAssignmentNotifications(with: decoded)
+                    self.lessons = decoded
+                }
                 }
     }
     
@@ -2145,6 +2154,7 @@ struct ContentView: View {
                         }
                     }
                     DispatchQueue.main.async {
+                        self.processChecklistMentionNotifications(with: decoded)
                         self.checklists = decoded
                     }
                 }
@@ -2606,6 +2616,157 @@ struct ContentView: View {
         }
     }
 
+    private func processLessonAssignmentNotifications(with lessons: [TrainingLesson]) {
+        guard user != nil else { return }
+        let currentAssignedIDs = Set(lessons.filter { isLessonAssignedToCurrentUser($0) }.map { $0.id })
+
+        guard hasPrimedLessonAssignmentState else {
+            lessonAssignedToCurrentUserIDs = currentAssignedIDs
+            hasPrimedLessonAssignmentState = true
+            return
+        }
+
+        let newlyAssigned = currentAssignedIDs.subtracting(lessonAssignedToCurrentUserIDs)
+        for lessonID in newlyAssigned {
+            guard let lesson = lessons.first(where: { $0.id == lessonID }) else { continue }
+            scheduleAssignmentNotification(
+                identifier: "lesson-assigned-\(lessonID)",
+                title: "New Training Assignment",
+                body: "\"\(lesson.title)\" was assigned to you."
+            )
+        }
+        lessonAssignedToCurrentUserIDs = currentAssignedIDs
+    }
+
+    private func processChecklistMentionNotifications(with checklists: [ChecklistTemplate]) {
+        guard user != nil else { return }
+        var newState: [String: Set<String>] = [:]
+        for checklist in checklists {
+            let mentionedItemIDs = Set(
+                checklist.items
+                    .filter { isChecklistItemMentioningCurrentUser($0) }
+                    .map { $0.id }
+            )
+            newState[checklist.id] = mentionedItemIDs
+        }
+
+        guard hasPrimedChecklistMentionState else {
+            checklistMentionedItemState = newState
+            hasPrimedChecklistMentionState = true
+            return
+        }
+
+        for checklist in checklists {
+            let oldSet = checklistMentionedItemState[checklist.id] ?? []
+            let newSet = newState[checklist.id] ?? []
+            let newlyMentionedItemIDs = newSet.subtracting(oldSet)
+            for itemID in newlyMentionedItemIDs {
+                guard let item = checklist.items.first(where: { $0.id == itemID }) else { continue }
+                let preview = checklistItemPreviewText(item.text)
+                let body: String
+                if preview.isEmpty {
+                    body = "You were tagged in \"\(checklist.title)\"."
+                } else {
+                    body = "You were tagged in \"\(checklist.title)\": \(preview)"
+                }
+                scheduleAssignmentNotification(
+                    identifier: "checklist-tag-\(checklist.id)-\(itemID)",
+                    title: "Checklist Assignment",
+                    body: body
+                )
+            }
+        }
+
+        checklistMentionedItemState = newState
+    }
+
+    private func scheduleAssignmentNotification(identifier: String, title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: identifier,
+            content: content,
+            trigger: UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
+        )
+
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                print("DEBUG: Failed to schedule assignment notification: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func isLessonAssignedToCurrentUser(_ lesson: TrainingLesson) -> Bool {
+        guard let currentUser = user else { return false }
+        let currentID = currentUser.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentEmail = currentUser.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let assignedID = lesson.assignedToUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let assignedEmail = lesson.assignedToUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if !assignedID.isEmpty && assignedID == currentID { return true }
+        if !assignedEmail.isEmpty && assignedEmail == currentEmail { return true }
+        return false
+    }
+
+    private func checklistItemPreviewText(_ text: String) -> String {
+        let pattern = "(?<!\\S)@[A-Za-z0-9._-]+"
+        let nsText = text as NSString
+        let fullRange = NSRange(location: 0, length: nsText.length)
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        var cleaned = regex.stringByReplacingMatches(in: text, options: [], range: fullRange, withTemplate: "")
+        cleaned = cleaned.replacingOccurrences(of: "\\s{2,}", with: " ", options: .regularExpression)
+        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func mentionTokens(in text: String) -> Set<String> {
+        let pattern = "(?<!\\S)@([A-Za-z0-9._-]+)"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let nsText = text as NSString
+        let range = NSRange(location: 0, length: nsText.length)
+        let matches = regex.matches(in: text, options: [], range: range)
+        var tokens: Set<String> = []
+        for match in matches where match.numberOfRanges > 1 {
+            let token = nsText.substring(with: match.range(at: 1))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            if !token.isEmpty { tokens.insert(token) }
+        }
+        return tokens
+    }
+
+    private func mentionMatchTokens(for user: UserProfile) -> Set<String> {
+        let email = user.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var tokens: Set<String> = []
+        if !email.isEmpty {
+            tokens.insert(email)
+            if let localPart = email.split(separator: "@").first, !localPart.isEmpty {
+                tokens.insert(String(localPart))
+            }
+        }
+        let displayName = user.displayName
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if !displayName.isEmpty {
+            tokens.insert(displayName)
+            tokens.insert(displayName.replacingOccurrences(of: " ", with: ""))
+            tokens.insert(displayName.replacingOccurrences(of: " ", with: "."))
+            tokens.insert(displayName.replacingOccurrences(of: " ", with: "_"))
+            tokens.insert(displayName.replacingOccurrences(of: " ", with: "-"))
+        }
+        return tokens
+    }
+
+    private func isChecklistItemMentioningCurrentUser(_ item: ChecklistItem) -> Bool {
+        guard let currentUser = user else { return false }
+        let tags = mentionTokens(in: item.text)
+        if tags.isEmpty { return false }
+        return !mentionMatchTokens(for: currentUser).isDisjoint(with: tags)
+    }
+
     func generateTeamCode() -> String { String(UUID().uuidString.prefix(6).uppercased()) }
     
     func saveLocation(_ location: String) {
@@ -2673,6 +2834,19 @@ struct ContentView: View {
     }
     
     func deleteChannel(_ channelID: String) {
+        if let channel = channels.first(where: { $0.id == channelID }) {
+            for message in channel.messages {
+                if let raw = message.attachmentURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !raw.isEmpty,
+                   (raw.hasPrefix("gs://") || raw.contains("firebasestorage.googleapis.com") || raw.contains("storage.googleapis.com")) {
+                    Storage.storage().reference(forURL: raw).delete { error in
+                        if let error {
+                            print("Error deleting channel attachment:", error.localizedDescription)
+                        }
+                    }
+                }
+            }
+        }
         db.collection("channels").document(channelID).delete()
         DispatchQueue.main.async {
             self.channels.removeAll { $0.id == channelID }
@@ -5125,6 +5299,7 @@ struct CustomizeView: View {
                 case "category": row.category = value
                 case "campus": row.campus = value
                 case "room": row.room = value
+                case "universe": row.universe = value
                 default: break
                 }
             }
@@ -5167,9 +5342,9 @@ struct ImportHelpView: View {
                     ])
 
                     helpCard(title: "Importing Patchsheet", bullets: [
-                        "Supported headers: name, input, output, category, campus, room.",
+                        "Supported headers: name, input, output, category, campus, room, universe.",
                         "Category can be Audio, Video, or Lighting.",
-                        "Lighting rows can leave output blank."
+                        "Lighting rows can leave output blank and may include universe."
                     ])
 
                     helpCard(title: "Link Tips", bullets: [
@@ -5486,6 +5661,7 @@ struct EditPatchView: View {
     @State var patch: PatchRow
     @State private var isSaving = false
     @State private var editChannelCountText = ""
+    @State private var editUniverseText = ""
     
     var canEdit: Bool { store.canEditPatchsheet }
     
@@ -5497,6 +5673,7 @@ struct EditPatchView: View {
                 if patch.category == "Lighting" {
                     TextField("DMX Channel", text: $patch.input).disabled(!canEdit)
                     TextField("Channel Count", text: $editChannelCountText).keyboardType(.numberPad).disabled(!canEdit)
+                    TextField("Universe", text: $editUniverseText).disabled(!canEdit)
                 } else if patch.category == "Video" {
                     TextField("Source", text: $patch.input).disabled(!canEdit)
                     TextField("Destination", text: $patch.output).disabled(!canEdit)
@@ -5526,6 +5703,7 @@ struct EditPatchView: View {
             } else {
                 editChannelCountText = ""
             }
+            editUniverseText = patch.universe ?? ""
         }
         .toolbar {
             if canEdit {
@@ -5535,6 +5713,7 @@ struct EditPatchView: View {
                         let trimmed = editChannelCountText.trimmingCharacters(in: .whitespaces)
                         let parsed = Int(trimmed) ?? 0
                         patch.channelCount = parsed > 0 ? parsed : nil
+                        patch.universe = editUniverseText.trimmingCharacters(in: .whitespacesAndNewlines)
                         // Use central savePatch to persist and update local state
                         store.savePatch(patch)
                         DispatchQueue.main.async {
@@ -5561,6 +5740,7 @@ struct TrainingListView: View {
     @State private var showAdd = false
     @State private var showAddVideo = false
     @State private var selectedFilter = "All"
+    @State private var assignmentFilter = "All"
     @State private var searchText = ""
     var canEdit: Bool { store.user?.isAdmin == true || store.user?.canEditTraining == true }
 
@@ -5569,10 +5749,16 @@ struct TrainingListView: View {
 
     // Filtered lessons based on selection and search
     var filteredLessons: [TrainingLesson] {
-        var lessons = store.lessons
+        var lessons = visibleLessons
         
         if selectedFilter != "All" {
             lessons = lessons.filter { $0.category == selectedFilter }
+        }
+
+        if assignmentFilter == "Assigned" {
+            lessons = lessons.filter { lesson in
+                !(lesson.assignedToUserID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            }
         }
         
         if !searchText.isEmpty {
@@ -5580,6 +5766,36 @@ struct TrainingListView: View {
         }
         
         return lessons
+    }
+
+    private var visibleLessons: [TrainingLesson] {
+        guard let currentUser = store.user else { return [] }
+        if currentUser.isAdmin || currentUser.isOwner {
+            return store.lessons
+        }
+
+        let currentUserID = currentUser.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentUserEmail = currentUser.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return store.lessons.filter { lesson in
+            let assignedID = lesson.assignedToUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let assignedEmail = lesson.assignedToUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            if assignedID.isEmpty && assignedEmail.isEmpty { return true }
+            if !assignedID.isEmpty && assignedID == currentUserID { return true }
+            if !assignedEmail.isEmpty && assignedEmail == currentUserEmail { return true }
+            return false
+        }
+    }
+
+    private func assignmentLabel(for lesson: TrainingLesson) -> String? {
+        let assignedID = lesson.assignedToUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let assignedEmail = lesson.assignedToUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if assignedID.isEmpty && assignedEmail.isEmpty { return nil }
+        if let member = store.teamMembers.first(where: { $0.id == assignedID }) {
+            let name = member.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty { return "Assigned: \(name)" }
+            return "Assigned: \(member.email)"
+        }
+        return assignedEmail.isEmpty ? "Assigned" : "Assigned: \(assignedEmail)"
     }
 
     var body: some View {
@@ -5593,6 +5809,13 @@ struct TrainingListView: View {
                 .pickerStyle(SegmentedPickerStyle())
                 .padding(.horizontal)
 
+                Picker("Assignment", selection: $assignmentFilter) {
+                    Text("All").tag("All")
+                    Text("Assigned").tag("Assigned")
+                }
+                .pickerStyle(SegmentedPickerStyle())
+                .padding(.horizontal)
+
                 List {
                     ForEach(filteredLessons) { lesson in
                         NavigationLink(destination: TrainingDetailView(lesson: lesson).environmentObject(store)) {
@@ -5600,6 +5823,9 @@ struct TrainingListView: View {
                                 VStack(alignment: .leading) {
                                     Text(lesson.title).font(.headline)
                                     Text(lesson.category).font(.caption).foregroundColor(.secondary)
+                                    if let label = assignmentLabel(for: lesson) {
+                                        Text(label).font(.caption2).foregroundColor(.blue)
+                                    }
                                 }
                                 Spacer()
                                 if lesson.isCompleted {
@@ -5612,8 +5838,7 @@ struct TrainingListView: View {
                     .onDelete { idx in
                         guard canEdit else { return }
                         for i in idx {
-                            let id = filteredLessons[i].id
-                            store.db.collection("lessons").document(id).delete()
+                            store.deleteLesson(filteredLessons[i])
                         }
                     }
                 }
@@ -5672,6 +5897,17 @@ struct TrainingDetailView: View {
     @EnvironmentObject var store: ProdConnectStore
     @State var lesson: TrainingLesson
     @State private var player: AVPlayer? = nil
+    @State private var selectedAssignedUserID: String = ""
+
+    private var canAssignLesson: Bool {
+        store.user?.isAdmin == true || store.user?.isOwner == true
+    }
+
+    private var assignableMembers: [UserProfile] {
+        store.teamMembers.sorted { lhs, rhs in
+            lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+        }
+    }
     
     var body: some View {
         VStack {
@@ -5707,9 +5943,31 @@ struct TrainingDetailView: View {
                     Text(lesson.title).font(.headline)
                     Text(lesson.category).font(.subheadline).foregroundColor(.secondary)
                 }
+
+                if canAssignLesson {
+                    Section("Assignment") {
+                        Picker("Assigned To", selection: $selectedAssignedUserID) {
+                            Text("Unassigned").tag("")
+                            ForEach(assignableMembers) { member in
+                                let displayName = member.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                                Text(displayName.isEmpty ? member.email : displayName).tag(member.id)
+                            }
+                        }
+                        .onChange(of: selectedAssignedUserID) { newValue in
+                            applyAssignment(for: newValue)
+                        }
+                    }
+                } else if let assignedTo = assignmentTextForCurrentLesson() {
+                    Section("Assignment") {
+                        Text(assignedTo).font(.subheadline)
+                    }
+                }
             }
         }
         .navigationTitle(lesson.title)
+        .onAppear {
+            selectedAssignedUserID = lesson.assignedToUserID ?? ""
+        }
         .onDisappear {
             // If it's a YouTube video, mark completed when leaving the view
             if lesson.urlString?.contains("youtube.com") == true || lesson.urlString?.contains("youtu.be") == true {
@@ -5722,6 +5980,38 @@ struct TrainingDetailView: View {
         guard !lesson.isCompleted else { return }
         lesson.isCompleted = true
         store.saveLesson(lesson)
+    }
+
+    private func applyAssignment(for userID: String) {
+        let trimmedID = userID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentID = lesson.assignedToUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let currentEmail = lesson.assignedToUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if trimmedID.isEmpty {
+            if currentID.isEmpty && currentEmail.isEmpty { return }
+            lesson.assignedToUserID = nil
+            lesson.assignedToUserEmail = nil
+            store.saveLesson(lesson)
+            return
+        }
+
+        guard let user = assignableMembers.first(where: { $0.id == trimmedID }) else { return }
+        let normalizedEmail = user.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if currentID == user.id && currentEmail == normalizedEmail { return }
+        lesson.assignedToUserID = user.id
+        lesson.assignedToUserEmail = normalizedEmail
+        store.saveLesson(lesson)
+    }
+
+    private func assignmentTextForCurrentLesson() -> String? {
+        let assignedID = lesson.assignedToUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let assignedEmail = lesson.assignedToUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if assignedID.isEmpty && assignedEmail.isEmpty { return nil }
+        if let member = assignableMembers.first(where: { $0.id == assignedID }) {
+            let displayName = member.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !displayName.isEmpty { return "Assigned to \(displayName)" }
+            return "Assigned to \(member.email)"
+        }
+        return assignedEmail.isEmpty ? "Assigned" : "Assigned to \(assignedEmail)"
     }
 }
 
@@ -5738,11 +6028,28 @@ struct AddTrainingView: View {
     @State private var isUploading = false
     @State private var uploadProgress: Double = 0
     @State private var errorMsg: String?
+    @State private var selectedAssignedUserID: String = ""
 
     var onSave: (TrainingLesson) -> Void
 
     // Only allowed categories
     let categories = ["Audio", "Video", "Lighting", "Misc"]
+
+    private var canAssignLesson: Bool {
+        store.user?.isAdmin == true || store.user?.isOwner == true
+    }
+
+    private var assignableMembers: [UserProfile] {
+        store.teamMembers.sorted { lhs, rhs in
+            lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+        }
+    }
+
+    private var selectedAssignedUser: UserProfile? {
+        let trimmed = selectedAssignedUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return assignableMembers.first(where: { $0.id == trimmed })
+    }
 
     private func uploadVideo(localURL: URL, completion: @escaping (Result<String, Error>) -> Void) {
         let filename = "\(UUID().uuidString).mov"
@@ -5774,6 +6081,17 @@ struct AddTrainingView: View {
                         ForEach(categories, id: \.self) { Text($0) }
                     }
                     .pickerStyle(MenuPickerStyle())
+
+                    if canAssignLesson {
+                        Picker("Assign To", selection: $selectedAssignedUserID) {
+                            Text("Unassigned").tag("")
+                            ForEach(assignableMembers) { member in
+                                let displayName = member.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                                Text(displayName.isEmpty ? member.email : displayName).tag(member.id)
+                            }
+                        }
+                        .pickerStyle(MenuPickerStyle())
+                    }
                 }
                 Section("Video Options") {
                     Picker("Video Source", selection: $videoSource) {
@@ -5833,7 +6151,9 @@ struct AddTrainingView: View {
                                             category: category,
                                             teamCode: store.teamCode ?? "",
                                             durationSeconds: 0,
-                                            urlString: urlString
+                                            urlString: urlString,
+                                            assignedToUserID: selectedAssignedUser?.id,
+                                            assignedToUserEmail: selectedAssignedUser?.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                                         )
                                         onSave(lesson)
                                         dismiss()
@@ -5852,7 +6172,9 @@ struct AddTrainingView: View {
                             category: category,
                             teamCode: store.teamCode ?? "",
                             durationSeconds: 0,
-                            urlString: normalizedYouTubeURL
+                            urlString: normalizedYouTubeURL,
+                            assignedToUserID: selectedAssignedUser?.id,
+                            assignedToUserEmail: selectedAssignedUser?.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                         )
                         onSave(lesson)
                         dismiss()
@@ -7183,8 +7505,7 @@ struct ChatListView: View {
                         .onDelete { idx in
                             guard isAdmin else { return }
                             for i in idx {
-                                let id = channelsToShow[i].id
-                                store.db.collection("channels").document(id).delete()
+                                store.deleteChannel(channelsToShow[i])
                             }
                         }
                         .moveDisabled(!isAdmin)
@@ -7735,6 +8056,7 @@ struct ChatChannelDetailView: View {
     }
 
     private func deleteMessage(_ msg: ChatMessage) {
+        let attachmentURLToDelete = msg.attachmentURL
         let updatedMessages = channel.messages.filter { $0.id != msg.id }
         persistMessages(updatedMessages) { result in
             switch result {
@@ -7744,8 +8066,21 @@ struct ChatChannelDetailView: View {
                 if let idx = store.channels.firstIndex(where: { $0.id == channel.id }) {
                     store.channels[idx] = channel
                 }
+                deleteMessageAttachmentIfNeeded(attachmentURLToDelete)
             case .failure(let error):
                 attachmentError = "Delete failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func deleteMessageAttachmentIfNeeded(_ urlString: String?) {
+        guard let raw = urlString?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return }
+        guard raw.hasPrefix("gs://") || raw.contains("firebasestorage.googleapis.com") || raw.contains("storage.googleapis.com") else {
+            return
+        }
+        Storage.storage().reference(forURL: raw).delete { error in
+            if let error {
+                print("DEBUG: Failed to delete chat attachment: \(error.localizedDescription)")
             }
         }
     }
@@ -8374,315 +8709,6 @@ struct ProdConnect_Previews: PreviewProvider {
 #endif
 
 
-struct PatchRow: Identifiable, Codable {
-    var id: String = UUID().uuidString
-    var name: String
-    var input: String
-    var output: String
-    var teamCode: String
-    var category: String
-    var campus: String
-    var room: String
-    var channelCount: Int?
-    var position: Int = 0
-}
-
-struct UserProfile: Identifiable, Codable {
-    var id: String = UUID().uuidString
-    var displayName: String
-    var email: String
-    var teamCode: String?
-    var isAdmin: Bool = false
-    var isOwner: Bool = false
-    var subscriptionTier: String = "free"
-    var assignedCampus: String = ""
-    var canEditPatchsheet: Bool = false
-    var canEditTraining: Bool = false
-    var canEditGear: Bool = false
-    var canEditIdeas: Bool = false
-    var canEditChecklists: Bool = false
-    var canSeeChat: Bool = true
-    var canSeePatchsheet: Bool = true
-    var canSeeTraining: Bool = true
-    var canSeeGear: Bool = true
-    var canSeeIdeas: Bool = true
-    var canSeeChecklists: Bool = true
-    // Add other fields as needed
-
-    enum CodingKeys: String, CodingKey {
-        case id
-        case displayName
-        case email
-        case teamCode
-        case isAdmin
-        case isOwner
-        case subscriptionTier
-        case assignedCampus
-        case canEditPatchsheet
-        case canEditTraining
-        case canEditGear
-        case canEditIdeas
-        case canEditChecklists
-        case canSeeChat
-        case canSeePatchsheet
-        case canSeeTraining
-        case canSeeGear
-        case canSeeIdeas
-        case canSeeChecklists
-    }
-
-    init(
-        id: String = UUID().uuidString,
-        displayName: String,
-        email: String,
-        teamCode: String? = nil,
-        isAdmin: Bool = false,
-        isOwner: Bool = false,
-        subscriptionTier: String = "free",
-        assignedCampus: String = "",
-        canEditPatchsheet: Bool = false,
-        canEditTraining: Bool = false,
-        canEditGear: Bool = false,
-        canEditIdeas: Bool = false,
-        canEditChecklists: Bool = false,
-        canSeeChat: Bool = true,
-        canSeePatchsheet: Bool = true,
-        canSeeTraining: Bool = true,
-        canSeeGear: Bool = true,
-        canSeeIdeas: Bool = true,
-        canSeeChecklists: Bool = true
-    ) {
-        self.id = id
-        self.displayName = displayName
-        self.email = email
-        self.teamCode = teamCode
-        self.isAdmin = isAdmin
-        self.isOwner = isOwner
-        self.subscriptionTier = subscriptionTier
-        self.assignedCampus = assignedCampus
-        self.canEditPatchsheet = canEditPatchsheet
-        self.canEditTraining = canEditTraining
-        self.canEditGear = canEditGear
-        self.canEditIdeas = canEditIdeas
-        self.canEditChecklists = canEditChecklists
-        self.canSeeChat = canSeeChat
-        self.canSeePatchsheet = canSeePatchsheet
-        self.canSeeTraining = canSeeTraining
-        self.canSeeGear = canSeeGear
-        self.canSeeIdeas = canSeeIdeas
-        self.canSeeChecklists = canSeeChecklists
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        enum LegacyCodingKeys: String, CodingKey {
-            case subriptionTier
-        }
-        let legacyContainer = try decoder.container(keyedBy: LegacyCodingKeys.self)
-
-        let decodedEmail = try container.decodeIfPresent(String.self, forKey: .email)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let fallbackName = decodedEmail.components(separatedBy: "@").first ?? "User"
-        let decodedName = try container.decodeIfPresent(String.self, forKey: .displayName)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
-        email = decodedEmail
-        displayName = decodedName.isEmpty ? fallbackName : decodedName
-        teamCode = try container.decodeIfPresent(String.self, forKey: .teamCode)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        isAdmin = try container.decodeIfPresent(Bool.self, forKey: .isAdmin) ?? false
-        isOwner = try container.decodeIfPresent(Bool.self, forKey: .isOwner) ?? false
-        let decodedSubscriptionTier = try container.decodeIfPresent(String.self, forKey: .subscriptionTier)
-        let legacyDecodedSubscriptionTier = try legacyContainer.decodeIfPresent(String.self, forKey: .subriptionTier)
-        subscriptionTier = decodedSubscriptionTier ?? legacyDecodedSubscriptionTier ?? "free"
-        assignedCampus = try container.decodeIfPresent(String.self, forKey: .assignedCampus) ?? ""
-        canEditPatchsheet = try container.decodeIfPresent(Bool.self, forKey: .canEditPatchsheet) ?? false
-        canEditTraining = try container.decodeIfPresent(Bool.self, forKey: .canEditTraining) ?? false
-        canEditGear = try container.decodeIfPresent(Bool.self, forKey: .canEditGear) ?? false
-        canEditIdeas = try container.decodeIfPresent(Bool.self, forKey: .canEditIdeas) ?? false
-        canEditChecklists = try container.decodeIfPresent(Bool.self, forKey: .canEditChecklists) ?? false
-        canSeeChat = try container.decodeIfPresent(Bool.self, forKey: .canSeeChat) ?? true
-        canSeePatchsheet = try container.decodeIfPresent(Bool.self, forKey: .canSeePatchsheet) ?? true
-        canSeeTraining = try container.decodeIfPresent(Bool.self, forKey: .canSeeTraining) ?? true
-        canSeeGear = try container.decodeIfPresent(Bool.self, forKey: .canSeeGear) ?? true
-        canSeeIdeas = try container.decodeIfPresent(Bool.self, forKey: .canSeeIdeas) ?? true
-        canSeeChecklists = try container.decodeIfPresent(Bool.self, forKey: .canSeeChecklists) ?? true
-    }
-
-    enum Role {
-        case free
-        case basic
-        case premium
-        case admin
-    }
-
-    var role: Role {
-        if isAdmin { return .admin }
-        switch subscriptionTier.lowercased() {
-        case "premium": return .premium
-        case "basic": return .basic
-        default: return .free
-        }
-    }
-
-    var hasCampusRoomFeatures: Bool {
-        role == .premium || role == .admin
-    }
-}
-
-struct TrainingLesson: Identifiable, Codable {
-    var id: String = UUID().uuidString
-    var title: String
-    var category: String
-    var teamCode: String
-    var durationSeconds: Int = 0
-    var urlString: String? = nil
-    var isCompleted: Bool = false
-}
-
-struct ChecklistItem: Identifiable, Codable {
-    var id: String = UUID().uuidString
-    var text: String
-    var isDone: Bool = false
-    var completedAt: Date? = nil
-    var completedBy: String? = nil
-}
-
-struct ChecklistTemplate: Identifiable, Codable {
-    var id: String = UUID().uuidString
-    var title: String
-    var teamCode: String
-    var items: [ChecklistItem] = []
-    var createdBy: String? = nil
-    var dueDate: Date? = nil
-    var completedAt: Date? = nil
-    var completedBy: String? = nil
-}
-
-struct IdeaCard: Identifiable, Codable {
-    var id: String = UUID().uuidString
-    var title: String
-    var detail: String = ""
-    var tags: [String] = []
-    var teamCode: String
-    var createdBy: String? = nil
-    var implemented: Bool = false
-    var completedAt: Date? = nil
-    var likedBy: [String] = []
-}
-
-struct ChatChannel: Identifiable, Codable {
-    var id: String = UUID().uuidString
-    var name: String
-    var teamCode: String
-    var position: Int = 0
-    var isReadOnly: Bool = false
-    var isHidden: Bool = false
-    var readOnlyUserEmails: [String] = []
-    var hiddenUserEmails: [String] = []
-    var messages: [ChatMessage] = []
-    var kind: ChatChannelKind = .group
-    var participantEmails: [String] = []
-    var lastMessageAt: Date? = nil
-
-    enum CodingKeys: String, CodingKey {
-        case id
-        case name
-        case teamCode
-        case position
-        case isReadOnly
-        case isHidden
-        case readOnlyUserEmails
-        case hiddenUserEmails
-        case messages
-        case kind
-        case participantEmails
-        case lastMessageAt
-    }
-
-    init(
-        id: String = UUID().uuidString,
-        name: String,
-        teamCode: String,
-        position: Int = 0,
-        isReadOnly: Bool = false,
-        isHidden: Bool = false,
-        readOnlyUserEmails: [String] = [],
-        hiddenUserEmails: [String] = [],
-        messages: [ChatMessage] = [],
-        kind: ChatChannelKind = .group,
-        participantEmails: [String] = [],
-        lastMessageAt: Date? = nil
-    ) {
-        self.id = id
-        self.name = name
-        self.teamCode = teamCode
-        self.position = position
-        self.isReadOnly = isReadOnly
-        self.isHidden = isHidden
-        self.readOnlyUserEmails = readOnlyUserEmails
-        self.hiddenUserEmails = hiddenUserEmails
-        self.messages = messages
-        self.kind = kind
-        self.participantEmails = participantEmails
-        self.lastMessageAt = lastMessageAt
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
-        name = try container.decodeIfPresent(String.self, forKey: .name) ?? "Channel"
-        teamCode = try container.decodeIfPresent(String.self, forKey: .teamCode) ?? ""
-        position = try container.decodeIfPresent(Int.self, forKey: .position) ?? 0
-        isReadOnly = try container.decodeIfPresent(Bool.self, forKey: .isReadOnly) ?? false
-        isHidden = try container.decodeIfPresent(Bool.self, forKey: .isHidden) ?? false
-        readOnlyUserEmails = try container.decodeIfPresent([String].self, forKey: .readOnlyUserEmails) ?? []
-        hiddenUserEmails = try container.decodeIfPresent([String].self, forKey: .hiddenUserEmails) ?? []
-        messages = try container.decodeIfPresent([ChatMessage].self, forKey: .messages) ?? []
-        kind = try container.decodeIfPresent(ChatChannelKind.self, forKey: .kind) ?? .group
-        participantEmails = try container.decodeIfPresent([String].self, forKey: .participantEmails) ?? []
-        lastMessageAt = try container.decodeIfPresent(Date.self, forKey: .lastMessageAt)
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(id, forKey: .id)
-        try container.encode(name, forKey: .name)
-        try container.encode(teamCode, forKey: .teamCode)
-        try container.encode(position, forKey: .position)
-        try container.encode(isReadOnly, forKey: .isReadOnly)
-        try container.encode(isHidden, forKey: .isHidden)
-        try container.encode(readOnlyUserEmails, forKey: .readOnlyUserEmails)
-        try container.encode(hiddenUserEmails, forKey: .hiddenUserEmails)
-        try container.encode(messages, forKey: .messages)
-        try container.encode(kind, forKey: .kind)
-        try container.encode(participantEmails, forKey: .participantEmails)
-        try container.encodeIfPresent(lastMessageAt, forKey: .lastMessageAt)
-    }
-}
-
-enum ChatChannelKind: String, Codable {
-    case group
-    case direct
-}
-
-struct ChatMessage: Identifiable, Codable {
-    var id: String = UUID().uuidString
-    var author: String
-    var text: String
-    var timestamp: Date
-    var editedAt: Date? = nil
-    var attachmentURL: String? = nil
-    var attachmentName: String? = nil
-    var attachmentKind: ChatAttachmentKind? = nil
-}
-
-enum ChatAttachmentKind: String, Codable {
-    case image
-    case file
-}
-
 // MARK: - Views
 
 
@@ -8698,6 +8724,9 @@ struct ShareSheet: UIViewControllerRepresentable {
 
 struct MainTabView: View {
     @EnvironmentObject var store: ProdConnectStore
+    @AppStorage("reviewPromptLaunchCount") private var reviewPromptLaunchCount = 0
+    @AppStorage("reviewPromptLastRequestTime") private var reviewPromptLastRequestTime: Double = 0
+    @AppStorage("reviewPromptHasRequestedBefore") private var reviewPromptHasRequestedBefore = false
 
     // Restored ChatChannelListView wrapper
     struct ChatChannelListView: View {
@@ -8721,6 +8750,7 @@ struct MainTabView: View {
         @State private var field1 = ""
         @State private var field2 = ""
         @State private var field3 = ""
+        @State private var field4 = ""
         @State private var selectedCampus: String = ""
         @State private var showCampusDialog = false
         private let categories = ["Audio", "Video", "Lighting"]
@@ -8799,6 +8829,9 @@ struct MainTabView: View {
                                 if !patch.room.isEmpty {
                                     Text("Room: \(patch.room)").font(.caption2)
                                 }
+                                if patch.category == "Lighting", let universe = patch.universe, !universe.isEmpty {
+                                    Text("Universe: \(universe)").font(.caption2)
+                                }
                             }
                         }
                     }
@@ -8818,23 +8851,34 @@ struct MainTabView: View {
                             )
                         }
                         .textFieldStyle(RoundedBorderTextFieldStyle())
+                        
+                        if categories[selectedTab] == "Lighting" {
+                            TextField("Universe", text: $field4)
+                                .textFieldStyle(RoundedBorderTextFieldStyle())
+                        }
                     }
                     .padding(.horizontal)
                     .padding(.bottom, 8)
                     Button {
+                        let trimmedChannelCount = field3.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let parsedChannelCount = Int(trimmedChannelCount)
+                        let isLighting = categories[selectedTab] == "Lighting"
                         let patch = PatchRow(
-                            name: categories[selectedTab] == "Lighting" ? field1 : field1,
-                            input: categories[selectedTab] == "Lighting" ? field2 : (categories[selectedTab] == "Video" ? field2 : field2),
-                            output: categories[selectedTab] == "Lighting" ? field3 : (categories[selectedTab] == "Video" ? field3 : field3),
+                            name: field1,
+                            input: field2,
+                            output: field3,
                             teamCode: store.teamCode ?? "",
                             category: categories[selectedTab],
                             campus: effectiveCampusFilter,
-                            room: ""
+                            room: "",
+                            channelCount: isLighting ? parsedChannelCount : nil,
+                            universe: isLighting ? field4.trimmingCharacters(in: .whitespacesAndNewlines) : nil
                         )
                         store.savePatch(patch)
                         field1 = ""
                         field2 = ""
                         field3 = ""
+                        field4 = ""
                     } label: {
                         Label("Add Patch", systemImage: "plus.rectangle.on.rectangle")
                             .fontWeight(.semibold)
@@ -8973,24 +9017,6 @@ struct MainTabView: View {
                                     .foregroundColor(.white)
                                     .cornerRadius(8)
                                 }
-                                Menu {
-                                    Button("Clear", action: { selectedStatus = nil })
-                                    Divider()
-                                    ForEach(GearItem.GearStatus.allCases, id: \ .self) { status in
-                                        Button(status.rawValue) { selectedStatus = status }
-                                    }
-                                } label: {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: "checkmark.circle")
-                                        Text(selectedStatus?.rawValue ?? "Status").lineLimit(1)
-                                    }
-                                    .font(.caption)
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 8)
-                                    .background(selectedStatus != nil ? Color.blue : Color.gray.opacity(0.3))
-                                    .foregroundColor(.white)
-                                    .cornerRadius(8)
-                                }
                                 if !allGearLocations.isEmpty {
                                     Menu {
                                         Button("Clear", action: { selectedLocation = nil })
@@ -9010,6 +9036,24 @@ struct MainTabView: View {
                                         .foregroundColor(.white)
                                         .cornerRadius(8)
                                     }
+                                }
+                                Menu {
+                                    Button("Clear", action: { selectedStatus = nil })
+                                    Divider()
+                                    ForEach(GearItem.GearStatus.allCases, id: \ .self) { status in
+                                        Button(status.rawValue) { selectedStatus = status }
+                                    }
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "checkmark.circle")
+                                        Text(selectedStatus?.rawValue ?? "Status").lineLimit(1)
+                                    }
+                                    .font(.caption)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(selectedStatus != nil ? Color.blue : Color.gray.opacity(0.3))
+                                    .foregroundColor(.white)
+                                    .cornerRadius(8)
                                 }
                             }
                             .padding(.horizontal)
@@ -9144,6 +9188,9 @@ struct MainTabView: View {
                         TextField("Output", text: .constant(patch.output)).disabled(true)
                         TextField("Campus", text: .constant(patch.campus)).disabled(true)
                         TextField("Room", text: .constant(patch.room)).disabled(true)
+                        if patch.category == "Lighting" {
+                            TextField("Universe", text: .constant(patch.universe ?? "")).disabled(true)
+                        }
                     }
                 }
                 .navigationTitle(patch.name)
@@ -9168,6 +9215,35 @@ struct MainTabView: View {
 
     private var canSeeGearTab: Bool {
         isPrivilegedUser || store.user?.canSeeGear == true
+    }
+
+    private func maybeRequestAppReview() {
+        guard store.user != nil else { return }
+
+        reviewPromptLaunchCount += 1
+
+        let minimumLaunches = reviewPromptHasRequestedBefore ? 20 : 6
+        guard reviewPromptLaunchCount >= minimumLaunches else { return }
+
+        let cooldown: TimeInterval = 120 * 24 * 60 * 60
+        let now = Date().timeIntervalSince1970
+        guard now - reviewPromptLastRequestTime >= cooldown else { return }
+
+        // Keep the request timing unpredictable so it feels natural.
+        let requestChancePercent = reviewPromptHasRequestedBefore ? 12 : 25
+        let shouldRequestNow = Int.random(in: 1...100) <= requestChancePercent
+        guard shouldRequestNow else { return }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            guard let windowScene = UIApplication.shared.connectedScenes
+                .compactMap({ $0 as? UIWindowScene })
+                .first(where: { $0.activationState == .foregroundActive }) else { return }
+
+            SKStoreReviewController.requestReview(in: windowScene)
+            reviewPromptLastRequestTime = Date().timeIntervalSince1970
+            reviewPromptHasRequestedBefore = true
+            reviewPromptLaunchCount = 0
+        }
     }
 
     var body: some View {
@@ -9200,6 +9276,9 @@ struct MainTabView: View {
                 .tabItem {
                     Label("More", systemImage: "ellipsis")
                 }
+        }
+        .onAppear {
+            maybeRequestAppReview()
         }
     }
 }

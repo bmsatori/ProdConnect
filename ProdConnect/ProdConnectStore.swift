@@ -2,16 +2,58 @@ import Foundation
 import SwiftUI
 import Combine
 import FirebaseFirestore
+import FirebaseStorage
 import FirebaseAuth
+#if canImport(OneSignalFramework)
 import OneSignalFramework
+#endif
 import UserNotifications
+#if canImport(UIKit)
 import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 @MainActor
 final class ProdConnectStore: ObservableObject {
+    private func pushLogin(_ externalID: String) {
+        #if canImport(OneSignalFramework)
+        OneSignal.login(externalID)
+        #endif
+    }
+
+    private func pushLogout() {
+        #if canImport(OneSignalFramework)
+        OneSignal.logout()
+        #endif
+    }
+
+    private var isApplicationActive: Bool {
+        #if canImport(UIKit)
+        return UIApplication.shared.applicationState == .active
+        #elseif canImport(AppKit)
+        return NSApplication.shared.isActive
+        #else
+        return true
+        #endif
+    }
+
+    private func deleteStorageObject(forDownloadURL urlString: String?) {
+        guard let raw = urlString?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return }
+        guard raw.hasPrefix("gs://") || raw.contains("firebasestorage.googleapis.com") || raw.contains("storage.googleapis.com") else {
+            return
+        }
+        Storage.storage().reference(forURL: raw).delete { error in
+            if let error {
+                print("Storage delete error:", error.localizedDescription)
+            }
+        }
+    }
+
         // Add deleteGear method for compatibility
         func deleteGear(items: [GearItem]) {
             for item in items {
+                deleteStorageObject(forDownloadURL: item.imageURL)
                 db.collection("gear").document(item.id).delete()
             }
             gear.removeAll { g in items.contains(where: { $0.id == g.id }) }
@@ -179,7 +221,7 @@ final class ProdConnectStore: ObservableObject {
                 self.user = fallbackProfile
                 self.teamCode = fallbackProfile.teamCode
                 self.isAdmin = fallbackProfile.isAdmin
-                OneSignal.login(fallbackProfile.email)
+                self.pushLogin(fallbackProfile.email)
                 self.listenToTeamData()
                 completion(.success(()))
             }
@@ -248,7 +290,7 @@ final class ProdConnectStore: ObservableObject {
             self.teamCode = teamCode
             self.isAdmin = isAdmin
             self.save(profile, collection: "users", id: uid)
-            OneSignal.login(email)
+            self.pushLogin(email)
             self.listenToTeamData()
             completion(.success(()))
         }
@@ -256,7 +298,7 @@ final class ProdConnectStore: ObservableObject {
 
     func signOut() {
         try? Auth.auth().signOut()
-        OneSignal.logout()
+        pushLogout()
         KeychainHelper.shared.delete(for: "prodconnect_email")
         KeychainHelper.shared.delete(for: "prodconnect_password")
         teamMembersListener?.remove()
@@ -295,7 +337,7 @@ final class ProdConnectStore: ObservableObject {
             self.teamCode = fallbackProfile.teamCode
             self.isAdmin = fallbackProfile.isAdmin
             if !fallbackProfile.email.isEmpty {
-                OneSignal.login(fallbackProfile.email)
+                self.pushLogin(fallbackProfile.email)
             }
             self.listenToTeamData()
         }
@@ -339,7 +381,7 @@ final class ProdConnectStore: ObservableObject {
                 self.teamCode = profile.teamCode
                 self.isAdmin = profile.isAdmin
                 if !profile.email.isEmpty {
-                    OneSignal.login(profile.email)
+                    self.pushLogin(profile.email)
                 }
                 self.listenToTeamData()
             }
@@ -491,7 +533,7 @@ final class ProdConnectStore: ObservableObject {
                 continue
             }
 
-            if channel.id == activeChatChannelID, UIApplication.shared.applicationState == .active {
+            if channel.id == activeChatChannelID, isApplicationActive {
                 continue
             }
 
@@ -515,7 +557,11 @@ final class ProdConnectStore: ObservableObject {
                 continue
             }
 
+            #if canImport(OneSignalFramework)
+            continue
+            #else
             scheduleLocalChatNotification(for: latestMessage, channelName: channel.name, channelID: channel.id)
+            #endif
         }
     }
 
@@ -580,8 +626,30 @@ final class ProdConnectStore: ObservableObject {
             lessons.append(item)
         }
     }
+    func deleteLesson(_ item: TrainingLesson) {
+        if let url = item.urlString?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !url.isEmpty,
+           !url.lowercased().contains("youtube.com"),
+           !url.lowercased().contains("youtu.be") {
+            deleteStorageObject(forDownloadURL: url)
+        }
+        db.collection("lessons").document(item.id).delete()
+        lessons.removeAll { $0.id == item.id }
+    }
     func saveChecklist(_ item: ChecklistTemplate) { save(item, collection: "checklists", id: item.id) }
     func saveIdea(_ item: IdeaCard) { save(item, collection: "ideas", id: item.id) }
+    func deletePatch(_ item: PatchRow) {
+        db.collection("patchsheet").document(item.id).delete()
+        patchsheet.removeAll { $0.id == item.id }
+    }
+    func deleteChecklist(_ item: ChecklistTemplate) {
+        db.collection("checklists").document(item.id).delete()
+        checklists.removeAll { $0.id == item.id }
+    }
+    func deleteIdea(_ item: IdeaCard) {
+        db.collection("ideas").document(item.id).delete()
+        ideas.removeAll { $0.id == item.id }
+    }
     func saveChannel(_ item: ChatChannel) {
         save(item, collection: "channels", id: item.id)
         if let index = channels.firstIndex(where: { $0.id == item.id }) {
@@ -590,6 +658,13 @@ final class ProdConnectStore: ObservableObject {
             channels.append(item)
         }
         channels.sort { $0.position < $1.position }
+    }
+    func deleteChannel(_ item: ChatChannel) {
+        for message in item.messages {
+            deleteStorageObject(forDownloadURL: message.attachmentURL)
+        }
+        db.collection("channels").document(item.id).delete()
+        channels.removeAll { $0.id == item.id }
     }
 
     func updateChannelOrder(orderedIds: [String?]) {
@@ -761,6 +836,7 @@ final class ProdConnectStore: ObservableObject {
 
     func deleteAllGear() {
         gear.forEach { item in
+            deleteStorageObject(forDownloadURL: item.imageURL)
             db.collection("gear").document(item.id).delete()
         }
         gear = []

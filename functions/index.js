@@ -77,6 +77,9 @@ exports.sendChatNotification = onDocumentUpdated(
         const channelName = after.name || "Chat";
         const teamCode = after.teamCode || "";
         const channelId = event.params.channelId;
+        const channelKind = after.kind || "group";
+        const participantEmails = Array.isArray(after.participantEmails) ?
+          after.participantEmails : [];
 
         console.log("Processing message for channel:", channelId);
         console.log("Full message object:", JSON.stringify(newMessage));
@@ -91,13 +94,24 @@ exports.sendChatNotification = onDocumentUpdated(
         // Get sender email (try both author and senderName fields)
         const senderEmail = newMessage.author || newMessage.senderEmail;
         console.log("Sender email:", senderEmail);
-
-        // Get external user IDs (email addresses), excluding sender
         const senderEmailLower = (senderEmail || "").toLowerCase();
+        const participantEmailSet = new Set(participantEmails
+            .map((email) => (email || "").toLowerCase())
+            .filter(Boolean));
+
+        // Get external user IDs (email addresses), excluding sender.
+        // Direct messages should only notify the users in that DM.
         const externalUserIds = usersSnapshot.docs
             .map((doc) => doc.data().email)
-            .filter((email) =>
-              email && email.toLowerCase() !== senderEmailLower);
+            .filter((email) => {
+              if (!email) return false;
+              const normalizedEmail = email.toLowerCase();
+              if (normalizedEmail === senderEmailLower) return false;
+              if (channelKind === "direct" && participantEmailSet.size > 0) {
+                return participantEmailSet.has(normalizedEmail);
+              }
+              return true;
+            });
 
         console.log("Message sender:", senderEmail,
             "(lowercase:", senderEmailLower, ")");
@@ -143,13 +157,18 @@ exports.sendChatNotification = onDocumentUpdated(
           },
           body: JSON.stringify({
             app_id: oneSignalAppId,
+            include_aliases: {
+              external_id: externalUserIds,
+            },
             include_external_user_ids: externalUserIds,
+            target_channel: "push",
             headings: {en: channelName},
             contents: {en: `${senderName}: ${newMessage.text || ""}`},
             data: {
               channelId,
               channelName,
             },
+            ios_interruption_level: "active",
             // iOS notification settings
             ios_badgeType: "Increase",
             ios_badgeCount: 1,
