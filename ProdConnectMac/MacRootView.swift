@@ -314,41 +314,52 @@ private struct MacChatView: View {
                                 GeometryReader { scrollProxy in
                                     ScrollView {
                                         LazyVStack(alignment: .leading, spacing: 0) {
-                                            ForEach(channel.messages) { message in
-                                                VStack(alignment: .leading, spacing: 4) {
-                                                    Text(displayName(for: message.author)).font(.headline)
-                                                    if !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                                        Text(message.text)
+                                            ForEach(Array(channel.messages.enumerated()), id: \.element.id) { index, message in
+                                                VStack(alignment: .leading, spacing: 0) {
+                                                    if shouldShowDateHeader(for: index, in: channel.messages) {
+                                                        Text(dateHeaderText(for: message.timestamp))
+                                                            .font(.caption)
+                                                            .foregroundStyle(.secondary)
+                                                            .padding(.top, index == 0 ? 4 : 14)
+                                                            .padding(.bottom, 8)
+                                                            .frame(maxWidth: .infinity, alignment: .center)
                                                     }
-                                                    HStack(spacing: 8) {
-                                                        Text(message.timestamp, style: .time)
-                                                        if message.editedAt != nil {
-                                                            Text("Edited")
-                                                        }
-                                                    }
-                                                    .font(.caption)
-                                                    .foregroundStyle(.secondary)
-                                                    attachmentView(for: message)
-                                                }
-                                                .frame(maxWidth: .infinity, alignment: .leading)
-                                                .padding(.vertical, 14)
-                                                .padding(.leading, 12)
-                                                .padding(.trailing, 12)
-                                                .overlay(alignment: .bottom) {
-                                                    Divider()
-                                                }
-                                                .contextMenu {
-                                                    Button("Edit") {
-                                                        beginEditing(message)
-                                                    }
-                                                    .disabled(channel.isReadOnly)
 
-                                                    Button("Delete", role: .destructive) {
-                                                        pendingDeleteMessage = message
+                                                    VStack(alignment: .leading, spacing: 4) {
+                                                        Text(displayName(for: message.author)).font(.headline)
+                                                        if !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                                            Text(message.text)
+                                                        }
+                                                        HStack(spacing: 8) {
+                                                            Text(message.timestamp, style: .time)
+                                                            if message.editedAt != nil {
+                                                                Text("Edited")
+                                                            }
+                                                        }
+                                                        .font(.caption)
+                                                        .foregroundStyle(.secondary)
+                                                        attachmentView(for: message)
                                                     }
-                                                    .disabled(channel.isReadOnly)
+                                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                                    .padding(.vertical, 14)
+                                                    .padding(.leading, 12)
+                                                    .padding(.trailing, 12)
+                                                    .overlay(alignment: .bottom) {
+                                                        Divider()
+                                                    }
+                                                    .contextMenu {
+                                                        Button("Edit") {
+                                                            beginEditing(message)
+                                                        }
+                                                        .disabled(channel.isReadOnly)
+
+                                                        Button("Delete", role: .destructive) {
+                                                            pendingDeleteMessage = message
+                                                        }
+                                                        .disabled(channel.isReadOnly)
+                                                    }
+                                                    .id(message.id)
                                                 }
-                                                .id(message.id)
                                             }
                                         }
                                         .frame(width: scrollProxy.size.width, alignment: .leading)
@@ -501,6 +512,22 @@ private struct MacChatView: View {
             return names.joined(separator: ", ")
         }
         return channel.name
+    }
+
+    private func shouldShowDateHeader(for index: Int, in messages: [ChatMessage]) -> Bool {
+        guard messages.indices.contains(index) else { return false }
+        guard index > 0 else { return true }
+        return !Calendar.current.isDate(messages[index].timestamp, inSameDayAs: messages[index - 1].timestamp)
+    }
+
+    private func dateHeaderText(for date: Date) -> String {
+        if Calendar.current.isDateInToday(date) {
+            return "Today"
+        }
+        if Calendar.current.isDateInYesterday(date) {
+            return "Yesterday"
+        }
+        return date.formatted(date: .abbreviated, time: .omitted)
     }
 
     private func moveChannels(from source: IndexSet, to destination: Int) {
@@ -908,90 +935,128 @@ private struct MacPatchsheetView: View {
 private struct MacTrainingView: View {
     @EnvironmentObject private var store: ProdConnectStore
     @State private var selectedLesson: TrainingLesson?
+    @State private var showAddTrainingSheet = false
     @State private var title = ""
     @State private var category = "Audio"
     @State private var urlString = ""
 
     private let categories = ["Audio", "Video", "Lighting", "Misc"]
+    private var canSaveNewLesson: Bool {
+        !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     var body: some View {
-        if let selectedLesson {
-            VStack(alignment: .leading, spacing: 16) {
-                Button {
-                    self.selectedLesson = nil
-                } label: {
-                    Label("Back", systemImage: "chevron.left")
-                }
-                .buttonStyle(.bordered)
-
-                MacTrainingLessonPlayerView(lesson: selectedLesson)
-            }
-            .padding()
-            .background(Color.clear)
-            .navigationTitle(selectedLesson.title)
-        } else {
-        VStack(alignment: .leading, spacing: 16) {
-            List {
-                ForEach(store.lessons.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }) { lesson in
+        Group {
+            if let selectedLesson {
+                VStack(alignment: .leading, spacing: 16) {
                     Button {
-                        selectedLesson = lesson
+                        self.selectedLesson = nil
                     } label: {
-                        HStack {
-                            VStack(alignment: .leading) {
-                                Text(lesson.title).font(.headline)
-                                Text(lesson.category).font(.caption).foregroundStyle(.secondary)
+                        Label("Back", systemImage: "chevron.left")
+                    }
+                    .buttonStyle(.bordered)
+
+                    MacTrainingLessonPlayerView(lesson: selectedLesson)
+                }
+                .padding()
+                .background(Color.clear)
+                .navigationTitle(selectedLesson.title)
+            } else {
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack {
+                        Spacer()
+                        Button {
+                            showAddTrainingSheet = true
+                        } label: {
+                            Label("Add", systemImage: "plus")
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+
+                    List {
+                        ForEach(store.lessons.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }) { lesson in
+                            Button {
+                                selectedLesson = lesson
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading) {
+                                        Text(lesson.title).font(.headline)
+                                        Text(lesson.category).font(.caption).foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if hasPlayableURL(lesson) {
+                                        Image(systemName: "play.circle.fill")
+                                            .foregroundStyle(.blue)
+                                    }
+                                }
                             }
-                            Spacer()
-                            if hasPlayableURL(lesson) {
-                                Image(systemName: "play.circle.fill")
-                                    .foregroundStyle(.blue)
+                            .buttonStyle(.plain)
+                        }
+                        .onDelete { indexSet in
+                            let lessons = store.lessons.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+                            for index in indexSet {
+                                store.deleteLesson(lessons[index])
                             }
                         }
                     }
-                    .buttonStyle(.plain)
+                    .scrollContentBackground(.hidden)
                 }
-                .onDelete { indexSet in
-                    let lessons = store.lessons.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
-                    for index in indexSet {
-                        store.deleteLesson(lessons[index])
-                    }
-                }
+                .padding()
+                .background(Color.clear)
+                .navigationTitle("Training")
             }
-            .scrollContentBackground(.hidden)
-
-            GroupBox("Add Training") {
-                VStack(spacing: 10) {
+        }
+        .sheet(isPresented: $showAddTrainingSheet) {
+            NavigationStack {
+                Form {
                     TextField("Title", text: $title)
                     Picker("Category", selection: $category) {
                         ForEach(categories, id: \.self) { Text($0).tag($0) }
                     }
                     TextField("Video URL (optional)", text: $urlString)
-                    Button("Save Lesson") {
-                        store.saveLesson(
-                            TrainingLesson(
-                                title: title,
-                                category: category,
-                                teamCode: store.teamCode ?? "",
-                                urlString: urlString.isEmpty ? nil : urlString
-                            )
-                        )
-                        title = ""
-                        urlString = ""
+                }
+                .navigationTitle("Add Training")
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") {
+                            resetNewLessonForm()
+                            showAddTrainingSheet = false
+                        }
                     }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Save") {
+                            saveNewLesson()
+                        }
+                        .disabled(!canSaveNewLesson)
+                    }
                 }
             }
-        }
-        .padding()
-        .background(Color.clear)
-        .navigationTitle("Training")
+            .frame(minWidth: 420, minHeight: 240)
         }
     }
 
     private func hasPlayableURL(_ lesson: TrainingLesson) -> Bool {
         let raw = lesson.urlString?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return !raw.isEmpty && URL(string: raw) != nil
+    }
+
+    private func saveNewLesson() {
+        store.saveLesson(
+            TrainingLesson(
+                title: title,
+                category: category,
+                teamCode: store.teamCode ?? "",
+                urlString: urlString.isEmpty ? nil : urlString
+            )
+        )
+        resetNewLessonForm()
+        showAddTrainingSheet = false
+    }
+
+    private func resetNewLessonForm() {
+        title = ""
+        category = categories.first ?? "Audio"
+        urlString = ""
     }
 }
 
@@ -1605,9 +1670,12 @@ private struct MacGearDetailView: View {
 private struct MacChecklistView: View {
     @EnvironmentObject private var store: ProdConnectStore
     @State private var selectedChecklist: ChecklistTemplate?
+    @State private var startsEditingSelectedChecklist = false
     @State private var isShowingAddChecklist = false
     @State private var title = ""
-    @State private var firstTask = ""
+    @State private var newChecklistItems = Array(repeating: "", count: 3)
+    @State private var hasDueDate = false
+    @State private var dueDate = Date()
 
     private var activeChecklists: [ChecklistTemplate] {
         store.checklists
@@ -1632,13 +1700,17 @@ private struct MacChecklistView: View {
         if let selectedChecklist {
             VStack(alignment: .leading, spacing: 16) {
                 Button {
+                    startsEditingSelectedChecklist = false
                     self.selectedChecklist = nil
                 } label: {
                     Label("Back", systemImage: "chevron.left")
                 }
                 .buttonStyle(.bordered)
 
-                MacChecklistDetailView(checklist: selectedChecklist)
+                MacChecklistDetailView(
+                    checklist: selectedChecklist,
+                    startEditing: startsEditingSelectedChecklist
+                )
             }
             .padding()
             .background(Color.clear)
@@ -1647,12 +1719,23 @@ private struct MacChecklistView: View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
                 Spacer()
-                Button(isShowingAddChecklist ? "Cancel" : "Add") {
-                    isShowingAddChecklist.toggle()
-                    if !isShowingAddChecklist {
-                        title = ""
-                        firstTask = ""
+                if isShowingAddChecklist {
+                    Button("Cancel") {
+                        isShowingAddChecklist = false
+                        resetNewChecklistForm()
                     }
+                    .buttonStyle(.bordered)
+                }
+                Button {
+                    if isShowingAddChecklist {
+                        isShowingAddChecklist = false
+                        resetNewChecklistForm()
+                    } else {
+                        resetNewChecklistForm()
+                        isShowingAddChecklist = true
+                    }
+                } label: {
+                    Label("Add", systemImage: "plus")
                 }
                 .buttonStyle(.borderedProminent)
             }
@@ -1679,19 +1762,38 @@ private struct MacChecklistView: View {
                 GroupBox("Add Checklist") {
                     VStack(spacing: 10) {
                         TextField("Title", text: $title)
-                        TextField("First Item", text: $firstTask)
+                        Toggle("Set due date", isOn: $hasDueDate)
+                        if hasDueDate {
+                            DatePicker("Due", selection: $dueDate, displayedComponents: [.date, .hourAndMinute])
+                        }
+                        Text("Items")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        ForEach(Array(newChecklistItems.indices), id: \.self) { index in
+                            TextField("Item \(index + 1)", text: $newChecklistItems[index])
+                        }
+                        Button("Add Another Item") {
+                            newChecklistItems.append("")
+                        }
+                        .buttonStyle(.bordered)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         Button("Save Checklist") {
-                            let item = ChecklistItem(text: firstTask.isEmpty ? "New Item" : firstTask)
-                            store.saveChecklist(
-                                ChecklistTemplate(
-                                    title: title.trimmingCharacters(in: .whitespacesAndNewlines),
-                                    teamCode: store.teamCode ?? "",
-                                    items: [item],
-                                    createdBy: store.user?.email
-                                )
+                            let parsedItems = newChecklistItems.compactMap { item -> ChecklistItem? in
+                                let trimmed = item.trimmingCharacters(in: .whitespacesAndNewlines)
+                                guard !trimmed.isEmpty else { return nil }
+                                return ChecklistItem(text: trimmed)
+                            }
+                            let items = parsedItems.isEmpty ? [ChecklistItem(text: "New Item")] : parsedItems
+                            var checklist = ChecklistTemplate(
+                                title: title.trimmingCharacters(in: .whitespacesAndNewlines),
+                                teamCode: store.teamCode ?? "",
+                                items: items,
+                                createdBy: store.user?.email
                             )
-                            title = ""
-                            firstTask = ""
+                            checklist.dueDate = hasDueDate ? dueDate : nil
+                            store.saveChecklist(checklist)
+                            resetNewChecklistForm()
                             isShowingAddChecklist = false
                         }
                         .buttonStyle(.borderedProminent)
@@ -1710,6 +1812,7 @@ private struct MacChecklistView: View {
     private func checklistRow(_ checklist: ChecklistTemplate) -> some View {
         Button {
             isShowingAddChecklist = false
+            startsEditingSelectedChecklist = false
             selectedChecklist = checklist
         } label: {
             VStack(alignment: .leading, spacing: 6) {
@@ -1741,6 +1844,7 @@ private struct MacChecklistView: View {
         .contextMenu {
             Button("Edit") {
                 isShowingAddChecklist = false
+                startsEditingSelectedChecklist = true
                 selectedChecklist = checklist
             }
 
@@ -1755,6 +1859,13 @@ private struct MacChecklistView: View {
     private func isChecklistCompleted(_ checklist: ChecklistTemplate) -> Bool {
         !checklist.items.isEmpty && checklist.items.allSatisfy(\.isDone)
     }
+
+    private func resetNewChecklistForm() {
+        title = ""
+        newChecklistItems = Array(repeating: "", count: 3)
+        hasDueDate = false
+        dueDate = Date()
+    }
 }
 
 private struct MacChecklistDetailView: View {
@@ -1764,8 +1875,10 @@ private struct MacChecklistDetailView: View {
     @State private var originalChecklist: ChecklistTemplate?
     @State private var newItemText = ""
 
-    init(checklist: ChecklistTemplate) {
+    init(checklist: ChecklistTemplate, startEditing: Bool = false) {
         _checklist = State(initialValue: checklist)
+        _isEditing = State(initialValue: startEditing)
+        _originalChecklist = State(initialValue: startEditing ? checklist : nil)
     }
 
     var body: some View {
@@ -1965,11 +2078,40 @@ private struct MacChecklistDetailView: View {
 
 private struct MacIdeasView: View {
     @EnvironmentObject private var store: ProdConnectStore
+    @State private var isShowingAddIdea = false
     @State private var title = ""
     @State private var detail = ""
+    @State private var tags = ""
+    
+    private var canSaveIdea: Bool {
+        !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Spacer()
+                if isShowingAddIdea {
+                    Button("Cancel") {
+                        resetIdeaForm()
+                        isShowingAddIdea = false
+                    }
+                    .buttonStyle(.bordered)
+                }
+                Button {
+                    if isShowingAddIdea {
+                        resetIdeaForm()
+                        isShowingAddIdea = false
+                    } else {
+                        resetIdeaForm()
+                        isShowingAddIdea = true
+                    }
+                } label: {
+                    Label("Add", systemImage: "plus")
+                }
+                .buttonStyle(.borderedProminent)
+            }
+
             List {
                 ForEach(store.ideas.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }) { idea in
                     VStack(alignment: .leading, spacing: 6) {
@@ -2000,30 +2142,49 @@ private struct MacIdeasView: View {
             }
             .scrollContentBackground(.hidden)
 
-            GroupBox("Add Idea") {
-                VStack(spacing: 10) {
-                    TextField("Title", text: $title)
-                    TextField("Detail", text: $detail)
-                    Button("Save Idea") {
-                        store.saveIdea(
-                            IdeaCard(
-                                title: title,
-                                detail: detail,
-                                teamCode: store.teamCode ?? "",
-                                createdBy: store.user?.email
-                            )
-                        )
-                        title = ""
-                        detail = ""
+            if isShowingAddIdea {
+                GroupBox("Add Idea") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        TextField("Title", text: $title)
+                        TextEditor(text: $detail)
+                            .frame(minHeight: 120)
+                        TextField("Tags (comma separated)", text: $tags)
+                        Button("Save Idea") {
+                            saveIdea()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!canSaveIdea)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
         }
         .padding()
         .background(Color.clear)
         .navigationTitle("Ideas")
+    }
+
+    private func saveIdea() {
+        let parsedTags = tags
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        store.saveIdea(
+            IdeaCard(
+                title: title.trimmingCharacters(in: .whitespacesAndNewlines),
+                detail: detail.trimmingCharacters(in: .whitespacesAndNewlines),
+                tags: parsedTags,
+                teamCode: store.teamCode ?? "",
+                createdBy: store.user?.email
+            )
+        )
+        resetIdeaForm()
+        isShowingAddIdea = false
+    }
+
+    private func resetIdeaForm() {
+        title = ""
+        detail = ""
+        tags = ""
     }
 }
 
@@ -2446,9 +2607,38 @@ private struct MacCustomizeView: View {
 
 private struct MacUsersView: View {
     @EnvironmentObject private var store: ProdConnectStore
+    @State private var selectedUser: UserProfile?
+
+    private var canManageUsers: Bool {
+        store.user?.isAdmin == true || store.user?.isOwner == true
+    }
 
     var body: some View {
         List(store.teamMembers.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }) { user in
+            userRow(for: user)
+        }
+        .scrollContentBackground(.hidden)
+        .background(Color.clear)
+        .navigationTitle("Users")
+        .sheet(item: $selectedUser) { user in
+            NavigationStack {
+                MacUserDetailView(user: user)
+                    .environmentObject(store)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") {
+                                selectedUser = nil
+                            }
+                        }
+                    }
+            }
+            .frame(minWidth: 520, minHeight: 640)
+        }
+    }
+
+    @ViewBuilder
+    private func userRow(for user: UserProfile) -> some View {
+        HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(user.displayName).font(.headline)
                 Text(user.email).font(.caption).foregroundStyle(.secondary)
@@ -2456,10 +2646,289 @@ private struct MacUsersView: View {
                     Text(user.assignedCampus).font(.caption2).foregroundStyle(.secondary)
                 }
             }
+
+            Spacer(minLength: 12)
+
+            if canManageUsers {
+                Button("Edit User") {
+                    selectedUser = user
+                }
+                .buttonStyle(.bordered)
+            }
         }
-        .scrollContentBackground(.hidden)
-        .background(Color.clear)
-        .navigationTitle("Users")
+        .padding(.vertical, 4)
+    }
+}
+
+private struct MacUserDetailView: View {
+    @EnvironmentObject private var store: ProdConnectStore
+    @State private var user: UserProfile
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+    @State private var showTransferConfirm = false
+
+    init(user: UserProfile) {
+        _user = State(initialValue: user)
+    }
+
+    var body: some View {
+        Form {
+            Section("User") {
+                LabeledContent("Name", value: user.displayName)
+                LabeledContent("Email", value: user.email)
+            }
+
+            Section("Role") {
+                Toggle("Admin", isOn: $user.isAdmin)
+                    .disabled(isSaving || user.isOwner)
+                    .onChange(of: user.isAdmin) { isAdmin in
+                        updateAdminFlag(isAdmin: isAdmin)
+                    }
+            }
+
+            if store.user?.isOwner == true, user.id != store.user?.id {
+                Section("Ownership") {
+                    Button("Transfer Ownership") {
+                        showTransferConfirm = true
+                    }
+                    .disabled(isSaving)
+                }
+            }
+
+            if !user.isAdmin && (store.user?.hasCampusRoomFeatures ?? false) {
+                Section("Assigned Campus") {
+                    Picker("Campus", selection: $user.assignedCampus) {
+                        Text("No campus assigned").tag("")
+                        ForEach(store.locations.sorted(), id: \.self) { campus in
+                            Text(campus).tag(campus)
+                        }
+                    }
+                    .onChange(of: user.assignedCampus) { campus in
+                        updateAssignedCampus(campus: campus)
+                    }
+                }
+            }
+
+            Section("Permissions") {
+                Toggle("Can edit patchsheet", isOn: $user.canEditPatchsheet)
+                    .onChange(of: user.canEditPatchsheet) { value in
+                        updatePermission(key: "canEditPatchsheet", value: value)
+                    }
+                Toggle("Can edit training", isOn: $user.canEditTraining)
+                    .onChange(of: user.canEditTraining) { value in
+                        updatePermission(key: "canEditTraining", value: value)
+                    }
+                Toggle("Can edit gear", isOn: $user.canEditGear)
+                    .onChange(of: user.canEditGear) { value in
+                        updatePermission(key: "canEditGear", value: value)
+                    }
+                Toggle("Can edit ideas", isOn: $user.canEditIdeas)
+                    .onChange(of: user.canEditIdeas) { value in
+                        updatePermission(key: "canEditIdeas", value: value)
+                    }
+                Toggle("Can edit checklists", isOn: $user.canEditChecklists)
+                    .onChange(of: user.canEditChecklists) { value in
+                        updatePermission(key: "canEditChecklists", value: value)
+                    }
+            }
+
+            if !user.isAdmin {
+                Section("Visible Tabs") {
+                    Toggle("Chat", isOn: $user.canSeeChat)
+                        .onChange(of: user.canSeeChat) { value in
+                            updatePermission(key: "canSeeChat", value: value)
+                        }
+                    Toggle("Patchsheet", isOn: $user.canSeePatchsheet)
+                        .onChange(of: user.canSeePatchsheet) { value in
+                            updatePermission(key: "canSeePatchsheet", value: value)
+                        }
+                    Toggle("Training", isOn: $user.canSeeTraining)
+                        .onChange(of: user.canSeeTraining) { value in
+                            updatePermission(key: "canSeeTraining", value: value)
+                        }
+                    Toggle("Gear", isOn: $user.canSeeGear)
+                        .onChange(of: user.canSeeGear) { value in
+                            updatePermission(key: "canSeeGear", value: value)
+                        }
+                    Toggle("Ideas", isOn: $user.canSeeIdeas)
+                        .onChange(of: user.canSeeIdeas) { value in
+                            updatePermission(key: "canSeeIdeas", value: value)
+                        }
+                    Toggle("Checklists", isOn: $user.canSeeChecklists)
+                        .onChange(of: user.canSeeChecklists) { value in
+                            updatePermission(key: "canSeeChecklists", value: value)
+                        }
+                }
+            }
+
+            if let errorMessage {
+                Section {
+                    Text(errorMessage)
+                        .foregroundStyle(.red)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Edit User")
+        .alert("Transfer Ownership?", isPresented: $showTransferConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Transfer", role: .destructive) {
+                transferOwnership()
+            }
+        } message: {
+            Text("This will move the Owner role and subscription control to this user.")
+        }
+        .toolbar {
+            if isSaving {
+                ToolbarItem {
+                    ProgressView()
+                }
+            }
+        }
+    }
+
+    private func transferOwnership() {
+        guard let currentOwner = store.user, currentOwner.isOwner else { return }
+        let teamCode = (currentOwner.teamCode ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !teamCode.isEmpty else {
+            errorMessage = "No team code available."
+            return
+        }
+
+        isSaving = true
+        errorMessage = nil
+
+        let batch = store.db.batch()
+        let teamRef = store.db.collection("teams").document(teamCode)
+        let currentOwnerRef = store.db.collection("users").document(currentOwner.id)
+        let newOwnerRef = store.db.collection("users").document(user.id)
+
+        batch.setData([
+            "ownerId": user.id,
+            "ownerEmail": user.email,
+            "code": teamCode,
+            "isActive": true
+        ], forDocument: teamRef, merge: true)
+
+        batch.setData([
+            "isOwner": false
+        ], forDocument: currentOwnerRef, merge: true)
+
+        var newOwnerUpdates: [String: Any] = [
+            "isOwner": true,
+            "isAdmin": true
+        ]
+        if user.subscriptionTier == "free" {
+            newOwnerUpdates["subscriptionTier"] = "basic"
+        }
+        batch.setData(newOwnerUpdates, forDocument: newOwnerRef, merge: true)
+
+        batch.commit { error in
+            DispatchQueue.main.async {
+                self.isSaving = false
+                if let error {
+                    self.errorMessage = "Transfer failed: \(error.localizedDescription)"
+                    return
+                }
+
+                if currentOwner.id == self.store.user?.id {
+                    self.store.user?.isOwner = false
+                }
+                self.user.isOwner = true
+                self.user.isAdmin = true
+                if self.user.subscriptionTier == "free" {
+                    self.user.subscriptionTier = "basic"
+                }
+                self.replaceTeamMember()
+            }
+        }
+    }
+
+    private func updateAdminFlag(isAdmin: Bool) {
+        isSaving = true
+        errorMessage = nil
+        store.db.collection("users").document(user.id).updateData(["isAdmin": isAdmin]) { error in
+            DispatchQueue.main.async {
+                self.isSaving = false
+                if let error {
+                    self.errorMessage = "Update failed: \(error.localizedDescription)"
+                    self.user.isAdmin.toggle()
+                    return
+                }
+
+                self.replaceTeamMember()
+            }
+        }
+    }
+
+    private func updateAssignedCampus(campus: String) {
+        guard !user.id.isEmpty else {
+            errorMessage = "Update failed: missing user id"
+            return
+        }
+
+        isSaving = true
+        errorMessage = nil
+        store.db.collection("users").document(user.id).setData(["assignedCampus": campus], merge: true) { error in
+            DispatchQueue.main.async {
+                self.isSaving = false
+                if let error {
+                    self.errorMessage = "Update failed: \(error.localizedDescription)"
+                    return
+                }
+
+                self.user.assignedCampus = campus
+                self.replaceTeamMember()
+            }
+        }
+    }
+
+    private func updatePermission(key: String, value: Bool) {
+        isSaving = true
+        errorMessage = nil
+        store.db.collection("users").document(user.id).updateData([key: value]) { error in
+            DispatchQueue.main.async {
+                self.isSaving = false
+                if let error {
+                    self.errorMessage = "Update failed: \(error.localizedDescription)"
+                    return
+                }
+
+                switch key {
+                case "canEditPatchsheet":
+                    self.user.canEditPatchsheet = value
+                case "canEditTraining":
+                    self.user.canEditTraining = value
+                case "canEditGear":
+                    self.user.canEditGear = value
+                case "canEditIdeas":
+                    self.user.canEditIdeas = value
+                case "canEditChecklists":
+                    self.user.canEditChecklists = value
+                case "canSeeChat":
+                    self.user.canSeeChat = value
+                case "canSeePatchsheet":
+                    self.user.canSeePatchsheet = value
+                case "canSeeTraining":
+                    self.user.canSeeTraining = value
+                case "canSeeGear":
+                    self.user.canSeeGear = value
+                case "canSeeIdeas":
+                    self.user.canSeeIdeas = value
+                case "canSeeChecklists":
+                    self.user.canSeeChecklists = value
+                default:
+                    break
+                }
+
+                self.replaceTeamMember()
+            }
+        }
+    }
+
+    private func replaceTeamMember() {
+        guard let index = store.teamMembers.firstIndex(where: { $0.id == user.id }) else { return }
+        store.teamMembers[index] = user
     }
 }
 
