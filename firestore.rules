@@ -68,6 +68,11 @@ service cloud.firestore {
       allow create: if isSignedIn() && request.resource.data.teamCode == getUserTeamCode();
     }
 
+    match /tickets/{ticketId} {
+      allow read, write: if belongsToUserTeam();
+      allow create: if isSignedIn() && request.resource.data.teamCode == getUserTeamCode();
+    }
+
     match /channels/{channelId} {
       allow read, write: if belongsToUserTeam();
       allow create: if isSignedIn() && request.resource.data.teamCode == getUserTeamCode();

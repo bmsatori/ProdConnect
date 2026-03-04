@@ -13,6 +13,7 @@ private enum MacRoute: String, CaseIterable, Identifiable {
     case patchsheet
     case training
     case gear
+    case tickets
     case checklists
     case ideas
     case customize
@@ -26,7 +27,8 @@ private enum MacRoute: String, CaseIterable, Identifiable {
         case .chat: return "Chat"
         case .patchsheet: return "Patchsheet"
         case .training: return "Training"
-        case .gear: return "Gear"
+        case .gear: return "Assets"
+        case .tickets: return "Tickets"
         case .checklists: return "Checklist"
         case .ideas: return "Ideas"
         case .customize: return "Customize"
@@ -41,6 +43,7 @@ private enum MacRoute: String, CaseIterable, Identifiable {
         case .patchsheet: return "square.grid.3x2"
         case .training: return "graduationcap"
         case .gear: return "shippingbox"
+        case .tickets: return "ticket"
         case .checklists: return "checklist"
         case .ideas: return "lightbulb"
         case .customize: return "paintbrush"
@@ -48,11 +51,27 @@ private enum MacRoute: String, CaseIterable, Identifiable {
         case .account: return "person.crop.circle"
         }
     }
+
 }
 
 struct MacRootView: View {
     @EnvironmentObject private var store: ProdConnectStore
     @State private var selectedRoute: MacRoute? = .chat
+
+    private var sidebarRoutes: [MacRoute] {
+        MacRoute.allCases.filter { route in
+            switch route {
+            case .chat:
+                return store.canSeeChat
+            case .training:
+                return store.canSeeTrainingTab
+            case .tickets:
+                return store.canUseTickets
+            default:
+                return true
+            }
+        }
+    }
 
     private var shellGradient: LinearGradient {
         LinearGradient(
@@ -83,15 +102,21 @@ struct MacRootView: View {
                     .navigationSplitViewStyle(.balanced)
                 }
                 .onAppear {
+                    if let selectedRoute, !sidebarRoutes.contains(selectedRoute) {
+                        self.selectedRoute = sidebarRoutes.first
+                    } else if selectedRoute == nil {
+                        self.selectedRoute = sidebarRoutes.first
+                    }
                     store.listenToTeamData()
                     store.listenToTeamMembers()
                 }
             }
         }
+        .multilineTextAlignment(.leading)
     }
 
     private var sidebar: some View {
-        List(MacRoute.allCases, selection: $selectedRoute) { route in
+        List(sidebarRoutes, selection: $selectedRoute) { route in
             Label(route.title, systemImage: route.icon)
                 .tag(route)
         }
@@ -111,6 +136,8 @@ struct MacRootView: View {
             MacTrainingView()
         case .gear:
             MacGearView()
+        case .tickets:
+            MacTicketsView()
         case .checklists:
             MacChecklistView()
         case .ideas:
@@ -1215,11 +1242,11 @@ private struct MacGearView: View {
                     }
                     .buttonStyle(.bordered)
 
-                    gearEditor(title: "Edit Gear", buttonTitle: "Save Changes", fullScreen: true)
+                    gearEditor(title: "Edit Asset", buttonTitle: "Save Changes", fullScreen: true)
                 }
                 .padding()
                 .background(Color.clear)
-                .navigationTitle(name.isEmpty ? "Edit Gear" : name)
+                .navigationTitle(name.isEmpty ? "Edit Asset" : name)
             } else
             if let selectedGearItem {
                 VStack(alignment: .leading, spacing: 16) {
@@ -1271,7 +1298,7 @@ private struct MacGearView: View {
                 .buttonStyle(.borderedProminent)
             }
 
-            TextField("Search gear...", text: $searchText)
+            TextField("Search assets...", text: $searchText)
                 .textFieldStyle(.roundedBorder)
 
             HStack(spacing: 12) {
@@ -1354,12 +1381,12 @@ private struct MacGearView: View {
             .scrollContentBackground(.hidden)
 
             if showAddGearForm {
-                gearEditor(title: "Add Gear", buttonTitle: "Save Gear", fullScreen: false)
+                gearEditor(title: "Add Asset", buttonTitle: "Save Asset", fullScreen: false)
             }
         }
         .padding()
         .background(Color.clear)
-        .navigationTitle("Gear")
+        .navigationTitle("Assets")
             }
         }
     }
@@ -1625,6 +1652,43 @@ private struct MacGearDetailView: View {
                 detailRow("Notes", item.maintenanceNotes)
             }
 
+            Section("Ticket History") {
+                if item.ticketHistory.isEmpty {
+                    Text("No tickets linked")
+                        .foregroundStyle(.secondary)
+                } else {
+                    if !item.activeTicketIDs.isEmpty {
+                        Text("\(item.activeTicketIDs.count) active ticket(s)")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                    ForEach(item.ticketHistory.sorted { $0.updatedAt > $1.updatedAt }) { entry in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(entry.ticketTitle)
+                                Spacer()
+                                Text(entry.status.rawValue)
+                                    .font(.caption)
+                                    .foregroundStyle(entry.status == .resolved ? .green : .orange)
+                            }
+                            let locationLine = [entry.campus, entry.room]
+                                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                                .filter { !$0.isEmpty }
+                                .joined(separator: " • ")
+                            if !locationLine.isEmpty {
+                                Text(locationLine)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text((entry.resolvedAt ?? entry.updatedAt).formatted(date: .abbreviated, time: .shortened))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+            }
+
             Section("Meta") {
                 detailRow("Created By", item.createdBy)
                 detailRow("Image URL", item.imageURL)
@@ -1664,6 +1728,1092 @@ private struct MacGearDetailView: View {
     private func currency(_ amount: Double?) -> String {
         guard let amount else { return "Not set" }
         return amount.formatted(.currency(code: Locale.current.currency?.identifier ?? "USD"))
+    }
+}
+
+private struct MacTicketsView: View {
+    @EnvironmentObject private var store: ProdConnectStore
+    @State private var selectedTicket: SupportTicket?
+    @State private var startsEditingSelectedTicket = false
+    @State private var isShowingAddTicket = false
+    @State private var title = ""
+    @State private var detail = ""
+    @State private var campus = ""
+    @State private var room = ""
+    @State private var status: TicketStatus = .new
+    @State private var hasDueDate = false
+    @State private var dueDate = Date()
+    @State private var linkedGearID = ""
+    @State private var assignedAgentID = ""
+    @State private var showAssetPicker = false
+    @State private var attachmentURL: String?
+    @State private var attachmentName: String?
+    @State private var attachmentKind: TicketAttachmentKind?
+    @State private var isUploadingAttachment = false
+    @State private var attachmentError: String?
+    @State private var locationFilter = ""
+    @State private var statusFilter = ""
+    @State private var agentFilter = ""
+
+    private let unassignedAgentFilter = "__UNASSIGNED__"
+
+    private var availableAgents: [UserProfile] {
+        store.teamMembers
+            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
+    private var availableGear: [GearItem] {
+        store.gear.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private var availableLocations: [String] {
+        Array(Set(store.visibleTickets.map { $0.campus.trimmingCharacters(in: .whitespacesAndNewlines) }))
+            .filter { !$0.isEmpty }
+            .sorted()
+    }
+
+    private var filteredTickets: [SupportTicket] {
+        store.visibleTickets.filter { ticket in
+            let locationMatches = locationFilter.isEmpty
+                || ticket.campus.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(locationFilter) == .orderedSame
+            let statusMatches = statusFilter.isEmpty
+                ? ticket.status != .resolved
+                : ticket.status.rawValue == statusFilter
+            let agentMatches: Bool
+            if agentFilter.isEmpty {
+                agentMatches = true
+            } else if agentFilter == unassignedAgentFilter {
+                agentMatches = (ticket.assignedAgentID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false)
+            } else {
+                agentMatches = ticket.assignedAgentID?.trimmingCharacters(in: .whitespacesAndNewlines) == agentFilter
+            }
+            return locationMatches && statusMatches && agentMatches
+        }
+    }
+
+    var body: some View {
+        if let selectedTicket {
+            VStack(alignment: .leading, spacing: 16) {
+                Button {
+                    startsEditingSelectedTicket = false
+                    self.selectedTicket = nil
+                } label: {
+                    Label("Back", systemImage: "chevron.left")
+                }
+                .buttonStyle(.bordered)
+
+                MacTicketDetailView(
+                    ticket: selectedTicket,
+                    startEditing: startsEditingSelectedTicket
+                )
+            }
+            .padding()
+            .background(Color.clear)
+            .navigationTitle("Ticket")
+        } else {
+            VStack(alignment: .leading, spacing: 16) {
+                if !store.canUseTickets {
+                    ContentUnavailableView(
+                        "Ticketing Locked",
+                        systemImage: "ticket",
+                        description: Text("Upgrade the team to Premium W/Ticketing to enable tickets.")
+                    )
+                } else {
+                    HStack {
+                        Spacer()
+                        if isShowingAddTicket {
+                            Button("Cancel") {
+                                isShowingAddTicket = false
+                                resetNewTicketForm()
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        Button {
+                            if isShowingAddTicket {
+                                isShowingAddTicket = false
+                                resetNewTicketForm()
+                            } else {
+                                resetNewTicketForm()
+                                isShowingAddTicket = true
+                            }
+                        } label: {
+                            Label("Add", systemImage: "plus")
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+
+                    HStack(spacing: 12) {
+                        ticketLocationMenu
+                        ticketStatusMenu
+                        ticketAgentMenu
+                    }
+
+                    List {
+                        if filteredTickets.isEmpty {
+                            Text("No matching tickets")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(filteredTickets) { ticket in
+                                ticketRow(ticket)
+                            }
+                        }
+                    }
+                    .scrollContentBackground(.hidden)
+
+                    if isShowingAddTicket {
+                        GroupBox("Add Ticket") {
+                            VStack(spacing: 10) {
+                                TextField("Title", text: $title)
+                                TextEditor(text: $detail)
+                                    .frame(minHeight: 120)
+                                Picker("Status", selection: $status) {
+                                    ForEach(TicketStatus.allCases, id: \.self) { option in
+                                        Text(option.rawValue).tag(option)
+                                    }
+                                }
+                                Toggle("Set Due Date", isOn: $hasDueDate)
+                                if hasDueDate {
+                                    DatePicker("Due", selection: $dueDate, displayedComponents: [.date, .hourAndMinute])
+                                }
+                                if store.locations.isEmpty {
+                                    TextField("Campus", text: $campus)
+                                } else {
+                                    Picker("Campus", selection: $campus) {
+                                        Text("Select campus").tag("")
+                                        ForEach(store.locations.sorted(), id: \.self) { option in
+                                            Text(option).tag(option)
+                                        }
+                                    }
+                                }
+                                if store.rooms.isEmpty {
+                                    TextField("Room", text: $room)
+                                } else {
+                                    Picker("Room", selection: $room) {
+                                        Text("Select room").tag("")
+                                        ForEach(store.rooms.sorted(), id: \.self) { option in
+                                            Text(option).tag(option)
+                                        }
+                                    }
+                                }
+                                Button {
+                                    showAssetPicker = true
+                                } label: {
+                                    HStack {
+                                        Text("Linked Asset")
+                                        Spacer()
+                                        Text(selectedAssetLabel)
+                                            .foregroundStyle(linkedGearID.isEmpty ? .secondary : .primary)
+                                        Image(systemName: "chevron.right")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                if !linkedGearID.isEmpty {
+                                    Button("Clear Asset Link") {
+                                        linkedGearID = ""
+                                    }
+                                }
+                                GroupBox("Attachment") {
+                                    VStack(alignment: .leading, spacing: 10) {
+                                        TextField(
+                                            "Attachment 1 Link (optional)",
+                                            text: Binding(
+                                                get: { attachmentURL ?? "" },
+                                                set: {
+                                                    attachmentURL = $0
+                                                    attachmentName = nil
+                                                    attachmentKind = nil
+                                                }
+                                            )
+                                        )
+                                        if !(attachmentURL?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) {
+                                            HStack(spacing: 10) {
+                                                Button("Clear Attachment") {
+                                                    attachmentURL = nil
+                                                    attachmentName = nil
+                                                    attachmentKind = nil
+                                                }
+                                            }
+                                        }
+                                        ticketAttachmentPreview(
+                                            urlString: attachmentURL,
+                                            attachmentName: attachmentName,
+                                            attachmentKind: attachmentKind
+                                        )
+                                    }
+                                }
+                                if store.canSeeAllTickets {
+                                    Picker("Agent", selection: $assignedAgentID) {
+                                        Text("Unassigned").tag("")
+                                        ForEach(availableAgents) { member in
+                                            Text(member.displayName).tag(member.id)
+                                        }
+                                    }
+                                }
+                                Button("Save Ticket") {
+                                    let activeTeamCode = [
+                                        store.teamCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+                                        store.user?.teamCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                                    ].first(where: { !$0.isEmpty }) ?? ""
+                                    let linkedGear = availableGear.first(where: { $0.id == linkedGearID })
+                                    let assignedAgent = availableAgents.first(where: { $0.id == assignedAgentID })
+                                    store.saveTicket(
+                                        SupportTicket(
+                                            title: title.trimmingCharacters(in: .whitespacesAndNewlines),
+                                            detail: detail.trimmingCharacters(in: .whitespacesAndNewlines),
+                                            teamCode: activeTeamCode,
+                                            campus: campus.trimmingCharacters(in: .whitespacesAndNewlines),
+                                            room: room.trimmingCharacters(in: .whitespacesAndNewlines),
+                                            status: status,
+                                            createdBy: store.user?.email ?? Auth.auth().currentUser?.email,
+                                            createdByUserID: store.user?.id,
+                                            assignedAgentID: assignedAgent?.id,
+                                            assignedAgentName: assignedAgent?.displayName,
+                                            linkedGearID: linkedGear?.id,
+                                            linkedGearName: linkedGear?.name,
+                                            dueDate: hasDueDate ? dueDate : nil,
+                                            lastUpdatedBy: currentUserLabel,
+                                            attachmentURL: attachmentURL,
+                                            attachmentName: attachmentName,
+                                            attachmentKind: attachmentKind,
+                                            activity: [
+                                                TicketActivityEntry(
+                                                    message: "Ticket created",
+                                                    createdAt: Date(),
+                                                    author: currentUserLabel
+                                                )
+                                            ]
+                                        )
+                                    )
+                                    isShowingAddTicket = false
+                                    resetNewTicketForm()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding()
+            .background(Color.clear)
+            .navigationTitle("Tickets")
+            .sheet(isPresented: $showAssetPicker) {
+                MacAssetPickerView(
+                    selectedAssetID: linkedGearID.isEmpty ? nil : linkedGearID,
+                    onSelect: { item in
+                        linkedGearID = item.id
+                    }
+                )
+                .environmentObject(store)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func ticketRow(_ ticket: SupportTicket) -> some View {
+        Button {
+            startsEditingSelectedTicket = false
+            selectedTicket = ticket
+        } label: {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text(ticket.title)
+                        .font(.headline)
+                    Spacer()
+                    Text(ticket.status.rawValue)
+                        .font(.caption2)
+                        .foregroundStyle(ticket.status == .resolved ? .green : .orange)
+                }
+                let locationLine = [ticket.campus, ticket.room]
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                    .joined(separator: " • ")
+                if !locationLine.isEmpty {
+                    Text(locationLine)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let dueDate = ticket.dueDate {
+                    Text("Due \(dueDate.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption2)
+                        .foregroundStyle(dueDate < Date() && ticket.status != .resolved ? .red : .secondary)
+                }
+                HStack {
+                    if let linkedGearName = ticket.linkedGearName?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !linkedGearName.isEmpty {
+                        Text(linkedGearName)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Text(ticket.updatedAt.formatted(date: .abbreviated, time: .shortened))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button("Edit") {
+                startsEditingSelectedTicket = true
+                selectedTicket = ticket
+            }
+        }
+    }
+
+    private func resetNewTicketForm() {
+        title = ""
+        detail = ""
+        campus = store.user?.assignedCampus.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        room = ""
+        status = .new
+        hasDueDate = false
+        dueDate = Date()
+        linkedGearID = ""
+        assignedAgentID = ""
+        attachmentURL = nil
+        attachmentName = nil
+        attachmentKind = nil
+        isUploadingAttachment = false
+        attachmentError = nil
+    }
+
+    private var currentUserLabel: String {
+        let name = store.user?.displayName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !name.isEmpty { return name }
+        return store.user?.email ?? Auth.auth().currentUser?.email ?? "Unknown User"
+    }
+
+    private var selectedAssetLabel: String {
+        availableGear.first(where: { $0.id == linkedGearID })?.name ?? "Select Asset"
+    }
+
+    @ViewBuilder
+    private func ticketAttachmentPreview(
+        urlString: String?,
+        attachmentName: String?,
+        attachmentKind: TicketAttachmentKind?
+    ) -> some View {
+        let rawURL = urlString?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if rawURL.isEmpty {
+            Text("No attachment")
+                .foregroundStyle(.secondary)
+        } else if let url = URL(string: rawURL) {
+            Link(destination: url) {
+                Label(
+                    attachmentName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                        ? (attachmentName ?? "Open Attachment")
+                        : "Open Attachment",
+                    systemImage: "paperclip"
+                )
+            }
+        } else {
+            Text("Invalid attachment link")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @MainActor
+    private func pickTicketAttachment(allowedTypes: [UTType], preferredKind: TicketAttachmentKind) {
+        attachmentError = nil
+
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = allowedTypes
+
+        let handleSelection: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else { return }
+            uploadTicketAttachment(from: url, kind: preferredKind)
+        }
+
+        if let keyWindow = NSApp.keyWindow {
+            panel.beginSheetModal(for: keyWindow, completionHandler: handleSelection)
+        } else {
+            handleSelection(panel.runModal())
+        }
+    }
+
+    private func uploadTicketAttachment(from localURL: URL, kind: TicketAttachmentKind) {
+        attachmentError = nil
+        isUploadingAttachment = true
+
+        let safeName = localURL.lastPathComponent.replacingOccurrences(of: " ", with: "_")
+        let path = "ticketAttachments/\(UUID().uuidString)/\(UUID().uuidString)-\(safeName)"
+        let storageRef = Storage.storage().reference().child(path)
+        let metadata = StorageMetadata()
+        metadata.contentType = contentType(for: localURL, kind: kind)
+        let didAccess = localURL.startAccessingSecurityScopedResource()
+
+        storageRef.putFile(from: localURL, metadata: metadata) { _, error in
+            if didAccess {
+                localURL.stopAccessingSecurityScopedResource()
+            }
+
+            if let error {
+                DispatchQueue.main.async {
+                    isUploadingAttachment = false
+                    attachmentError = "Attachment upload failed: \(error.localizedDescription)"
+                }
+                return
+            }
+
+            storageRef.downloadURL { url, downloadError in
+                DispatchQueue.main.async {
+                    isUploadingAttachment = false
+                    if let downloadError {
+                        attachmentError = "Attachment upload failed: \(downloadError.localizedDescription)"
+                        return
+                    }
+                    attachmentURL = url?.absoluteString
+                    attachmentName = safeName
+                    attachmentKind = kind
+                }
+            }
+        }
+    }
+
+    private func contentType(for url: URL, kind: TicketAttachmentKind) -> String {
+        if let type = UTType(filenameExtension: url.pathExtension), let mime = type.preferredMIMEType {
+            return mime
+        }
+        switch kind {
+        case .image:
+            return "image/jpeg"
+        case .video:
+            return "video/quicktime"
+        }
+    }
+
+    private var ticketLocationMenu: some View {
+        Menu {
+            Button("Clear") { locationFilter = "" }
+            Divider()
+            ForEach(availableLocations, id: \.self) { option in
+                Button(option) { locationFilter = option }
+            }
+        } label: {
+            filterChip(
+                title: locationFilter.isEmpty ? "Location" : locationFilter,
+                icon: "mappin.circle",
+                isActive: !locationFilter.isEmpty
+            )
+        }
+    }
+
+    private var ticketStatusMenu: some View {
+        Menu {
+            Button("Active") { statusFilter = "" }
+            Divider()
+            ForEach(TicketStatus.allCases, id: \.self) { option in
+                Button(option.rawValue) { statusFilter = option.rawValue }
+            }
+        } label: {
+            filterChip(
+                title: statusFilter.isEmpty ? "Active" : statusFilter,
+                icon: "checkmark.circle",
+                isActive: !statusFilter.isEmpty
+            )
+        }
+    }
+
+    private var ticketAgentMenu: some View {
+        Menu {
+            Button("Clear") { agentFilter = "" }
+            Divider()
+            Button("Unassigned") { agentFilter = unassignedAgentFilter }
+            if !availableAgents.isEmpty {
+                Divider()
+                ForEach(availableAgents) { member in
+                    Button(member.displayName) { agentFilter = member.id }
+                }
+            }
+        } label: {
+            filterChip(
+                title: agentFilterTitle,
+                icon: "person.crop.circle",
+                isActive: !agentFilter.isEmpty
+            )
+        }
+    }
+
+    private var agentFilterTitle: String {
+        if agentFilter.isEmpty { return "Agent" }
+        if agentFilter == unassignedAgentFilter { return "Unassigned" }
+        return availableAgents.first(where: { $0.id == agentFilter })?.displayName ?? "Agent"
+    }
+
+    @ViewBuilder
+    private func filterChip(title: String, icon: String, isActive: Bool) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+            Text(title).lineLimit(1)
+        }
+        .font(.caption)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(isActive ? Color.blue : Color.gray.opacity(0.3))
+        .foregroundColor(.white)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+private struct MacTicketDetailView: View {
+    @EnvironmentObject private var store: ProdConnectStore
+    @State private var ticket: SupportTicket
+    @State private var isEditing = false
+    @State private var originalTicket: SupportTicket?
+    @State private var showAssetPicker = false
+    @State private var isUploadingAttachment = false
+    @State private var attachmentError: String?
+
+    init(ticket: SupportTicket, startEditing: Bool = false) {
+        _ticket = State(initialValue: ticket)
+        _isEditing = State(initialValue: startEditing)
+        _originalTicket = State(initialValue: startEditing ? ticket : nil)
+    }
+
+    private var availableAgents: [UserProfile] {
+        store.teamMembers
+            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
+    private var availableGear: [GearItem] {
+        store.gear.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Spacer()
+                if isEditing {
+                    Button("Cancel") {
+                        if let originalTicket {
+                            ticket = originalTicket
+                        }
+                        originalTicket = nil
+                        isEditing = false
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button("Save") {
+                        ticket.lastUpdatedBy = currentUserLabel
+                        store.saveTicket(ticket)
+                        originalTicket = nil
+                        isEditing = false
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(ticket.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                } else {
+                    Button("Edit") {
+                        originalTicket = ticket
+                        isEditing = true
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+
+            Form {
+                Section("Overview") {
+                    if isEditing {
+                        TextField("Title", text: $ticket.title)
+                        TextEditor(text: $ticket.detail)
+                            .frame(minHeight: 120)
+                    } else {
+                        Text(ticket.title)
+                        Text(ticket.detail.isEmpty ? "No details" : ticket.detail)
+                            .foregroundStyle(ticket.detail.isEmpty ? .secondary : .primary)
+                    }
+                }
+
+                Section("Status") {
+                    Picker(
+                        "Status",
+                        selection: Binding(
+                            get: { ticket.status },
+                            set: { newValue in
+                                ticket.status = newValue
+                                if !isEditing {
+                                    ticket.lastUpdatedBy = currentUserLabel
+                                    store.saveTicket(ticket)
+                                }
+                            }
+                        )
+                    ) {
+                        ForEach(TicketStatus.allCases, id: \.self) { option in
+                            Text(option.rawValue).tag(option)
+                        }
+                    }
+                }
+
+                Section("Due Date") {
+                    if isEditing {
+                        Toggle("Set Due Date", isOn: hasDueDateBinding)
+                        if ticket.dueDate != nil {
+                            DatePicker("Due", selection: dueDateBinding, displayedComponents: [.date, .hourAndMinute])
+                        }
+                    } else if let dueDate = ticket.dueDate {
+                        Text(dueDate.formatted(date: .abbreviated, time: .shortened))
+                            .foregroundStyle(dueDate < Date() && ticket.status != .resolved ? .red : .primary)
+                    } else {
+                        Text("Not set")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Section("Location") {
+                    if isEditing {
+                        if store.locations.isEmpty {
+                            TextField("Campus", text: $ticket.campus)
+                        } else {
+                            Picker("Campus", selection: $ticket.campus) {
+                                Text("Select campus").tag("")
+                                ForEach(store.locations.sorted(), id: \.self) { option in
+                                    Text(option).tag(option)
+                                }
+                            }
+                        }
+                        if store.rooms.isEmpty {
+                            TextField("Room", text: $ticket.room)
+                        } else {
+                            Picker("Room", selection: $ticket.room) {
+                                Text("Select room").tag("")
+                                ForEach(store.rooms.sorted(), id: \.self) { option in
+                                    Text(option).tag(option)
+                                }
+                            }
+                        }
+                    } else {
+                        let locationLine = [ticket.campus, ticket.room]
+                            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                            .filter { !$0.isEmpty }
+                            .joined(separator: " • ")
+                        Text(locationLine.isEmpty ? "Not set" : locationLine)
+                            .foregroundStyle(locationLine.isEmpty ? .secondary : .primary)
+                    }
+                }
+
+                Section("Linked Asset") {
+                    if isEditing {
+                        Button {
+                            showAssetPicker = true
+                        } label: {
+                            HStack {
+                                Text("Asset")
+                                Spacer()
+                                Text(selectedAssetLabel)
+                                    .foregroundStyle(selectedAssetName == nil ? .secondary : .primary)
+                                Image(systemName: "chevron.right")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        if ticket.linkedGearID != nil || ticket.linkedGearName != nil {
+                            Button("Clear Asset Link") {
+                                ticket.linkedGearID = nil
+                                ticket.linkedGearName = nil
+                            }
+                        }
+                    } else {
+                        Text((ticket.linkedGearName ?? "").isEmpty ? "None" : (ticket.linkedGearName ?? ""))
+                            .foregroundStyle((ticket.linkedGearName ?? "").isEmpty ? .secondary : .primary)
+                    }
+                }
+
+                Section("Attachment") {
+                    if isEditing {
+                        TextField(
+                            "Attachment 1 Link (optional)",
+                            text: Binding(
+                                get: { ticket.attachmentURL ?? "" },
+                                set: {
+                                    ticket.attachmentURL = $0
+                                    ticket.attachmentName = nil
+                                    ticket.attachmentKind = nil
+                                }
+                            )
+                        )
+                        if !(ticket.attachmentURL?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) {
+                            HStack(spacing: 10) {
+                                Button("Clear Attachment") {
+                                    ticket.attachmentURL = nil
+                                    ticket.attachmentName = nil
+                                    ticket.attachmentKind = nil
+                                }
+                            }
+                        }
+                    }
+
+                    ticketAttachmentPreview
+                }
+
+                Section("Assignment") {
+                    if isEditing && store.canSeeAllTickets {
+                        Picker(
+                            "Agent",
+                            selection: Binding(
+                                get: { ticket.assignedAgentID ?? "" },
+                                set: { newValue in
+                                    let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    if trimmed.isEmpty {
+                                        ticket.assignedAgentID = nil
+                                        ticket.assignedAgentName = nil
+                                    } else if let member = availableAgents.first(where: { $0.id == trimmed }) {
+                                        ticket.assignedAgentID = member.id
+                                        ticket.assignedAgentName = member.displayName
+                                    }
+                                }
+                            )
+                        ) {
+                            Text("Unassigned").tag("")
+                            ForEach(availableAgents) { member in
+                                Text(member.displayName).tag(member.id)
+                            }
+                        }
+                    } else {
+                        Text((ticket.assignedAgentName ?? "").isEmpty ? "Unassigned" : (ticket.assignedAgentName ?? ""))
+                            .foregroundStyle((ticket.assignedAgentName ?? "").isEmpty ? .secondary : .primary)
+                    }
+                }
+
+                Section("Activity") {
+                    if ticket.activity.isEmpty {
+                        Text("No updates yet")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(ticket.activity.sorted { $0.createdAt > $1.createdAt }) { entry in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(entry.message)
+                                HStack {
+                                    if let author = entry.author?.trimmingCharacters(in: .whitespacesAndNewlines),
+                                       !author.isEmpty {
+                                        Text(author)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Text(entry.createdAt.formatted(date: .abbreviated, time: .shortened))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
+            .background(Color.clear)
+        }
+        .navigationTitle("Ticket")
+        .sheet(isPresented: $showAssetPicker) {
+            MacAssetPickerView(
+                selectedAssetID: ticket.linkedGearID,
+                onSelect: { item in
+                    ticket.linkedGearID = item.id
+                    ticket.linkedGearName = item.name
+                }
+            )
+            .environmentObject(store)
+        }
+    }
+
+    private var currentUserLabel: String {
+        let name = store.user?.displayName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !name.isEmpty { return name }
+        return store.user?.email ?? Auth.auth().currentUser?.email ?? "Unknown User"
+    }
+
+    private var selectedAssetName: String? {
+        let currentName = ticket.linkedGearName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !currentName.isEmpty {
+            return currentName
+        }
+        guard let linkedGearID = ticket.linkedGearID else { return nil }
+        return availableGear.first(where: { $0.id == linkedGearID })?.name
+    }
+
+    private var selectedAssetLabel: String {
+        selectedAssetName ?? "Select Asset"
+    }
+
+    private var hasDueDateBinding: Binding<Bool> {
+        Binding(
+            get: { ticket.dueDate != nil },
+            set: { isEnabled in
+                ticket.dueDate = isEnabled ? (ticket.dueDate ?? Date()) : nil
+            }
+        )
+    }
+
+    private var dueDateBinding: Binding<Date> {
+        Binding(
+            get: { ticket.dueDate ?? Date() },
+            set: { ticket.dueDate = $0 }
+        )
+    }
+
+    @ViewBuilder
+    private var ticketAttachmentPreview: some View {
+        let rawURL = ticket.attachmentURL?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if rawURL.isEmpty {
+            Text("No attachment")
+                .foregroundStyle(.secondary)
+        } else if let url = URL(string: rawURL) {
+            Link(destination: url) {
+                Label(
+                    ticket.attachmentName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                        ? (ticket.attachmentName ?? "Open Attachment")
+                        : "Open Attachment",
+                    systemImage: "paperclip"
+                )
+            }
+        } else {
+            Text("Invalid attachment link")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @MainActor
+    private func pickTicketAttachment(allowedTypes: [UTType], preferredKind: TicketAttachmentKind) {
+        attachmentError = nil
+
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = allowedTypes
+
+        let handleSelection: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else { return }
+            uploadTicketAttachment(from: url, kind: preferredKind)
+        }
+
+        if let keyWindow = NSApp.keyWindow {
+            panel.beginSheetModal(for: keyWindow, completionHandler: handleSelection)
+        } else {
+            handleSelection(panel.runModal())
+        }
+    }
+
+    private func uploadTicketAttachment(from localURL: URL, kind: TicketAttachmentKind) {
+        attachmentError = nil
+        isUploadingAttachment = true
+
+        let safeName = localURL.lastPathComponent.replacingOccurrences(of: " ", with: "_")
+        let path = "ticketAttachments/\(ticket.id)/\(UUID().uuidString)-\(safeName)"
+        let storageRef = Storage.storage().reference().child(path)
+        let metadata = StorageMetadata()
+        metadata.contentType = contentType(for: localURL, kind: kind)
+        let didAccess = localURL.startAccessingSecurityScopedResource()
+
+        storageRef.putFile(from: localURL, metadata: metadata) { _, error in
+            if didAccess {
+                localURL.stopAccessingSecurityScopedResource()
+            }
+
+            if let error {
+                DispatchQueue.main.async {
+                    isUploadingAttachment = false
+                    attachmentError = "Attachment upload failed: \(error.localizedDescription)"
+                }
+                return
+            }
+
+            storageRef.downloadURL { url, downloadError in
+                DispatchQueue.main.async {
+                    isUploadingAttachment = false
+                    if let downloadError {
+                        attachmentError = "Attachment upload failed: \(downloadError.localizedDescription)"
+                        return
+                    }
+                    ticket.attachmentURL = url?.absoluteString
+                    ticket.attachmentName = safeName
+                    ticket.attachmentKind = kind
+                }
+            }
+        }
+    }
+
+    private func contentType(for url: URL, kind: TicketAttachmentKind) -> String {
+        if let type = UTType(filenameExtension: url.pathExtension), let mime = type.preferredMIMEType {
+            return mime
+        }
+        switch kind {
+        case .image:
+            return "image/jpeg"
+        case .video:
+            return "video/quicktime"
+        }
+    }
+}
+
+private struct MacAssetPickerView: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var store: ProdConnectStore
+    @State private var searchText = ""
+    @State private var selectedCategory: String?
+    @State private var selectedStatus: GearItem.GearStatus?
+    @State private var selectedLocation: String?
+
+    let selectedAssetID: String?
+    let onSelect: (GearItem) -> Void
+
+    private var availableCategories: [String] {
+        Array(Set(store.gear.map(\.category))).filter { !$0.isEmpty }.sorted()
+    }
+
+    private var availableLocations: [String] {
+        Array(Set(store.gear.map(\.location))).filter { !$0.isEmpty }.sorted()
+    }
+
+    private var filteredAssets: [GearItem] {
+        var result = store.gear
+        if !searchText.isEmpty {
+            result = result.filter {
+                $0.name.localizedCaseInsensitiveContains(searchText) ||
+                $0.category.localizedCaseInsensitiveContains(searchText) ||
+                $0.location.localizedCaseInsensitiveContains(searchText)
+            }
+        }
+        if let selectedCategory {
+            result = result.filter { $0.category == selectedCategory }
+        }
+        if let selectedStatus {
+            result = result.filter { $0.status == selectedStatus }
+        }
+        if let selectedLocation {
+            result = result.filter { $0.location == selectedLocation }
+        }
+        return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("Select Asset")
+                    .font(.headline)
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .buttonStyle(.bordered)
+            }
+
+            TextField("Search assets...", text: $searchText)
+                .textFieldStyle(.roundedBorder)
+
+            HStack(spacing: 12) {
+                categoryMenu
+                if !availableLocations.isEmpty {
+                    locationMenu
+                }
+                statusMenu
+            }
+
+            List {
+                if filteredAssets.isEmpty {
+                    Text("No assets found")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(filteredAssets) { item in
+                        Button {
+                            onSelect(item)
+                            dismiss()
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(item.name)
+                                        .font(.headline)
+                                    Text(item.category)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    if !item.location.isEmpty {
+                                        Text(item.location)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                Spacer()
+                                if item.id == selectedAssetID {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundStyle(.blue)
+                                }
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .scrollContentBackground(.hidden)
+        }
+        .padding()
+        .frame(minWidth: 520, minHeight: 520)
+    }
+
+    private var categoryMenu: some View {
+        Menu {
+            Button("Clear") { selectedCategory = nil }
+            Divider()
+            ForEach(availableCategories, id: \.self) { option in
+                Button(option) { selectedCategory = option }
+            }
+        } label: {
+            filterChip(
+                title: selectedCategory ?? "Category",
+                icon: "line.3.horizontal.decrease.circle",
+                isActive: selectedCategory != nil
+            )
+        }
+    }
+
+    private var locationMenu: some View {
+        Menu {
+            Button("Clear") { selectedLocation = nil }
+            Divider()
+            ForEach(availableLocations, id: \.self) { option in
+                Button(option) { selectedLocation = option }
+            }
+        } label: {
+            filterChip(
+                title: selectedLocation ?? "Location",
+                icon: "mappin.circle",
+                isActive: selectedLocation != nil
+            )
+        }
+    }
+
+    private var statusMenu: some View {
+        Menu {
+            Button("Clear") { selectedStatus = nil }
+            Divider()
+            ForEach(GearItem.GearStatus.allCases, id: \.self) { option in
+                Button(option.rawValue) { selectedStatus = option }
+            }
+        } label: {
+            filterChip(
+                title: selectedStatus?.rawValue ?? "Status",
+                icon: "checkmark.circle",
+                isActive: selectedStatus != nil
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func filterChip(title: String, icon: String, isActive: Bool) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+            Text(title).lineLimit(1)
+        }
+        .font(.caption)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(isActive ? Color.blue : Color.gray.opacity(0.3))
+        .foregroundColor(.white)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
@@ -1874,6 +3024,7 @@ private struct MacChecklistDetailView: View {
     @State private var isEditing = false
     @State private var originalChecklist: ChecklistTemplate?
     @State private var newItemText = ""
+    @State private var newItemNotes = ""
 
     init(checklist: ChecklistTemplate, startEditing: Bool = false) {
         _checklist = State(initialValue: checklist)
@@ -1893,6 +3044,7 @@ private struct MacChecklistDetailView: View {
                         originalChecklist = nil
                         isEditing = false
                         newItemText = ""
+                        newItemNotes = ""
                     }
                     .buttonStyle(.bordered)
 
@@ -1929,28 +3081,39 @@ private struct MacChecklistDetailView: View {
                                 .foregroundStyle(.secondary)
                         } else {
                             ForEach(Array(checklist.items.indices), id: \.self) { index in
-                                HStack(spacing: 10) {
-                                    TextField("Item", text: $checklist.items[index].text)
-                                    Button(role: .destructive) {
-                                        checklist.items.remove(at: index)
-                                    } label: {
-                                        Image(systemName: "trash")
+                                VStack(alignment: .leading, spacing: 8) {
+                                    HStack(spacing: 10) {
+                                        TextField("Item", text: $checklist.items[index].text)
+                                        Button(role: .destructive) {
+                                            checklist.items.remove(at: index)
+                                        } label: {
+                                            Image(systemName: "trash")
+                                        }
+                                        .buttonStyle(.borderless)
                                     }
-                                    .buttonStyle(.borderless)
+                                    TextField("Notes (optional)", text: $checklist.items[index].notes, axis: .vertical)
+                                        .lineLimit(2...4)
                                 }
                             }
                         }
 
-                        HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 10) {
                             TextField("New Item", text: $newItemText)
-                            Button("Add Item") {
-                                let trimmed = newItemText.trimmingCharacters(in: .whitespacesAndNewlines)
-                                guard !trimmed.isEmpty else { return }
-                                checklist.items.append(ChecklistItem(text: trimmed))
-                                newItemText = ""
+                            TextField("Notes (optional)", text: $newItemNotes, axis: .vertical)
+                                .lineLimit(2...4)
+                            HStack {
+                                Spacer()
+                                Button("Add Item") {
+                                    let trimmed = newItemText.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !trimmed.isEmpty else { return }
+                                    let trimmedNotes = newItemNotes.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    checklist.items.append(ChecklistItem(text: trimmed, notes: trimmedNotes))
+                                    newItemText = ""
+                                    newItemNotes = ""
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(newItemText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                             }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(newItemText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
                     }
                 } else {
@@ -1978,6 +3141,12 @@ private struct MacChecklistDetailView: View {
                                         VStack(alignment: .leading, spacing: 4) {
                                             Text(item.text)
                                                 .foregroundStyle(.primary)
+                                            let trimmedNotes = item.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+                                            if !trimmedNotes.isEmpty {
+                                                Text(trimmedNotes)
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                            }
                                             if item.isDone, let completedAt = item.completedAt {
                                                 if let completedBy = item.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines),
                                                    !completedBy.isEmpty {
@@ -2058,12 +3227,14 @@ private struct MacChecklistDetailView: View {
             guard !trimmed.isEmpty else { return nil }
             var updatedItem = item
             updatedItem.text = trimmed
+            updatedItem.notes = updatedItem.notes.trimmingCharacters(in: .whitespacesAndNewlines)
             return updatedItem
         }
         updateChecklistCompletionMetadata()
         store.saveChecklist(checklist)
         originalChecklist = nil
         newItemText = ""
+        newItemNotes = ""
         isEditing = false
     }
 
@@ -2210,7 +3381,7 @@ private struct MacCustomizeView: View {
 
         var title: String {
             switch self {
-            case .deleteAllGear: return "Delete All Gear?"
+            case .deleteAllGear: return "Delete All Assets?"
             case .deleteAudioPatchsheet: return "Delete Audio Patchsheet?"
             case .deleteVideoPatchsheet: return "Delete Video Patchsheet?"
             case .deleteLightingPatchsheet: return "Delete Lighting Patchsheet?"
@@ -2220,7 +3391,7 @@ private struct MacCustomizeView: View {
         var message: String {
             switch self {
             case .deleteAllGear:
-                return "Are you sure you want to delete all gear items? This cannot be undone."
+                return "Are you sure you want to delete all asset items? This cannot be undone."
             case .deleteAudioPatchsheet:
                 return "Are you sure you want to delete all audio patches? This cannot be undone."
             case .deleteVideoPatchsheet:
@@ -2249,7 +3420,7 @@ private struct MacCustomizeView: View {
                             Button {
                                 syncGearLocationsToCampuses()
                             } label: {
-                                Label("Copy Locations from Gear", systemImage: "arrow.triangle.2.circlepath")
+                                Label("Copy Locations from Assets", systemImage: "arrow.triangle.2.circlepath")
                             }
                             .buttonStyle(.bordered)
 
@@ -2309,7 +3480,7 @@ private struct MacCustomizeView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
 
-                        importRow(title: "Gear sheet link", text: $gearSheetLink) {
+                        importRow(title: "Assets sheet link", text: $gearSheetLink) {
                             importGearData()
                         }
                         importRow(title: "Audio patchsheet link", text: $audioPatchSheetLink) {
@@ -2326,7 +3497,7 @@ private struct MacCustomizeView: View {
 
                 GroupBox("Reset") {
                     VStack(alignment: .leading, spacing: 10) {
-                        resetButton("Delete All Gear", action: .deleteAllGear)
+                        resetButton("Delete All Assets", action: .deleteAllGear)
                         resetButton("Delete Audio Patchsheet", action: .deleteAudioPatchsheet)
                         resetButton("Delete Video Patchsheet", action: .deleteVideoPatchsheet)
                         resetButton("Delete Lighting Patchsheet", action: .deleteLightingPatchsheet)
@@ -2380,7 +3551,7 @@ private struct MacCustomizeView: View {
         switch action {
         case .deleteAllGear:
             store.deleteAllGear()
-            resultMessage = "All gear has been deleted."
+            resultMessage = "All assets have been deleted."
         case .deleteAudioPatchsheet:
             store.deletePatchesByCategory("Audio")
             resultMessage = "Audio patchsheet has been deleted."
@@ -2409,7 +3580,7 @@ private struct MacCustomizeView: View {
             }
         }
 
-        resultMessage = added == 0 ? "No new locations to copy from Gear." : "Added \(added) location(s) from Gear."
+        resultMessage = added == 0 ? "No new locations to copy from Assets." : "Added \(added) location(s) from Assets."
     }
 
     private func importGearData() {
@@ -2438,7 +3609,7 @@ private struct MacCustomizeView: View {
                 store.replaceAllGear(gearItems)
                 gearSheetLink = ""
                 isImporting = false
-                resultMessage = "Imported \(gearItems.count) gear items."
+                resultMessage = "Imported \(gearItems.count) asset items."
             }
         }.resume()
     }
@@ -2718,7 +3889,7 @@ private struct MacUserDetailView: View {
                     .onChange(of: user.canEditTraining) { value in
                         updatePermission(key: "canEditTraining", value: value)
                     }
-                Toggle("Can edit gear", isOn: $user.canEditGear)
+                Toggle("Can edit assets", isOn: $user.canEditGear)
                     .onChange(of: user.canEditGear) { value in
                         updatePermission(key: "canEditGear", value: value)
                     }
@@ -2729,6 +3900,10 @@ private struct MacUserDetailView: View {
                 Toggle("Can edit checklists", isOn: $user.canEditChecklists)
                     .onChange(of: user.canEditChecklists) { value in
                         updatePermission(key: "canEditChecklists", value: value)
+                    }
+                Toggle("Ticket Agent", isOn: $user.isTicketAgent)
+                    .onChange(of: user.isTicketAgent) { value in
+                        updatePermission(key: "isTicketAgent", value: value)
                     }
             }
 
@@ -2746,7 +3921,7 @@ private struct MacUserDetailView: View {
                         .onChange(of: user.canSeeTraining) { value in
                             updatePermission(key: "canSeeTraining", value: value)
                         }
-                    Toggle("Gear", isOn: $user.canSeeGear)
+                    Toggle("Assets", isOn: $user.canSeeGear)
                         .onChange(of: user.canSeeGear) { value in
                             updatePermission(key: "canSeeGear", value: value)
                         }
@@ -2757,6 +3932,10 @@ private struct MacUserDetailView: View {
                     Toggle("Checklists", isOn: $user.canSeeChecklists)
                         .onChange(of: user.canSeeChecklists) { value in
                             updatePermission(key: "canSeeChecklists", value: value)
+                        }
+                    Toggle("Tickets", isOn: $user.canSeeTickets)
+                        .onChange(of: user.canSeeTickets) { value in
+                            updatePermission(key: "canSeeTickets", value: value)
                         }
                 }
             }
@@ -2905,6 +4084,8 @@ private struct MacUserDetailView: View {
                     self.user.canEditIdeas = value
                 case "canEditChecklists":
                     self.user.canEditChecklists = value
+                case "isTicketAgent":
+                    self.user.isTicketAgent = value
                 case "canSeeChat":
                     self.user.canSeeChat = value
                 case "canSeePatchsheet":
@@ -2917,6 +4098,8 @@ private struct MacUserDetailView: View {
                     self.user.canSeeIdeas = value
                 case "canSeeChecklists":
                     self.user.canSeeChecklists = value
+                case "canSeeTickets":
+                    self.user.canSeeTickets = value
                 default:
                     break
                 }
@@ -2957,7 +4140,7 @@ private struct MacAccountView: View {
     }
 
     private var normalizedSubscriptionTier: String {
-        store.user?.subscriptionTier.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "free"
+        canonicalSubscriptionTier(store.user?.subscriptionTier)
     }
 
     private var canManageSubscription: Bool {
@@ -2965,11 +4148,26 @@ private struct MacAccountView: View {
         if normalizedSubscriptionTier == "free" {
             return true
         }
-        return normalizedSubscriptionTier == "basic" && user.isAdmin
+        return (user.isAdmin || user.isOwner) && normalizedSubscriptionTier != "premium_ticketing"
     }
 
     private var subscriptionButtonTitle: String {
         normalizedSubscriptionTier == "free" ? "Subscribe" : "Upgrade Subscription"
+    }
+
+    private var subscriptionTierLabel: String {
+        switch normalizedSubscriptionTier {
+        case "premium_ticketing", "premium w/ticketing", "premium with ticketing":
+            return "Premium W/Ticketing"
+        case "premium":
+            return "Premium"
+        case "basic_ticketing", "basic w/ticketing", "basic with ticketing":
+            return "Basic W/Ticketing"
+        case "basic":
+            return "Basic"
+        default:
+            return "Free"
+        }
     }
 
     var body: some View {
@@ -2978,7 +4176,7 @@ private struct MacAccountView: View {
                 LabeledContent("Name", value: user.displayName)
                 LabeledContent("Email", value: user.email)
                 LabeledContent("Team Code", value: user.teamCode ?? "None")
-                LabeledContent("Subscription", value: user.subscriptionTier.capitalized)
+                LabeledContent("Subscription", value: subscriptionTierLabel)
                 LabeledContent("Role", value: roleLabel)
                 if !appVersionText.isEmpty {
                     LabeledContent("App Version", value: appVersionText)
@@ -3043,8 +4241,14 @@ private struct MacAccountView: View {
                 onPurchaseBasic: {
                     await purchaseSubscription(productID: "Basic3", targetTier: "basic")
                 },
+                onPurchaseBasicTicketing: {
+                    await purchaseSubscription(productID: "Basic_Ticketing", targetTier: "basic_ticketing")
+                },
                 onPurchasePremium: {
                     await purchaseSubscription(productID: "Premium2", targetTier: "premium")
+                },
+                onPurchasePremiumTicketing: {
+                    await purchaseSubscription(productID: "Premium_Ticketing", targetTier: "premium_ticketing")
                 },
                 onRestorePurchases: {
                     await restorePurchases()
@@ -3142,12 +4346,24 @@ private struct MacAccountView: View {
             var restoredTier: String?
             for try await verification in Transaction.currentEntitlements {
                 let transaction = try checkVerified(verification)
-                if transaction.productID == "Premium2" {
-                    restoredTier = "premium"
+                switch transaction.productID {
+                case "Premium_Ticketing":
+                    restoredTier = "premium_ticketing"
                     break
-                }
-                if transaction.productID == "Basic3" {
-                    restoredTier = "basic"
+                case "Premium2":
+                    if restoredTier != "premium_ticketing" {
+                        restoredTier = "premium"
+                    }
+                case "Basic_Ticketing":
+                    if restoredTier != "premium_ticketing", restoredTier != "premium" {
+                        restoredTier = "basic_ticketing"
+                    }
+                case "Basic3":
+                    if restoredTier == nil {
+                        restoredTier = "basic"
+                    }
+                default:
+                    break
                 }
             }
 
@@ -3167,7 +4383,7 @@ private struct MacAccountView: View {
             throw MacSubscriptionError.userNotLoaded
         }
 
-        let resolvedTier = targetTier.lowercased() == "premium" ? "premium" : "basic"
+        let resolvedTier = canonicalSubscriptionTier(targetTier)
         user.isAdmin = true
         user.subscriptionTier = resolvedTier
         user.canEditPatchsheet = true
@@ -3207,6 +4423,21 @@ private struct MacAccountView: View {
         store.listenToTeamMembers()
     }
 
+    private func canonicalSubscriptionTier(_ rawValue: String?) -> String {
+        switch rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "free" {
+        case "premium_ticketing", "premium w/ticketing", "premium with ticketing":
+            return "premium_ticketing"
+        case "basic_ticketing", "basic w/ticketing", "basic with ticketing":
+            return "basic_ticketing"
+        case "premium":
+            return "premium"
+        case "basic":
+            return "basic"
+        default:
+            return "free"
+        }
+    }
+
     private func checkVerified<T>(_ result: VerificationResult<T>) throws -> T {
         switch result {
         case .unverified(_, _):
@@ -3220,13 +4451,17 @@ private struct MacAccountView: View {
 private struct MacSubscriptionOptionsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var basicProduct: Product?
+    @State private var basicTicketingProduct: Product?
     @State private var premiumProduct: Product?
+    @State private var premiumTicketingProduct: Product?
     @State private var isLoadingProducts = false
     @State private var isPurchasing = false
 
     let currentTier: String
     let onPurchaseBasic: () async -> Void
+    let onPurchaseBasicTicketing: () async -> Void
     let onPurchasePremium: () async -> Void
+    let onPurchasePremiumTicketing: () async -> Void
     let onRestorePurchases: () async -> Void
 
     var body: some View {
@@ -3241,24 +4476,46 @@ private struct MacSubscriptionOptionsView: View {
 
                     subscriptionCard(
                         title: basicProduct?.displayName ?? "Basic",
-                        subtitle: "Team management, user permissions, and full access to gear, training, checklists, and ideas.",
+                        subtitle: "$99.99. Includes chat and training, but hides Locations, Rooms, and Tickets.",
                         price: priceText(for: basicProduct),
-                        buttonTitle: currentTier == "free" ? "Choose Basic" : "Current or Included",
+                        buttonTitle: currentTier == "basic" ? "Current Plan" : "Choose Basic",
                         isPrimary: true,
-                        isDisabled: isPurchasing || currentTier != "free"
+                        isDisabled: isPurchasing || currentTier == "basic" || currentTier == "basic_ticketing" || currentTier == "premium" || currentTier == "premium_ticketing"
                     ) {
                         await runPurchase(onPurchaseBasic)
                     }
 
                     subscriptionCard(
+                        title: basicTicketingProduct?.displayName ?? "Basic W/Ticketing",
+                        subtitle: "$199.99. Includes chat, training, and Tickets, but hides Locations and Rooms.",
+                        price: priceText(for: basicTicketingProduct),
+                        buttonTitle: currentTier == "basic_ticketing" ? "Current Plan" : "Choose Basic W/Ticketing",
+                        isPrimary: false,
+                        isDisabled: isPurchasing || currentTier == "basic_ticketing" || currentTier == "premium" || currentTier == "premium_ticketing"
+                    ) {
+                        await runPurchase(onPurchaseBasicTicketing)
+                    }
+
+                    subscriptionCard(
                         title: premiumProduct?.displayName ?? "Premium",
-                        subtitle: "Everything in Basic plus premium workspace features and expanded team management.",
+                        subtitle: "$249.99. Includes everything except Tickets.",
                         price: priceText(for: premiumProduct),
                         buttonTitle: currentTier == "premium" ? "Current Plan" : "Choose Premium",
                         isPrimary: false,
-                        isDisabled: isPurchasing || currentTier == "premium"
+                        isDisabled: isPurchasing || currentTier == "premium" || currentTier == "premium_ticketing"
                     ) {
                         await runPurchase(onPurchasePremium)
+                    }
+
+                    subscriptionCard(
+                        title: premiumTicketingProduct?.displayName ?? "Premium W/Ticketing",
+                        subtitle: "$499.99. Includes every feature.",
+                        price: priceText(for: premiumTicketingProduct),
+                        buttonTitle: currentTier == "premium_ticketing" ? "Current Plan" : "Choose Premium W/Ticketing",
+                        isPrimary: false,
+                        isDisabled: isPurchasing || currentTier == "premium_ticketing"
+                    ) {
+                        await runPurchase(onPurchasePremiumTicketing)
                     }
 
                     Button(isPurchasing ? "Working..." : "Restore Purchases") {
@@ -3330,9 +4587,11 @@ private struct MacSubscriptionOptionsView: View {
         defer { isLoadingProducts = false }
 
         do {
-            let products = try await Product.products(for: ["Basic3", "Premium2"])
+            let products = try await Product.products(for: ["Basic3", "Basic_Ticketing", "Premium2", "Premium_Ticketing"])
             basicProduct = products.first(where: { $0.id == "Basic3" })
+            basicTicketingProduct = products.first(where: { $0.id == "Basic_Ticketing" })
             premiumProduct = products.first(where: { $0.id == "Premium2" })
+            premiumTicketingProduct = products.first(where: { $0.id == "Premium_Ticketing" })
         } catch {
             // Keep the fallback copy visible even if products fail to load.
         }

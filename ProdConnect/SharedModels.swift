@@ -28,12 +28,14 @@ struct UserProfile: Identifiable, Codable {
     var canEditGear: Bool = false
     var canEditIdeas: Bool = false
     var canEditChecklists: Bool = false
+    var isTicketAgent: Bool = false
     var canSeeChat: Bool = true
     var canSeePatchsheet: Bool = true
     var canSeeTraining: Bool = true
     var canSeeGear: Bool = true
     var canSeeIdeas: Bool = true
     var canSeeChecklists: Bool = true
+    var canSeeTickets: Bool = true
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -49,12 +51,14 @@ struct UserProfile: Identifiable, Codable {
         case canEditGear
         case canEditIdeas
         case canEditChecklists
+        case isTicketAgent
         case canSeeChat
         case canSeePatchsheet
         case canSeeTraining
         case canSeeGear
         case canSeeIdeas
         case canSeeChecklists
+        case canSeeTickets
     }
 
     init(
@@ -71,12 +75,14 @@ struct UserProfile: Identifiable, Codable {
         canEditGear: Bool = false,
         canEditIdeas: Bool = false,
         canEditChecklists: Bool = false,
+        isTicketAgent: Bool = false,
         canSeeChat: Bool = true,
         canSeePatchsheet: Bool = true,
         canSeeTraining: Bool = true,
         canSeeGear: Bool = true,
         canSeeIdeas: Bool = true,
-        canSeeChecklists: Bool = true
+        canSeeChecklists: Bool = true,
+        canSeeTickets: Bool = true
     ) {
         self.id = id
         self.displayName = displayName
@@ -91,12 +97,14 @@ struct UserProfile: Identifiable, Codable {
         self.canEditGear = canEditGear
         self.canEditIdeas = canEditIdeas
         self.canEditChecklists = canEditChecklists
+        self.isTicketAgent = isTicketAgent
         self.canSeeChat = canSeeChat
         self.canSeePatchsheet = canSeePatchsheet
         self.canSeeTraining = canSeeTraining
         self.canSeeGear = canSeeGear
         self.canSeeIdeas = canSeeIdeas
         self.canSeeChecklists = canSeeChecklists
+        self.canSeeTickets = canSeeTickets
     }
 
     init(from decoder: Decoder) throws {
@@ -128,12 +136,14 @@ struct UserProfile: Identifiable, Codable {
         canEditGear = try container.decodeIfPresent(Bool.self, forKey: .canEditGear) ?? false
         canEditIdeas = try container.decodeIfPresent(Bool.self, forKey: .canEditIdeas) ?? false
         canEditChecklists = try container.decodeIfPresent(Bool.self, forKey: .canEditChecklists) ?? false
+        isTicketAgent = try container.decodeIfPresent(Bool.self, forKey: .isTicketAgent) ?? false
         canSeeChat = try container.decodeIfPresent(Bool.self, forKey: .canSeeChat) ?? true
         canSeePatchsheet = try container.decodeIfPresent(Bool.self, forKey: .canSeePatchsheet) ?? true
         canSeeTraining = try container.decodeIfPresent(Bool.self, forKey: .canSeeTraining) ?? true
         canSeeGear = try container.decodeIfPresent(Bool.self, forKey: .canSeeGear) ?? true
         canSeeIdeas = try container.decodeIfPresent(Bool.self, forKey: .canSeeIdeas) ?? true
         canSeeChecklists = try container.decodeIfPresent(Bool.self, forKey: .canSeeChecklists) ?? true
+        canSeeTickets = try container.decodeIfPresent(Bool.self, forKey: .canSeeTickets) ?? true
     }
 
     enum Role {
@@ -145,15 +155,55 @@ struct UserProfile: Identifiable, Codable {
 
     var role: Role {
         if isAdmin { return .admin }
-        switch subscriptionTier.lowercased() {
-        case "premium": return .premium
-        case "basic": return .basic
+        switch normalizedSubscriptionTier {
+        case "premium", "premium_ticketing", "premium w/ticketing", "premium with ticketing":
+            return .premium
+        case "basic", "basic_ticketing", "basic w/ticketing", "basic with ticketing":
+            return .basic
         default: return .free
         }
     }
 
+    var normalizedSubscriptionTier: String {
+        subscriptionTier.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    var subscriptionTierRank: Int {
+        switch normalizedSubscriptionTier {
+        case "premium_ticketing", "premium w/ticketing", "premium with ticketing":
+            return 4
+        case "premium":
+            return 3
+        case "basic_ticketing", "basic w/ticketing", "basic with ticketing":
+            return 2
+        case "basic":
+            return 1
+        default:
+            return 0
+        }
+    }
+
+    var hasChatAndTrainingFeatures: Bool {
+        normalizedSubscriptionTier != "free"
+    }
+
     var hasCampusRoomFeatures: Bool {
-        role == .premium || role == .admin
+        switch normalizedSubscriptionTier {
+        case "premium", "premium_ticketing", "premium w/ticketing", "premium with ticketing":
+            return true
+        default:
+            return false
+        }
+    }
+
+    var hasTicketingFeatures: Bool {
+        switch normalizedSubscriptionTier {
+        case "basic_ticketing", "basic w/ticketing", "basic with ticketing",
+             "premium_ticketing", "premium w/ticketing", "premium with ticketing":
+            return true
+        default:
+            return false
+        }
     }
 }
 
@@ -172,9 +222,45 @@ struct TrainingLesson: Identifiable, Codable {
 struct ChecklistItem: Identifiable, Codable {
     var id: String = UUID().uuidString
     var text: String
+    var notes: String = ""
     var isDone: Bool = false
     var completedAt: Date? = nil
     var completedBy: String? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case text
+        case notes
+        case isDone
+        case completedAt
+        case completedBy
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        text: String,
+        notes: String = "",
+        isDone: Bool = false,
+        completedAt: Date? = nil,
+        completedBy: String? = nil
+    ) {
+        self.id = id
+        self.text = text
+        self.notes = notes
+        self.isDone = isDone
+        self.completedAt = completedAt
+        self.completedBy = completedBy
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        text = try container.decode(String.self, forKey: .text)
+        notes = try container.decodeIfPresent(String.self, forKey: .notes) ?? ""
+        isDone = try container.decodeIfPresent(Bool.self, forKey: .isDone) ?? false
+        completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
+        completedBy = try container.decodeIfPresent(String.self, forKey: .completedBy)
+    }
 }
 
 struct ChecklistTemplate: Identifiable, Codable {
@@ -198,6 +284,70 @@ struct IdeaCard: Identifiable, Codable {
     var implemented: Bool = false
     var completedAt: Date? = nil
     var likedBy: [String] = []
+}
+
+enum TicketStatus: String, Codable, CaseIterable, Equatable {
+    case new = "New"
+    case open = "Open"
+    case inProgress = "In Progress"
+    case resolved = "Resolved"
+
+    var sortOrder: Int {
+        switch self {
+        case .new: return 0
+        case .open: return 1
+        case .inProgress: return 2
+        case .resolved: return 3
+        }
+    }
+}
+
+struct TicketActivityEntry: Identifiable, Codable, Equatable {
+    var id: String = UUID().uuidString
+    var message: String
+    var createdAt: Date = Date()
+    var author: String? = nil
+}
+
+enum TicketAttachmentKind: String, Codable, Equatable {
+    case image
+    case video
+}
+
+struct SupportTicket: Identifiable, Codable, Equatable {
+    var id: String = UUID().uuidString
+    var title: String
+    var detail: String = ""
+    var teamCode: String
+    var campus: String = ""
+    var room: String = ""
+    var status: TicketStatus = .new
+    var createdBy: String? = nil
+    var createdByUserID: String? = nil
+    var assignedAgentID: String? = nil
+    var assignedAgentName: String? = nil
+    var linkedGearID: String? = nil
+    var linkedGearName: String? = nil
+    var dueDate: Date? = nil
+    var createdAt: Date = Date()
+    var updatedAt: Date = Date()
+    var resolvedAt: Date? = nil
+    var lastUpdatedBy: String? = nil
+    var attachmentURL: String? = nil
+    var attachmentName: String? = nil
+    var attachmentKind: TicketAttachmentKind? = nil
+    var activity: [TicketActivityEntry] = []
+}
+
+struct GearTicketHistoryEntry: Identifiable, Codable, Equatable {
+    var id: String { ticketID }
+    var ticketID: String
+    var ticketTitle: String
+    var status: TicketStatus
+    var campus: String = ""
+    var room: String = ""
+    var updatedAt: Date = Date()
+    var resolvedAt: Date? = nil
 }
 
 struct ChatChannel: Identifiable, Codable {

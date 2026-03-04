@@ -139,7 +139,7 @@ struct GearTabView: View {
             var body: some View {
                 HStack {
                     Image(systemName: "magnifyingglass")
-                    TextField("Search gear...", text: $text)
+                    TextField("Search assets...", text: $text)
                         .textFieldStyle(PlainTextFieldStyle())
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
@@ -286,7 +286,7 @@ struct GearTabView: View {
                     Text(mergeResultMessage)
                 }
             }
-            .navigationTitle("Gear")
+            .navigationTitle("Assets")
             .toolbar {
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
                     Button(action: exportGear) {
@@ -780,7 +780,7 @@ struct GearTabView: View {
                     }
                 }
             }
-            .navigationTitle("Gear")
+            .navigationTitle("Assets")
             .toolbar {
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
                     Button(action: exportGear) {
@@ -824,7 +824,7 @@ struct GearTabView: View {
             } message: {
                 Text("Found \(duplicateGearGroupCount) duplicate group(s). Merge now?")
             }
-            .alert("Gear", isPresented: $showMergeResult) {
+            .alert("Assets", isPresented: $showMergeResult) {
                 Button("OK", role: .cancel) {}
             } message: {
                 Text(mergeResultMessage)
@@ -1296,7 +1296,7 @@ struct ContentView: View {
                         mergeProgressSection
                         mergeResultSection
                     }
-                    .navigationTitle("Gear")
+                    .navigationTitle("Assets")
                     .toolbar {
                         toolbarButtons
                     }
@@ -3002,50 +3002,40 @@ class IAPManager: ObservableObject {
     @Published var isAdminActive: Bool = false
 
     // Replace with your subscription product IDs
-    private let adminSubscriptionProductID = "Basic1"
+    private let basicSubscriptionProductID = "Basic1"
+    private let basicTicketingSubscriptionProductID = "Basic_Ticketing"
     private let premiumSubscriptionProductID = "Premium1"
+    private let premiumTicketingSubscriptionProductID = "Premium_Ticketing"
 
     // MARK: - Fetch Products
     func fetchProducts() async {
         do {
-            let products = try await Product.products(for: [adminSubscriptionProductID, premiumSubscriptionProductID])
+            let products = try await Product.products(for: [
+                basicSubscriptionProductID,
+                basicTicketingSubscriptionProductID,
+                premiumSubscriptionProductID,
+                premiumTicketingSubscriptionProductID
+            ])
             print("Successfully fetched \(products.count) products: \(products.map { $0.id })")
-            product = products.first(where: { $0.id == adminSubscriptionProductID })
+            product = products.first(where: { $0.id == basicSubscriptionProductID })
             if product == nil {
-                print("Error: Basic product not found for ID \(adminSubscriptionProductID)")
+                print("Error: Basic product not found for ID \(basicSubscriptionProductID)")
             }
         } catch {
-            print("Error fetching subscription products for IDs [\(adminSubscriptionProductID), \(premiumSubscriptionProductID)]: \(error)")
+            print("Error fetching subscription products: \(error)")
         }
     }
 
     
     func purchaseSubscriptionWithError(for store: ProdConnectStore) async throws {
-        if await isOwnerLocked(for: store) {
-            throw StoreError.ownerLocked
-        }
-        guard let product = product else {
-            throw StoreError.productNotFound
-        }
-        let result = try await product.purchase()
-        switch result {
-        case .success(let verification):
-            let transaction = try checkVerified(verification)
-            await unlockAdmin(for: store)
-            await transaction.finish()
-            if await canApplySubscription(for: store) == false {
-                throw StoreError.ownerLocked
-            }
-        case .userCancelled:
-            throw StoreError.userCancelled
-        case .pending:
-            throw StoreError.pending
-        @unknown default:
-            throw StoreError.unknown
-        }
+        try await purchaseTierWithError(productID: basicSubscriptionProductID, targetTier: "basic", for: store)
     }
     
     func purchasePremiumWithError(productID: String, for store: ProdConnectStore) async throws {
+        try await purchaseTierWithError(productID: productID, targetTier: "premium", for: store)
+    }
+
+    func purchaseTierWithError(productID: String, targetTier: String, for store: ProdConnectStore) async throws {
         if await isOwnerLocked(for: store) {
             throw StoreError.ownerLocked
         }
@@ -3058,7 +3048,7 @@ class IAPManager: ObservableObject {
         switch result {
         case .success(let verification):
             let transaction = try checkVerified(verification)
-            await unlockPremium(for: store)
+            await applySubscriptionTier(targetTier, for: store)
             await transaction.finish()
             if await canApplySubscription(for: store) == false {
                 throw StoreError.ownerLocked
@@ -3128,17 +3118,21 @@ class IAPManager: ObservableObject {
         do {
             for try await verification in Transaction.currentEntitlements {
                 let transaction = try checkVerified(verification)
-                if transaction.productID == adminSubscriptionProductID {
-                    // Admin subscription active
-                    if await canApplySubscription(for: store) {
-                        await unlockAdmin(for: store)
-                    }
-                    return
-                } else if transaction.productID == premiumSubscriptionProductID {
-                    // Premium subscription active
-                    if await canApplySubscription(for: store) {
-                        await unlockPremium(for: store)
-                    }
+                let resolvedTier: String?
+                switch transaction.productID {
+                case basicSubscriptionProductID:
+                    resolvedTier = "basic"
+                case basicTicketingSubscriptionProductID:
+                    resolvedTier = "basic_ticketing"
+                case premiumSubscriptionProductID:
+                    resolvedTier = "premium"
+                case premiumTicketingSubscriptionProductID:
+                    resolvedTier = "premium_ticketing"
+                default:
+                    resolvedTier = nil
+                }
+                if let resolvedTier, await canApplySubscription(for: store) {
+                    await applySubscriptionTier(resolvedTier, for: store)
                     return
                 }
             }
@@ -3152,55 +3146,7 @@ class IAPManager: ObservableObject {
 
     // MARK: - Unlock / Revoke Admin
     private func unlockAdmin(for store: ProdConnectStore) async {
-        guard var user = store.user else { return }
-        if !user.isAdmin {
-            user.isAdmin = true
-            if user.subscriptionTier == "free" {
-                user.subscriptionTier = "basic"
-            }
-            if user.teamCode == nil || user.teamCode?.isEmpty == true {
-                // Generate a unique team code
-                var teamCode = store.generateTeamCode()
-                var isUnique = false
-                
-                while !isUnique {
-                    do {
-                        let snapshot = try await store.db.collection("users").whereField("teamCode", isEqualTo: teamCode).getDocuments()
-                        isUnique = snapshot.documents.count == 0
-                        if !isUnique {
-                            teamCode = store.generateTeamCode()
-                        }
-                    } catch {
-                        print("Error checking team code uniqueness: \(error)")
-                        break
-                    }
-                }
-                
-                user.teamCode = teamCode
-                
-                // Register the team code in the teams collection so others can join
-                store.db.collection("teams").document(teamCode).setData([
-                    "code": teamCode,
-                    "createdAt": FieldValue.serverTimestamp(),
-                    "createdBy": user.email,
-                    "isActive": true
-                ], merge: true) { error in
-                    if let error = error { print("Team registration error:", error) }
-                }
-            }
-            store.user = user
-
-            // ✅ Non-throwing Firestore update
-            store.db.collection("users").document(user.id).setData([
-                "isAdmin": true,
-                "subscriptionTier": user.subscriptionTier,
-                "teamCode": user.teamCode ?? ""
-            ], merge: true) { error in
-                if let error = error { print("Firestore update error:", error) }
-            }
-
-            store.listenToTeamData()
-        }
+        await applySubscriptionTier("basic", for: store)
         isAdminActive = true
     }
 
@@ -3222,56 +3168,61 @@ class IAPManager: ObservableObject {
     }
     
     func unlockPremium(for store: ProdConnectStore) async {
+        await applySubscriptionTier("premium", for: store)
+    }
+
+    private func applySubscriptionTier(_ targetTier: String, for store: ProdConnectStore) async {
         guard var user = store.user else { return }
-        if user.subscriptionTier != "premium" {
-            user.subscriptionTier = "premium"
-            user.isAdmin = true
-            
-            // Generate team code if they don't have one
-            if user.teamCode == nil || user.teamCode?.isEmpty == true {
-                var teamCode = store.generateTeamCode()
-                var isUnique = false
-                
-                while !isUnique {
-                    do {
-                        let snapshot = try await store.db.collection("users").whereField("teamCode", isEqualTo: teamCode).getDocuments()
-                        isUnique = snapshot.documents.count == 0
-                        if !isUnique {
-                            teamCode = store.generateTeamCode()
-                        }
-                    } catch {
-                        print("Error checking team code uniqueness: \(error)")
-                        break
+        let normalizedTier = targetTier.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if user.subscriptionTier.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedTier,
+           user.isAdmin {
+            return
+        }
+
+        user.subscriptionTier = normalizedTier
+        user.isAdmin = true
+
+        if user.teamCode == nil || user.teamCode?.isEmpty == true {
+            var teamCode = store.generateTeamCode()
+            var isUnique = false
+
+            while !isUnique {
+                do {
+                    let snapshot = try await store.db.collection("users").whereField("teamCode", isEqualTo: teamCode).getDocuments()
+                    isUnique = snapshot.documents.count == 0
+                    if !isUnique {
+                        teamCode = store.generateTeamCode()
                     }
-                }
-                
-                user.teamCode = teamCode
-                
-                // Register the team code in the teams collection so others can join
-                store.db.collection("teams").document(teamCode).setData([
-                    "code": teamCode,
-                    "createdAt": FieldValue.serverTimestamp(),
-                    "createdBy": user.email,
-                    "isActive": true
-                ], merge: true) { error in
-                    if let error = error { print("Team registration error:", error) }
+                } catch {
+                    print("Error checking team code uniqueness: \(error)")
+                    break
                 }
             }
-            
-            store.user = user
-            
-            store.db.collection("users").document(user.id).setData([
-                "subscriptionTier": "premium",
-                "isAdmin": true,
-                "teamCode": user.teamCode ?? ""
+
+            user.teamCode = teamCode
+
+            store.db.collection("teams").document(teamCode).setData([
+                "code": teamCode,
+                "createdAt": FieldValue.serverTimestamp(),
+                "createdBy": user.email,
+                "isActive": true
             ], merge: true) { error in
-                if let error = error { print("Firestore update error:", error) }
+                if let error = error { print("Team registration error:", error) }
             }
-            
-            // Refresh team data listeners so free user filters are removed
-            await MainActor.run {
-                store.listenToTeamData()
-            }
+        }
+
+        store.user = user
+
+        store.db.collection("users").document(user.id).setData([
+            "subscriptionTier": user.subscriptionTier,
+            "isAdmin": true,
+            "teamCode": user.teamCode ?? ""
+        ], merge: true) { error in
+            if let error = error { print("Firestore update error:", error) }
+        }
+
+        await MainActor.run {
+            store.listenToTeamData()
         }
     }
     
@@ -3790,20 +3741,38 @@ struct AccountView: View {
     private let termsURLString = "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/"
     // Replace with your app's public privacy policy URL before App Store submission.
     private let privacyPolicyURLString = "https://bmsatori.github.io/prodconnect-privacy/"
+
+    private var effectiveSubscriptionTierLabel: String {
+        switch effectiveSubscriptionTier {
+        case "premium_ticketing":
+            return "Premium W/Ticketing"
+        case "premium":
+            return "Premium"
+        case "basic_ticketing":
+            return "Basic W/Ticketing"
+        case "basic":
+            return "Basic"
+        default:
+            return "Free"
+        }
+    }
     
     private var effectiveSubscriptionTier: String {
-        let ownTier = store.user?.subscriptionTier.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "free"
+        let ownTier = canonicalSubscriptionTier(store.user?.subscriptionTier)
         let teamCode = store.user?.teamCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !teamCode.isEmpty else { return ownTier }
 
         let teamMembers = store.teamMembers.filter {
             ($0.teamCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") == teamCode
         }
-        if teamMembers.contains(where: { $0.subscriptionTier.lowercased() == "premium" }) { return "premium" }
-        if ownTier == "premium" { return "premium" }
-        if teamMembers.contains(where: { $0.subscriptionTier.lowercased() == "basic" }) { return "basic" }
-        if ownTier == "basic" { return "basic" }
-        return "free"
+        let highestRank = teamMembers
+            .map(\.subscriptionTierRank)
+            .reduce(subscriptionTierRank(for: ownTier), max)
+        return subscriptionTierName(for: highestRank)
+    }
+
+    private var canUpgradeSubscription: Bool {
+        (store.user?.isAdmin == true || store.user?.isOwner == true) && effectiveSubscriptionTier != "premium_ticketing"
     }
 
     var body: some View {
@@ -3842,7 +3811,7 @@ struct AccountView: View {
                             .foregroundColor(.white)
                             .fontWeight(.medium)
                         Spacer()
-                        Text(effectiveSubscriptionTier.capitalized)
+                        Text(effectiveSubscriptionTierLabel)
                             .foregroundColor(.white)
                             .fontWeight(.medium)
                     }
@@ -3914,7 +3883,7 @@ struct AccountView: View {
                         }
                     }
                     .padding(.horizontal)
-                } else if effectiveSubscriptionTier == "basic", store.user?.isAdmin == true {
+                } else if canUpgradeSubscription {
                     Button(action: {
                         showSubscriptionOptions = true
                     }) {
@@ -4018,9 +3987,35 @@ struct AccountView: View {
                         showPurchaseError = true
                     }
                 },
+                onPurchaseBasicTicketing: {
+                    do {
+                        try await IAPManager.shared.purchaseTierWithError(
+                            productID: "Basic_Ticketing",
+                            targetTier: "basic_ticketing",
+                            for: store
+                        )
+                        showSubscriptionOptions = false
+                    } catch {
+                        purchaseError = error.localizedDescription
+                        showPurchaseError = true
+                    }
+                },
                 onPurchasePremium: {
                     do {
                         try await IAPManager.shared.purchasePremiumWithError(productID: "Premium1", for: store)
+                        showSubscriptionOptions = false
+                    } catch {
+                        purchaseError = error.localizedDescription
+                        showPurchaseError = true
+                    }
+                },
+                onPurchasePremiumTicketing: {
+                    do {
+                        try await IAPManager.shared.purchaseTierWithError(
+                            productID: "Premium_Ticketing",
+                            targetTier: "premium_ticketing",
+                            for: store
+                        )
                         showSubscriptionOptions = false
                     } catch {
                         purchaseError = error.localizedDescription
@@ -4162,6 +4157,51 @@ struct AccountView: View {
         }
     }
 
+    private func canonicalSubscriptionTier(_ rawValue: String?) -> String {
+        switch rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "free" {
+        case "premium_ticketing", "premium w/ticketing", "premium with ticketing":
+            return "premium_ticketing"
+        case "basic_ticketing", "basic w/ticketing", "basic with ticketing":
+            return "basic_ticketing"
+        case "premium":
+            return "premium"
+        case "basic":
+            return "basic"
+        default:
+            return "free"
+        }
+    }
+
+    private func subscriptionTierRank(for tier: String) -> Int {
+        switch tier {
+        case "premium_ticketing":
+            return 4
+        case "premium":
+            return 3
+        case "basic_ticketing":
+            return 2
+        case "basic":
+            return 1
+        default:
+            return 0
+        }
+    }
+
+    private func subscriptionTierName(for rank: Int) -> String {
+        switch rank {
+        case 4:
+            return "premium_ticketing"
+        case 3:
+            return "premium"
+        case 2:
+            return "basic_ticketing"
+        case 1:
+            return "basic"
+        default:
+            return "free"
+        }
+    }
+
     private func loadUserInfo() {
         guard let user = Auth.auth().currentUser else {
             errorMessage = "No logged in user."
@@ -4278,14 +4318,18 @@ struct AccountView: View {
 struct SubscriptionOptionsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var basicProduct: Product?
+    @State private var basicTicketingProduct: Product?
     @State private var premiumProduct: Product?
+    @State private var premiumTicketingProduct: Product?
     @State private var isLoadingProducts = false
 
     let termsURLString: String
     let privacyPolicyURLString: String
     let onPurchaseBasic: () async -> Void
+    let onPurchaseBasicTicketing: () async -> Void
     let onPurchasePremium: () async -> Void
-    private let subscriptionProductIDs = ["Basic1", "Premium1"]
+    let onPurchasePremiumTicketing: () async -> Void
+    private let subscriptionProductIDs = ["Basic1", "Basic_Ticketing", "Premium1", "Premium_Ticketing"]
 
     var body: some View {
         NavigationStack {
@@ -4302,14 +4346,20 @@ struct SubscriptionOptionsSheet: View {
                     Button("Close") { dismiss() }
                 }
                 if #unavailable(iOS 17.0) {
-                    ToolbarItemGroup(placement: .navigationBarTrailing) {
-                        Button(isLoadingProducts ? "Loading..." : "Basic") {
-                            Task { await onPurchaseBasic() }
-                        }
-                        .disabled(isLoadingProducts)
-
-                        Button(isLoadingProducts ? "Loading..." : "Premium") {
-                            Task { await onPurchasePremium() }
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Menu(isLoadingProducts ? "Loading..." : "Buy") {
+                            Button("Basic") {
+                                Task { await onPurchaseBasic() }
+                            }
+                            Button("Basic W/Ticketing") {
+                                Task { await onPurchaseBasicTicketing() }
+                            }
+                            Button("Premium") {
+                                Task { await onPurchasePremium() }
+                            }
+                            Button("Premium W/Ticketing") {
+                                Task { await onPurchasePremiumTicketing() }
+                            }
                         }
                         .disabled(isLoadingProducts)
                     }
@@ -4328,7 +4378,7 @@ struct SubscriptionOptionsSheet: View {
                 Text("ProdConnect Subscriptions")
                     .font(.title3)
                     .fontWeight(.semibold)
-                Text("Basic and Premium are auto-renewing subscriptions.")
+                Text("Choose from Free, Basic, Basic W/Ticketing, Premium, or Premium W/Ticketing.")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
             }
@@ -4356,14 +4406,28 @@ struct SubscriptionOptionsSheet: View {
                     title: basicProduct?.displayName ?? "Basic",
                     length: subscriptionLengthText(for: basicProduct),
                     price: priceText(for: basicProduct),
-                    details: "Team management, user permissions, and full access to gear, training, checklists, and ideas."
+                    details: "$99.99. Includes chat and training, but hides Locations, Rooms, and Tickets."
+                )
+
+                subscriptionCard(
+                    title: basicTicketingProduct?.displayName ?? "Basic W/Ticketing",
+                    length: subscriptionLengthText(for: basicTicketingProduct),
+                    price: priceText(for: basicTicketingProduct, fallback: "$199.99"),
+                    details: "$199.99. Includes chat, training, and Tickets, but hides Locations and Rooms."
                 )
 
                 subscriptionCard(
                     title: premiumProduct?.displayName ?? "Premium",
                     length: subscriptionLengthText(for: premiumProduct),
                     price: priceText(for: premiumProduct),
-                    details: "Everything in Basic plus campus/room management, advanced permissions, and priority support."
+                    details: "$249.99. Includes everything except Tickets."
+                )
+
+                subscriptionCard(
+                    title: premiumTicketingProduct?.displayName ?? "Premium W/Ticketing",
+                    length: subscriptionLengthText(for: premiumTicketingProduct),
+                    price: priceText(for: premiumTicketingProduct, fallback: "$499.99"),
+                    details: "$499.99. Includes every feature."
                 )
 
                 if let termsURL = URL(string: termsURLString) {
@@ -4402,9 +4466,11 @@ struct SubscriptionOptionsSheet: View {
         isLoadingProducts = true
         defer { isLoadingProducts = false }
         do {
-            let products = try await Product.products(for: ["Basic1", "Premium1"])
+            let products = try await Product.products(for: subscriptionProductIDs)
             basicProduct = products.first(where: { $0.id == "Basic1" })
+            basicTicketingProduct = products.first(where: { $0.id == "Basic_Ticketing" })
             premiumProduct = products.first(where: { $0.id == "Premium1" })
+            premiumTicketingProduct = products.first(where: { $0.id == "Premium_Ticketing" })
         } catch {
             // Keep fallback copy visible even if products fail to load.
         }
@@ -4423,8 +4489,8 @@ struct SubscriptionOptionsSheet: View {
         return "\(period.value) \(unit) (auto-renewing)"
     }
 
-    private func priceText(for product: Product?) -> String {
-        guard let product else { return "See App Store pricing" }
+    private func priceText(for product: Product?, fallback: String = "See App Store pricing") -> String {
+        guard let product else { return fallback }
         return product.displayPrice
     }
 }
@@ -4723,7 +4789,7 @@ struct CustomizeView: View {
             Button(action: syncGearLocationsToCampuses) {
                 HStack {
                     Image(systemName: "arrow.triangle.2.circlepath")
-                    Text("Copy Locations from Gear")
+                    Text("Copy Locations from Assets")
                 }
             }
             .listRowBackground(Color.black)
@@ -4855,7 +4921,7 @@ struct CustomizeView: View {
                     .foregroundColor(.secondary)
 
                 HStack {
-                    TextField("Gear sheet link", text: $gearSheetLink)
+                    TextField("Assets sheet link", text: $gearSheetLink)
                         .textFieldStyle(RoundedBorderTextFieldStyle())
                     Button(action: importGearData) {
                         if isImporting {
@@ -4915,7 +4981,7 @@ struct CustomizeView: View {
                 HStack {
                     Image(systemName: "trash.fill")
                         .foregroundColor(.red)
-                    Text("Delete All Gear")
+                    Text("Delete All Assets")
                         .foregroundColor(.red)
                 }
             }
@@ -5001,14 +5067,14 @@ struct CustomizeView: View {
 
     private var customizeFinalView: some View {
         customizeSheetedView
-        .alert("Delete All Gear?", isPresented: $showDeleteAllConfirmation) {
+        .alert("Delete All Assets?", isPresented: $showDeleteAllConfirmation) {
             Button("Cancel", role: .cancel) { }
             Button("Delete All", role: .destructive) {
                 store.deleteAllGear()
-                presentResultAlert("✓ All gear has been deleted")
+                presentResultAlert("✓ All assets have been deleted")
             }
         } message: {
-            Text("Are you sure you want to delete all gear items? This cannot be undone.")
+            Text("Are you sure you want to delete all asset items? This cannot be undone.")
         }
         .alert("Delete Audio Patchsheet?", isPresented: $showDeleteAudioConfirmation) {
             Button("Cancel", role: .cancel) { }
@@ -5124,9 +5190,9 @@ struct CustomizeView: View {
         }
 
         if added == 0 {
-            presentResultAlert("No new locations to copy from Gear.", delay: 0)
+            presentResultAlert("No new locations to copy from Assets.", delay: 0)
         } else {
-            presentResultAlert("✓ Added \(added) location(s) from Gear.", delay: 0)
+            presentResultAlert("✓ Added \(added) location(s) from Assets.", delay: 0)
         }
     }
 
@@ -5156,7 +5222,7 @@ struct CustomizeView: View {
                 store.replaceAllGear(gearItems)
                 gearSheetLink = ""
                 isImporting = false
-                presentResultAlert("✓ Imported \(gearItems.count) gear items", delay: 0)
+                presentResultAlert("✓ Imported \(gearItems.count) asset items", delay: 0)
             }
         }.resume()
     }
@@ -5443,7 +5509,7 @@ struct UserDetailView: View {
                     .onChange(of: user.canEditTraining) { newValue in
                         updatePermission(key: "canEditTraining", value: newValue)
                     }
-                Toggle("Can edit gear", isOn: $user.canEditGear)
+                Toggle("Can edit assets", isOn: $user.canEditGear)
                     .onChange(of: user.canEditGear) { newValue in
                         updatePermission(key: "canEditGear", value: newValue)
                     }
@@ -5454,6 +5520,10 @@ struct UserDetailView: View {
                 Toggle("Can edit checklists", isOn: $user.canEditChecklists)
                     .onChange(of: user.canEditChecklists) { newValue in
                         updatePermission(key: "canEditChecklists", value: newValue)
+                    }
+                Toggle("Ticket Agent", isOn: $user.isTicketAgent)
+                    .onChange(of: user.isTicketAgent) { newValue in
+                        updatePermission(key: "isTicketAgent", value: newValue)
                     }
             }
 
@@ -5471,7 +5541,7 @@ struct UserDetailView: View {
                         .onChange(of: user.canSeeTraining) { newValue in
                             updatePermission(key: "canSeeTraining", value: newValue)
                         }
-                    Toggle("Gear", isOn: $user.canSeeGear)
+                    Toggle("Assets", isOn: $user.canSeeGear)
                         .onChange(of: user.canSeeGear) { newValue in
                             updatePermission(key: "canSeeGear", value: newValue)
                         }
@@ -5482,6 +5552,10 @@ struct UserDetailView: View {
                     Toggle("Checklists", isOn: $user.canSeeChecklists)
                         .onChange(of: user.canSeeChecklists) { newValue in
                             updatePermission(key: "canSeeChecklists", value: newValue)
+                        }
+                    Toggle("Tickets", isOn: $user.canSeeTickets)
+                        .onChange(of: user.canSeeTickets) { newValue in
+                            updatePermission(key: "canSeeTickets", value: newValue)
                         }
                 }
             }
@@ -5629,6 +5703,8 @@ struct UserDetailView: View {
                             store.teamMembers[idx].canEditIdeas = value
                         case "canEditChecklists":
                             store.teamMembers[idx].canEditChecklists = value
+                        case "isTicketAgent":
+                            store.teamMembers[idx].isTicketAgent = value
                         case "canSeeChat":
                             store.teamMembers[idx].canSeeChat = value
                         case "canSeePatchsheet":
@@ -5641,6 +5717,8 @@ struct UserDetailView: View {
                             store.teamMembers[idx].canSeeIdeas = value
                         case "canSeeChecklists":
                             store.teamMembers[idx].canSeeChecklists = value
+                        case "canSeeTickets":
+                            store.teamMembers[idx].canSeeTickets = value
                         default:
                             break
                         }
@@ -6282,6 +6360,42 @@ struct GearDetailView: View {
                     .disabled(!canEdit)
             }
 
+            Section("Ticket History") {
+                if item.ticketHistory.isEmpty {
+                    Text("No tickets linked")
+                        .foregroundColor(.secondary)
+                } else {
+                    if !item.activeTicketIDs.isEmpty {
+                        Text("\(item.activeTicketIDs.count) active ticket(s)")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    }
+                    ForEach(item.ticketHistory.sorted { $0.updatedAt > $1.updatedAt }) { entry in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(entry.ticketTitle)
+                                Spacer()
+                                Text(entry.status.rawValue)
+                                    .font(.caption)
+                                    .foregroundColor(entry.status == .resolved ? .green : .orange)
+                            }
+                            let locationLine = [entry.campus, entry.room]
+                                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                                .filter { !$0.isEmpty }
+                                .joined(separator: " • ")
+                            if !locationLine.isEmpty {
+                                Text(locationLine)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                            Text((entry.resolvedAt ?? entry.updatedAt).formatted(date: .abbreviated, time: .shortened))
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+
             Section("Image") {
                 if let urlString = item.imageURL, let url = URL(string: urlString) {
                     AsyncImage(url: url) { phase in
@@ -6526,7 +6640,7 @@ struct AddGearView: View {
                     }
                 }
             }
-            .navigationTitle("Add Gear")
+            .navigationTitle("Add Asset")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -6780,6 +6894,987 @@ struct CreateIdeaView: View {
     }
 }
 
+// MARK: - Tickets Views
+
+struct TicketsListView: View {
+    @EnvironmentObject var store: ProdConnectStore
+    @State private var showCreate = false
+    @State private var locationFilter = ""
+    @State private var statusFilter = ""
+    @State private var agentFilter = ""
+
+    private let unassignedAgentFilter = "__UNASSIGNED__"
+
+    private var availableLocations: [String] {
+        Array(Set(store.visibleTickets.map { $0.campus.trimmingCharacters(in: .whitespacesAndNewlines) }))
+            .filter { !$0.isEmpty }
+            .sorted()
+    }
+
+    private var availableAgents: [UserProfile] {
+        store.teamMembers
+            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
+    private var filteredTickets: [SupportTicket] {
+        store.visibleTickets.filter { ticket in
+            let locationMatches = locationFilter.isEmpty
+                || ticket.campus.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(locationFilter) == .orderedSame
+            let statusMatches = statusFilter.isEmpty
+                ? ticket.status != .resolved
+                : ticket.status.rawValue == statusFilter
+            let agentMatches: Bool
+            if agentFilter.isEmpty {
+                agentMatches = true
+            } else if agentFilter == unassignedAgentFilter {
+                agentMatches = (ticket.assignedAgentID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false)
+            } else {
+                agentMatches = ticket.assignedAgentID?.trimmingCharacters(in: .whitespacesAndNewlines) == agentFilter
+            }
+            return locationMatches && statusMatches && agentMatches
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if !store.canUseTickets {
+                    VStack(spacing: 12) {
+                        Text("Ticketing is available on Premium W/Ticketing.")
+                            .font(.headline)
+                        Text("Upgrade the team subscription to enable campus ticket tracking.")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding()
+                } else {
+                    VStack(spacing: 0) {
+                        ticketFilterBar
+
+                        List {
+                            if filteredTickets.isEmpty {
+                                Text("No matching tickets")
+                                    .foregroundColor(.secondary)
+                            } else {
+                                ForEach(filteredTickets) { ticket in
+                                    NavigationLink {
+                                        TicketDetailView(ticket: ticket)
+                                    } label: {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            HStack(alignment: .firstTextBaseline) {
+                                                Text(ticket.title)
+                                                    .font(.headline)
+                                                Spacer()
+                                                Text(ticket.status.rawValue)
+                                                    .font(.caption2)
+                                                    .foregroundColor(ticket.status == .resolved ? .green : .orange)
+                                            }
+                                            let locationLine = [ticket.campus, ticket.room]
+                                                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                                                .filter { !$0.isEmpty }
+                                                .joined(separator: " • ")
+                                            if !locationLine.isEmpty {
+                                                Text(locationLine)
+                                                    .font(.caption)
+                                                    .foregroundColor(.secondary)
+                                            }
+                                            if let dueDate = ticket.dueDate {
+                                                Text("Due \(dueDate.formatted(date: .abbreviated, time: .shortened))")
+                                                    .font(.caption2)
+                                                    .foregroundColor(dueDate < Date() && ticket.status != .resolved ? .red : .secondary)
+                                            }
+                                            HStack {
+                                                if let assetName = ticket.linkedGearName?.trimmingCharacters(in: .whitespacesAndNewlines),
+                                                   !assetName.isEmpty {
+                                                    Text(assetName)
+                                                        .font(.caption2)
+                                                        .foregroundColor(.secondary)
+                                                }
+                                                Spacer()
+                                                Text(ticket.updatedAt.formatted(date: .abbreviated, time: .shortened))
+                                                    .font(.caption2)
+                                                    .foregroundColor(.secondary)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Tickets")
+            .toolbar {
+                if store.canUseTickets {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button { showCreate = true } label: { Image(systemName: "plus") }
+                    }
+                }
+            }
+            .sheet(isPresented: $showCreate) {
+                CreateTicketView { ticket in
+                    store.saveTicket(ticket)
+                }
+            }
+        }
+    }
+
+    private var ticketFilterBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 12) {
+                ticketLocationMenu
+                ticketStatusMenu
+                ticketAgentMenu
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+        }
+    }
+
+    private var ticketLocationMenu: some View {
+        Menu {
+            Button("Clear") { locationFilter = "" }
+            Divider()
+            if availableLocations.isEmpty {
+                Text("No locations")
+            } else {
+                ForEach(availableLocations, id: \.self) { location in
+                    Button(location) { locationFilter = location }
+                }
+            }
+        } label: {
+            ticketFilterChip(
+                title: locationFilter.isEmpty ? "Location" : locationFilter,
+                icon: "mappin.circle",
+                isActive: !locationFilter.isEmpty
+            )
+        }
+    }
+
+    private var ticketStatusMenu: some View {
+        Menu {
+            Button("Active") { statusFilter = "" }
+            Divider()
+            ForEach(TicketStatus.allCases, id: \.self) { status in
+                Button(status.rawValue) { statusFilter = status.rawValue }
+            }
+        } label: {
+            ticketFilterChip(
+                title: statusFilter.isEmpty ? "Active" : statusFilter,
+                icon: "checkmark.circle",
+                isActive: !statusFilter.isEmpty
+            )
+        }
+    }
+
+    private var ticketAgentMenu: some View {
+        Menu {
+            Button("Clear") { agentFilter = "" }
+            Divider()
+            Button("Unassigned") { agentFilter = unassignedAgentFilter }
+            if !availableAgents.isEmpty {
+                Divider()
+                ForEach(availableAgents) { agent in
+                    Button(agent.displayName) { agentFilter = agent.id }
+                }
+            }
+        } label: {
+            ticketFilterChip(
+                title: agentFilterTitle,
+                icon: "person.crop.circle",
+                isActive: !agentFilter.isEmpty
+            )
+        }
+    }
+
+    private var agentFilterTitle: String {
+        if agentFilter.isEmpty { return "Agent" }
+        if agentFilter == unassignedAgentFilter { return "Unassigned" }
+        return availableAgents.first(where: { $0.id == agentFilter })?.displayName ?? "Agent"
+    }
+
+    private func ticketFilterChip(title: String, icon: String, isActive: Bool) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+            Text(title).lineLimit(1)
+        }
+        .font(.caption)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(isActive ? Color.blue : Color.gray.opacity(0.3))
+        .foregroundColor(.white)
+        .cornerRadius(8)
+    }
+}
+
+struct TicketDetailView: View {
+    @EnvironmentObject var store: ProdConnectStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var ticket: SupportTicket
+    @State private var isEditing = false
+    @State private var originalTicket: SupportTicket?
+    @State private var showAssetPicker = false
+
+    init(ticket: SupportTicket) {
+        _ticket = State(initialValue: ticket)
+    }
+
+    private var canAssignAgents: Bool {
+        store.canSeeAllTickets
+    }
+
+    private var availableAgents: [UserProfile] {
+        store.teamMembers
+            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
+    private var availableGear: [GearItem] {
+        store.gear.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    var body: some View {
+        Form {
+            Section("Overview") {
+                if isEditing {
+                    TextField("Title", text: $ticket.title)
+                    TextEditor(text: $ticket.detail)
+                        .frame(minHeight: 120)
+                } else {
+                    Text(ticket.title)
+                        .font(.title3)
+                    Text(ticket.detail.isEmpty ? "No details" : ticket.detail)
+                        .foregroundColor(ticket.detail.isEmpty ? .secondary : .primary)
+                }
+            }
+
+            Section("Status") {
+                Picker(
+                    "Status",
+                    selection: Binding(
+                        get: { ticket.status },
+                        set: { newValue in
+                            ticket.status = newValue
+                            if !isEditing {
+                                ticket.lastUpdatedBy = currentUserLabel
+                                store.saveTicket(ticket)
+                            }
+                        }
+                    )
+                ) {
+                    ForEach(TicketStatus.allCases, id: \.self) { status in
+                        Text(status.rawValue).tag(status)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+
+            Section("Due Date") {
+                if isEditing {
+                    Toggle("Set Due Date", isOn: hasDueDateBinding)
+                    if ticket.dueDate != nil {
+                        DatePicker("Due", selection: dueDateBinding, displayedComponents: [.date, .hourAndMinute])
+                    }
+                } else if let dueDate = ticket.dueDate {
+                    Text(dueDate.formatted(date: .abbreviated, time: .shortened))
+                        .foregroundColor(dueDate < Date() && ticket.status != .resolved ? .red : .primary)
+                } else {
+                    Text("Not set")
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            Section("Location") {
+                if isEditing {
+                    if store.locations.isEmpty {
+                        TextField("Campus", text: $ticket.campus)
+                    } else {
+                        Picker("Campus", selection: $ticket.campus) {
+                            Text("Select campus").tag("")
+                            ForEach(store.locations.sorted(), id: \.self) { campus in
+                                Text(campus).tag(campus)
+                            }
+                        }
+                    }
+                    if store.rooms.isEmpty {
+                        TextField("Room", text: $ticket.room)
+                    } else {
+                        Picker("Room", selection: $ticket.room) {
+                            Text("Select room").tag("")
+                            ForEach(store.rooms.sorted(), id: \.self) { room in
+                                Text(room).tag(room)
+                            }
+                        }
+                    }
+                } else {
+                    let locationLine = [ticket.campus, ticket.room]
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                        .joined(separator: " • ")
+                    Text(locationLine.isEmpty ? "Not set" : locationLine)
+                        .foregroundColor(locationLine.isEmpty ? .secondary : .primary)
+                }
+            }
+
+            Section("Linked Asset") {
+                if isEditing {
+                    Button {
+                        showAssetPicker = true
+                    } label: {
+                        HStack {
+                            Text("Asset")
+                            Spacer()
+                            Text(selectedAssetLabel)
+                                .foregroundColor(selectedAssetName == nil ? .secondary : .primary)
+                            Image(systemName: "chevron.right")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    if ticket.linkedGearID != nil || ticket.linkedGearName != nil {
+                        Button("Clear Asset Link", role: .destructive) {
+                            ticket.linkedGearID = nil
+                            ticket.linkedGearName = nil
+                        }
+                    }
+                } else {
+                    Text(ticket.linkedGearName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? (ticket.linkedGearName ?? "") : "None")
+                        .foregroundColor((ticket.linkedGearName ?? "").isEmpty ? .secondary : .primary)
+                }
+            }
+
+            Section("Attachment") {
+                if isEditing {
+                    TextField(
+                        "Attachment 1 Link (optional)",
+                        text: Binding(
+                            get: { ticket.attachmentURL ?? "" },
+                            set: {
+                                ticket.attachmentURL = $0
+                                ticket.attachmentName = nil
+                                ticket.attachmentKind = nil
+                            }
+                        )
+                    )
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    if !(ticket.attachmentURL?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) {
+                        Button("Clear Attachment", role: .destructive) {
+                            ticket.attachmentURL = nil
+                            ticket.attachmentName = nil
+                            ticket.attachmentKind = nil
+                        }
+                    }
+                }
+
+                ticketAttachmentPreview
+            }
+
+            Section("Assignment") {
+                if isEditing, canAssignAgents {
+                    Picker(
+                        "Agent",
+                        selection: Binding(
+                            get: { ticket.assignedAgentID ?? "" },
+                            set: { newValue in
+                                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                                if trimmed.isEmpty {
+                                    ticket.assignedAgentID = nil
+                                    ticket.assignedAgentName = nil
+                                } else if let member = availableAgents.first(where: { $0.id == trimmed }) {
+                                    ticket.assignedAgentID = member.id
+                                    ticket.assignedAgentName = member.displayName
+                                }
+                            }
+                        )
+                    ) {
+                        Text("Unassigned").tag("")
+                        ForEach(availableAgents) { member in
+                            Text(member.displayName).tag(member.id)
+                        }
+                    }
+                } else {
+                    Text(ticket.assignedAgentName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? (ticket.assignedAgentName ?? "") : "Unassigned")
+                        .foregroundColor((ticket.assignedAgentName ?? "").isEmpty ? .secondary : .primary)
+                }
+
+                if !isEditing, let currentUser = store.user, ticket.assignedAgentID != currentUser.id {
+                    Button("Assign to Me") {
+                        ticket.assignedAgentID = currentUser.id
+                        ticket.assignedAgentName = currentUser.displayName
+                        ticket.lastUpdatedBy = currentUserLabel
+                        store.saveTicket(ticket)
+                    }
+                }
+            }
+
+            Section("Activity") {
+                if ticket.activity.isEmpty {
+                    Text("No updates yet")
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(ticket.activity.sorted { $0.createdAt > $1.createdAt }) { entry in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(entry.message)
+                            HStack {
+                                if let author = entry.author?.trimmingCharacters(in: .whitespacesAndNewlines), !author.isEmpty {
+                                    Text(author)
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                                Spacer()
+                                Text(entry.createdAt.formatted(date: .abbreviated, time: .shortened))
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+
+            Section {
+                Button(isEditing ? "Save" : "Close") {
+                    if isEditing {
+                        ticket.lastUpdatedBy = currentUserLabel
+                        store.saveTicket(ticket)
+                    }
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .navigationTitle("Ticket")
+        .navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: $showAssetPicker) {
+            AssetTicketPickerView(
+                selectedAssetID: ticket.linkedGearID,
+                onSelect: { item in
+                    ticket.linkedGearID = item.id
+                    ticket.linkedGearName = item.name
+                }
+            )
+            .environmentObject(store)
+        }
+        .toolbar {
+            if store.canUseTickets {
+                ToolbarItemGroup(placement: .navigationBarTrailing) {
+                    if isEditing {
+                        Button("Cancel") {
+                            if let originalTicket {
+                                ticket = originalTicket
+                            }
+                            isEditing = false
+                            originalTicket = nil
+                        }
+                    }
+                    Button(isEditing ? "Done" : "Edit") {
+                        if isEditing {
+                            ticket.lastUpdatedBy = currentUserLabel
+                            store.saveTicket(ticket)
+                            dismiss()
+                        } else {
+                            originalTicket = ticket
+                            isEditing = true
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var currentUserLabel: String {
+        let name = store.user?.displayName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !name.isEmpty { return name }
+        return store.user?.email ?? Auth.auth().currentUser?.email ?? "Unknown User"
+    }
+
+    private var selectedAssetName: String? {
+        let currentName = ticket.linkedGearName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !currentName.isEmpty {
+            return currentName
+        }
+        guard let linkedGearID = ticket.linkedGearID else { return nil }
+        return availableGear.first(where: { $0.id == linkedGearID })?.name
+    }
+
+    private var selectedAssetLabel: String {
+        selectedAssetName ?? "Select Asset"
+    }
+
+    private var hasDueDateBinding: Binding<Bool> {
+        Binding(
+            get: { ticket.dueDate != nil },
+            set: { isEnabled in
+                ticket.dueDate = isEnabled ? (ticket.dueDate ?? Date()) : nil
+            }
+        )
+    }
+
+    private var dueDateBinding: Binding<Date> {
+        Binding(
+            get: { ticket.dueDate ?? Date() },
+            set: { ticket.dueDate = $0 }
+        )
+    }
+
+    @ViewBuilder
+    private var ticketAttachmentPreview: some View {
+        let rawURL = ticket.attachmentURL?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if rawURL.isEmpty {
+            Text("No attachment")
+                .foregroundColor(.secondary)
+        } else if let url = URL(string: rawURL) {
+            Link(destination: url) {
+                Label(
+                    ticket.attachmentName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                        ? (ticket.attachmentName ?? "Open Attachment")
+                        : "Open Attachment",
+                    systemImage: "paperclip"
+                )
+            }
+        } else {
+            Text("Invalid attachment link")
+                .foregroundColor(.secondary)
+        }
+    }
+}
+
+struct CreateTicketView: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject var store: ProdConnectStore
+    @State private var title = ""
+    @State private var detail = ""
+    @State private var campus = ""
+    @State private var room = ""
+    @State private var status: TicketStatus = .new
+    @State private var hasDueDate = false
+    @State private var dueDate = Date()
+    @State private var linkedGearID = ""
+    @State private var assignedAgentID = ""
+    @State private var showAssetPicker = false
+    @State private var attachmentURL: String?
+    @State private var attachmentName: String?
+    @State private var attachmentKind: TicketAttachmentKind?
+
+    var onSave: (SupportTicket) -> Void
+
+    private var availableAgents: [UserProfile] {
+        store.teamMembers
+            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
+    private var availableGear: [GearItem] {
+        store.gear.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private var canSave: Bool {
+        !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                overviewSection
+                statusSection
+                dueDateSection
+                locationSection
+                linkedAssetSection
+                attachmentSection
+                assignmentSection
+                createButtonSection
+            }
+            .navigationTitle("New Ticket")
+            .sheet(isPresented: $showAssetPicker) {
+                AssetTicketPickerView(
+                    selectedAssetID: linkedGearID.isEmpty ? nil : linkedGearID,
+                    onSelect: { item in
+                        linkedGearID = item.id
+                    }
+                )
+                .environmentObject(store)
+            }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+            .onAppear {
+                let assignedCampus = store.user?.assignedCampus.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if campus.isEmpty {
+                    campus = assignedCampus
+                }
+            }
+        }
+    }
+
+    private var selectedAssetLabel: String {
+        availableGear.first(where: { $0.id == linkedGearID })?.name ?? "Select Asset"
+    }
+
+    private var overviewSection: some View {
+        Section("Overview") {
+            TextField("Title", text: $title)
+            TextEditor(text: $detail)
+                .frame(minHeight: 120)
+        }
+    }
+
+    private var statusSection: some View {
+        Section("Status") {
+            Picker("Status", selection: $status) {
+                ForEach(TicketStatus.allCases, id: \.self) { option in
+                    Text(option.rawValue).tag(option)
+                }
+            }
+        }
+    }
+
+    private var dueDateSection: some View {
+        Section("Due Date") {
+            Toggle("Set Due Date", isOn: $hasDueDate)
+            if hasDueDate {
+                DatePicker("Due", selection: $dueDate, displayedComponents: [.date, .hourAndMinute])
+            }
+        }
+    }
+
+    private var locationSection: some View {
+        Section("Location") {
+            if store.locations.isEmpty {
+                TextField("Campus", text: $campus)
+            } else {
+                Picker("Campus", selection: $campus) {
+                    Text("Select campus").tag("")
+                    ForEach(store.locations.sorted(), id: \.self) { option in
+                        Text(option).tag(option)
+                    }
+                }
+            }
+            if store.rooms.isEmpty {
+                TextField("Room", text: $room)
+            } else {
+                Picker("Room", selection: $room) {
+                    Text("Select room").tag("")
+                    ForEach(store.rooms.sorted(), id: \.self) { option in
+                        Text(option).tag(option)
+                    }
+                }
+            }
+        }
+    }
+
+    private var linkedAssetSection: some View {
+        Section("Linked Asset") {
+            Button {
+                showAssetPicker = true
+            } label: {
+                HStack {
+                    Text("Asset")
+                    Spacer()
+                    Text(selectedAssetLabel)
+                        .foregroundColor(linkedGearID.isEmpty ? .secondary : .primary)
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            if !linkedGearID.isEmpty {
+                Button("Clear Asset Link", role: .destructive) {
+                    linkedGearID = ""
+                }
+            }
+        }
+    }
+
+    private var attachmentSection: some View {
+        Section("Attachment") {
+            TextField(
+                "Attachment 1 Link (optional)",
+                text: Binding(
+                    get: { attachmentURL ?? "" },
+                    set: {
+                        attachmentURL = $0
+                        attachmentName = nil
+                        attachmentKind = nil
+                    }
+                )
+            )
+            .keyboardType(.URL)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled(true)
+            ticketAttachmentPreview
+            if !(attachmentURL?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) {
+                Button("Clear Attachment", role: .destructive) {
+                    attachmentURL = nil
+                    attachmentName = nil
+                    attachmentKind = nil
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var assignmentSection: some View {
+        if store.canSeeAllTickets {
+            Section("Assignment") {
+                Picker("Agent", selection: $assignedAgentID) {
+                    Text("Unassigned").tag("")
+                    ForEach(availableAgents) { member in
+                        Text(member.displayName).tag(member.id)
+                    }
+                }
+            }
+        }
+    }
+
+    private var createButtonSection: some View {
+        Section {
+            Button("Create", action: createTicket)
+                .buttonStyle(.borderedProminent)
+                .disabled(!canSave)
+        }
+    }
+
+    private var currentUserLabel: String {
+        let name = store.user?.displayName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !name.isEmpty { return name }
+        return store.user?.email ?? Auth.auth().currentUser?.email ?? "Unknown User"
+    }
+
+    @ViewBuilder
+    private var ticketAttachmentPreview: some View {
+        let rawURL = attachmentURL?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if rawURL.isEmpty {
+            Text("No attachment")
+                .foregroundColor(.secondary)
+        } else if let url = URL(string: rawURL) {
+            Link(destination: url) {
+                Label(
+                    attachmentName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                        ? (attachmentName ?? "Open Attachment")
+                        : "Open Attachment",
+                    systemImage: "paperclip"
+                )
+            }
+        } else {
+            Text("Invalid attachment link")
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private func createTicket() {
+        let activeTeamCode = [
+            store.teamCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+            store.user?.teamCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        ].first(where: { !$0.isEmpty }) ?? ""
+        let linkedGear = availableGear.first(where: { $0.id == linkedGearID })
+        let assignedAgent = availableAgents.first(where: { $0.id == assignedAgentID })
+        var ticket = SupportTicket(
+            title: title.trimmingCharacters(in: .whitespacesAndNewlines),
+            detail: detail.trimmingCharacters(in: .whitespacesAndNewlines),
+            teamCode: activeTeamCode,
+            campus: campus.trimmingCharacters(in: .whitespacesAndNewlines),
+            room: room.trimmingCharacters(in: .whitespacesAndNewlines),
+            status: status,
+            createdBy: store.user?.email ?? Auth.auth().currentUser?.email,
+            createdByUserID: store.user?.id,
+            assignedAgentID: assignedAgent?.id,
+            assignedAgentName: assignedAgent?.displayName,
+            linkedGearID: linkedGear?.id,
+            linkedGearName: linkedGear?.name,
+            dueDate: hasDueDate ? dueDate : nil,
+            lastUpdatedBy: currentUserLabel,
+            attachmentURL: attachmentURL,
+            attachmentName: attachmentName,
+            attachmentKind: attachmentKind
+        )
+        ticket.activity = [
+            TicketActivityEntry(
+                message: "Ticket created",
+                createdAt: ticket.createdAt,
+                author: currentUserLabel
+            )
+        ]
+        onSave(ticket)
+        dismiss()
+    }
+}
+
+private struct AssetTicketPickerView: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var store: ProdConnectStore
+    @State private var searchText = ""
+    @State private var selectedCategory: String?
+    @State private var selectedStatus: GearItem.GearStatus?
+    @State private var selectedLocation: String?
+
+    let selectedAssetID: String?
+    let onSelect: (GearItem) -> Void
+
+    private var availableCategories: [String] {
+        Array(Set(store.gear.map(\.category))).filter { !$0.isEmpty }.sorted()
+    }
+
+    private var availableLocations: [String] {
+        Array(Set(store.gear.map(\.location))).filter { !$0.isEmpty }.sorted()
+    }
+
+    private var filteredAssets: [GearItem] {
+        var result = store.gear
+        if !searchText.isEmpty {
+            result = result.filter {
+                $0.name.localizedCaseInsensitiveContains(searchText) ||
+                $0.category.localizedCaseInsensitiveContains(searchText) ||
+                $0.location.localizedCaseInsensitiveContains(searchText)
+            }
+        }
+        if let selectedCategory {
+            result = result.filter { $0.category == selectedCategory }
+        }
+        if let selectedStatus {
+            result = result.filter { $0.status == selectedStatus }
+        }
+        if let selectedLocation {
+            result = result.filter { $0.location == selectedLocation }
+        }
+        return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                SearchBar(text: $searchText)
+                filterBar
+
+                List {
+                    if filteredAssets.isEmpty {
+                        Text("No assets found")
+                            .foregroundColor(.secondary)
+                    } else {
+                        ForEach(filteredAssets) { item in
+                            Button {
+                                onSelect(item)
+                                dismiss()
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(item.name)
+                                            .foregroundColor(.primary)
+                                        Text(item.category)
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                        if !item.location.isEmpty {
+                                            Text(item.location)
+                                                .font(.caption2)
+                                                .foregroundColor(.secondary)
+                                        }
+                                    }
+                                    Spacer()
+                                    if item.id == selectedAssetID {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundColor(.blue)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                .listStyle(.plain)
+            }
+            .navigationTitle("Select Asset")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private var filterBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 12) {
+                categoryMenu
+                if !availableLocations.isEmpty {
+                    locationMenu
+                }
+                statusMenu
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+        }
+    }
+
+    private var categoryMenu: some View {
+        Menu {
+            Button("Clear") { selectedCategory = nil }
+            Divider()
+            if availableCategories.isEmpty {
+                Text("No categories")
+            } else {
+                ForEach(availableCategories, id: \.self) { category in
+                    Button(category) { selectedCategory = category }
+                }
+            }
+        } label: {
+            filterChip(
+                title: selectedCategory ?? "Category",
+                icon: "line.3.horizontal.decrease.circle",
+                isActive: selectedCategory != nil
+            )
+        }
+    }
+
+    private var locationMenu: some View {
+        Menu {
+            Button("Clear") { selectedLocation = nil }
+            Divider()
+            if availableLocations.isEmpty {
+                Text("No locations")
+            } else {
+                ForEach(availableLocations, id: \.self) { location in
+                    Button(location) { selectedLocation = location }
+                }
+            }
+        } label: {
+            filterChip(
+                title: selectedLocation ?? "Location",
+                icon: "mappin.circle",
+                isActive: selectedLocation != nil
+            )
+        }
+    }
+
+    private var statusMenu: some View {
+        Menu {
+            Button("Clear") { selectedStatus = nil }
+            Divider()
+            ForEach(GearItem.GearStatus.allCases, id: \.self) { status in
+                Button(status.rawValue) { selectedStatus = status }
+            }
+        } label: {
+            filterChip(
+                title: selectedStatus?.rawValue ?? "Status",
+                icon: "checkmark.circle",
+                isActive: selectedStatus != nil
+            )
+        }
+    }
+
+    private func filterChip(title: String, icon: String, isActive: Bool) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+            Text(title).lineLimit(1)
+        }
+        .font(.caption)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(isActive ? Color.blue : Color.gray.opacity(0.3))
+        .foregroundColor(.white)
+        .cornerRadius(8)
+    }
+}
+
 // MARK: - Checklists Views
 
 // ...existing code...
@@ -6936,6 +8031,7 @@ struct ChecklistRunView: View {
     @State private var draftDueDate = Date()
     @State private var isEditingChecklist = false
     @State private var newChecklistItemText = ""
+    @State private var newChecklistItemNotes = ""
     @State private var activeMentionTarget: MentionTarget? = nil
     @State private var activeMentionQuery: String = ""
     var canEdit: Bool { store.canEditChecklists }
@@ -7009,6 +8105,25 @@ struct ChecklistRunView: View {
                                 .buttonStyle(.plain)
                             }
                         }
+                        if canEdit && isEditingChecklist {
+                            TextField("Notes (optional)", text: Binding(
+                                get: { item.notes },
+                                set: { newValue in
+                                    item.notes = newValue
+                                    persistChecklistDraft()
+                                }
+                            ), axis: .vertical)
+                            .lineLimit(2...4)
+                            .padding(.leading, 28)
+                        } else {
+                            let trimmedNotes = item.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !trimmedNotes.isEmpty {
+                                Text(trimmedNotes)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .padding(.leading, 28)
+                            }
+                        }
                         let assignedMembers = mentionedMembers(in: item.text)
                         if !assignedMembers.isEmpty {
                             Text("Assigned to \(assignedMembers.map(displayName(for:)).joined(separator: ", "))")
@@ -7040,19 +8155,24 @@ struct ChecklistRunView: View {
             if canEdit && isEditingChecklist {
                 Section(header: Text("Add Item")) {
                     inlineMentionSuggestions(for: .newItem)
+                    TextField("New checklist item", text: Binding(
+                        get: { newChecklistItemText },
+                        set: { newValue in
+                            newChecklistItemText = newValue
+                            updateMentionContext(for: newValue, target: .newItem)
+                        }
+                    ))
+                    TextField("Notes (optional)", text: $newChecklistItemNotes, axis: .vertical)
+                        .lineLimit(2...4)
                     HStack {
-                        TextField("New checklist item", text: Binding(
-                            get: { newChecklistItemText },
-                            set: { newValue in
-                                newChecklistItemText = newValue
-                                updateMentionContext(for: newValue, target: .newItem)
-                            }
-                        ))
+                        Spacer()
                         Button("Add") {
                             let trimmed = newChecklistItemText.trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !trimmed.isEmpty else { return }
-                            template.items.append(ChecklistItem(text: trimmed))
+                            let trimmedNotes = newChecklistItemNotes.trimmingCharacters(in: .whitespacesAndNewlines)
+                            template.items.append(ChecklistItem(text: trimmed, notes: trimmedNotes))
                             newChecklistItemText = ""
+                            newChecklistItemNotes = ""
                             activeMentionTarget = nil
                             activeMentionQuery = ""
                             persistChecklistDraft()
@@ -7104,6 +8224,7 @@ struct ChecklistRunView: View {
                 draftDueDate = Date()
             }
             newChecklistItemText = ""
+            newChecklistItemNotes = ""
             activeMentionTarget = nil
             activeMentionQuery = ""
         }
@@ -7337,6 +8458,11 @@ struct ChecklistRunView: View {
     }
 
     private func persistChecklistDraft() {
+        template.items = template.items.map { item in
+            var updatedItem = item
+            updatedItem.notes = updatedItem.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+            return updatedItem
+        }
         updateChecklistCompletionMetadata()
         store.saveChecklist(template)
     }
@@ -9080,7 +10206,7 @@ struct MainTabView: View {
                                     }
                                 }
                             }
-                            .navigationTitle("Gear")
+                            .navigationTitle("Assets")
                             .toolbar {
                                 ToolbarItemGroup(placement: .navigationBarTrailing) {
                                     Button(action: exportGear) {
@@ -9202,7 +10328,7 @@ struct MainTabView: View {
     }
 
     private var canSeeChatTab: Bool {
-        isPrivilegedUser || store.user?.canSeeChat == true
+        (store.user?.hasChatAndTrainingFeatures ?? false) && (isPrivilegedUser || store.user?.canSeeChat == true)
     }
 
     private var canSeePatchsheetTab: Bool {
@@ -9210,7 +10336,7 @@ struct MainTabView: View {
     }
 
     private var canSeeTrainingMainTab: Bool {
-        isPrivilegedUser || store.user?.canSeeTraining == true
+        (store.user?.hasChatAndTrainingFeatures ?? false) && (isPrivilegedUser || store.user?.canSeeTraining == true)
     }
 
     private var canSeeGearTab: Bool {
@@ -9269,7 +10395,7 @@ struct MainTabView: View {
             if canSeeGearTab {
                 GearTabView()
                     .tabItem {
-                        Label("Gear", systemImage: "shippingbox")
+                        Label("Assets", systemImage: "shippingbox")
                     }
             }
             MoreTabView()
@@ -9302,6 +10428,10 @@ struct MoreTabView: View {
         isPrivilegedUser || store.user?.canSeeChecklists == true
     }
 
+    private var canSeeTickets: Bool {
+        store.canUseTickets
+    }
+
     private var canManageUsers: Bool {
         isPrivilegedUser
     }
@@ -9321,6 +10451,13 @@ struct MoreTabView: View {
                         IdeasListView()
                     } label: {
                         Text("Ideas")
+                    }
+                }
+                if canSeeTickets {
+                    NavigationLink {
+                        TicketsListView()
+                    } label: {
+                        Text("Tickets")
                     }
                 }
                 if canSeeCustomize {

@@ -64,6 +64,7 @@ final class ProdConnectStore: ObservableObject {
     private var teamMembersListener: ListenerRegistration?
     private var checklistsListener: ListenerRegistration?
     private var ideasListener: ListenerRegistration?
+    private var ticketsListener: ListenerRegistration?
     private var channelsListener: ListenerRegistration?
     private var lessonsListener: ListenerRegistration?
     private var gearListener: ListenerRegistration?
@@ -72,6 +73,8 @@ final class ProdConnectStore: ObservableObject {
     private var authStateListener: AuthStateDidChangeListenerHandle?
     private var hasInitializedChannelsSnapshot = false
     private var activeChatChannelID: String?
+    private var hasPrimedTicketAssignmentState = false
+    private var ticketAssignedToCurrentUserIDs: Set<String> = []
 
     @Published var gear: [GearItem] = []
     @Published var patchsheet: [PatchRow] = []
@@ -79,6 +82,7 @@ final class ProdConnectStore: ObservableObject {
     @Published var lessons: [TrainingLesson] = []
     @Published var checklists: [ChecklistTemplate] = []
     @Published var ideas: [IdeaCard] = []
+    @Published var tickets: [SupportTicket] = []
     @Published var channels: [ChatChannel] = []
     @Published var teamMembers: [UserProfile] = []
     @Published var locations: [String] = []
@@ -89,11 +93,11 @@ final class ProdConnectStore: ObservableObject {
     }
     var canSeeChat: Bool {
         guard let user else { return false }
-        return user.isAdmin || user.isOwner || user.canSeeChat
+        return user.hasChatAndTrainingFeatures && (user.isAdmin || user.isOwner || user.canSeeChat)
     }
     var canSeeTrainingTab: Bool {
         guard let user else { return false }
-        return user.isAdmin || user.isOwner || user.canSeeTraining
+        return user.hasChatAndTrainingFeatures && (user.isAdmin || user.isOwner || user.canSeeTraining)
     }
     var canEditGear: Bool {
         guard let user else { return false }
@@ -106,6 +110,53 @@ final class ProdConnectStore: ObservableObject {
     var canEditChecklists: Bool {
         guard let user else { return false }
         return user.isAdmin || user.isOwner || user.canEditChecklists
+    }
+    var teamHasTicketing: Bool {
+        if user?.hasTicketingFeatures == true { return true }
+        return teamMembers.contains { $0.hasTicketingFeatures }
+    }
+    var canUseTickets: Bool {
+        guard let user else { return false }
+        return teamHasTicketing && (user.isAdmin || user.isOwner || user.canSeeTickets)
+    }
+    var canSeeAllTickets: Bool {
+        guard let user else { return false }
+        if user.isAdmin || user.isOwner {
+            return true
+        }
+        let assignedCampus = user.assignedCampus.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !assignedCampus.isEmpty {
+            return false
+        }
+        return user.isTicketAgent
+    }
+    var visibleTickets: [SupportTicket] {
+        guard canUseTickets, let user else { return [] }
+
+        let scopedTickets: [SupportTicket]
+        if canSeeAllTickets {
+            scopedTickets = tickets
+        } else {
+            let assignedCampus = user.assignedCampus.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !assignedCampus.isEmpty {
+                scopedTickets = tickets.filter {
+                    $0.campus.trimmingCharacters(in: .whitespacesAndNewlines)
+                        .caseInsensitiveCompare(assignedCampus) == .orderedSame
+                }
+            } else {
+                let userID = user.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                let email = user.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                scopedTickets = tickets.filter { ticket in
+                    let ticketCreatorEmail = ticket.createdBy?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+                    let ticketCreatorID = ticket.createdByUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    let assignedAgentID = ticket.assignedAgentID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    return (!userID.isEmpty && (ticketCreatorID == userID || assignedAgentID == userID))
+                        || (!email.isEmpty && ticketCreatorEmail == email)
+                }
+            }
+        }
+
+        return scopedTickets.sorted { $0.updatedAt > $1.updatedAt }
     }
     @Published var isAdmin = false
     @Published var teamCode: String?
@@ -248,12 +299,14 @@ final class ProdConnectStore: ObservableObject {
                         canEditGear: data["canEditGear"] as? Bool ?? false,
                         canEditIdeas: data["canEditIdeas"] as? Bool ?? false,
                         canEditChecklists: data["canEditChecklists"] as? Bool ?? false,
+                        isTicketAgent: data["isTicketAgent"] as? Bool ?? false,
                         canSeeChat: data["canSeeChat"] as? Bool ?? true,
                         canSeePatchsheet: data["canSeePatchsheet"] as? Bool ?? true,
                         canSeeTraining: data["canSeeTraining"] as? Bool ?? true,
                         canSeeGear: data["canSeeGear"] as? Bool ?? true,
                         canSeeIdeas: data["canSeeIdeas"] as? Bool ?? true,
-                        canSeeChecklists: data["canSeeChecklists"] as? Bool ?? true
+                        canSeeChecklists: data["canSeeChecklists"] as? Bool ?? true,
+                        canSeeTickets: data["canSeeTickets"] as? Bool ?? true
                     )
                 } else {
                     // Backfill a profile doc for existing auth users missing Firestore user data.
@@ -279,15 +332,28 @@ final class ProdConnectStore: ObservableObject {
             }
 
             let uid = result?.user.uid ?? UUID().uuidString
+            let normalizedTeamCode = teamCode?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let hasTeamCode = normalizedTeamCode?.isEmpty == false
+            let subscriptionTier = (hasTeamCode || isAdmin) ? "basic" : "free"
+            let canUseChatAndTraining = subscriptionTier != "free"
             let profile = UserProfile(
                 id: uid,
                 displayName: email.components(separatedBy: "@").first ?? "User",
                 email: email,
-                teamCode: teamCode,
-                isAdmin: isAdmin
+                teamCode: normalizedTeamCode,
+                isAdmin: isAdmin,
+                subscriptionTier: subscriptionTier,
+                canEditPatchsheet: subscriptionTier != "free",
+                canEditTraining: subscriptionTier != "free",
+                canEditGear: subscriptionTier != "free",
+                canEditIdeas: subscriptionTier != "free",
+                canEditChecklists: subscriptionTier != "free",
+                canSeeChat: canUseChatAndTraining,
+                canSeeTraining: canUseChatAndTraining,
+                canSeeTickets: false
             )
             self.user = profile
-            self.teamCode = teamCode
+            self.teamCode = normalizedTeamCode
             self.isAdmin = isAdmin
             self.save(profile, collection: "users", id: uid)
             self.pushLogin(email)
@@ -304,6 +370,7 @@ final class ProdConnectStore: ObservableObject {
         teamMembersListener?.remove()
         checklistsListener?.remove()
         ideasListener?.remove()
+        ticketsListener?.remove()
         channelsListener?.remove()
         lessonsListener?.remove()
         gearListener?.remove()
@@ -315,6 +382,7 @@ final class ProdConnectStore: ObservableObject {
         lessons = []
         checklists = []
         ideas = []
+        tickets = []
         channels = []
         teamMembers = []
         locations = []
@@ -323,6 +391,8 @@ final class ProdConnectStore: ObservableObject {
         isAdmin = false
         activeChatChannelID = nil
         hasInitializedChannelsSnapshot = false
+        hasPrimedTicketAssignmentState = false
+        ticketAssignedToCurrentUserIDs = []
     }
 
     private func restoreSession(for authUser: FirebaseAuth.User) {
@@ -364,12 +434,14 @@ final class ProdConnectStore: ObservableObject {
                     canEditGear: data["canEditGear"] as? Bool ?? false,
                     canEditIdeas: data["canEditIdeas"] as? Bool ?? false,
                     canEditChecklists: data["canEditChecklists"] as? Bool ?? false,
+                    isTicketAgent: data["isTicketAgent"] as? Bool ?? false,
                     canSeeChat: data["canSeeChat"] as? Bool ?? true,
                     canSeePatchsheet: data["canSeePatchsheet"] as? Bool ?? true,
                     canSeeTraining: data["canSeeTraining"] as? Bool ?? true,
                     canSeeGear: data["canSeeGear"] as? Bool ?? true,
                     canSeeIdeas: data["canSeeIdeas"] as? Bool ?? true,
-                    canSeeChecklists: data["canSeeChecklists"] as? Bool ?? true
+                    canSeeChecklists: data["canSeeChecklists"] as? Bool ?? true,
+                    canSeeTickets: data["canSeeTickets"] as? Bool ?? true
                 )
             } else {
                 profile = fallbackProfile
@@ -392,6 +464,7 @@ final class ProdConnectStore: ObservableObject {
         teamMembersListener?.remove()
         checklistsListener?.remove()
         ideasListener?.remove()
+        ticketsListener?.remove()
         channelsListener?.remove()
         lessonsListener?.remove()
         gearListener?.remove()
@@ -405,6 +478,9 @@ final class ProdConnectStore: ObservableObject {
             }
             locations = []
             rooms = []
+            tickets = []
+            hasPrimedTicketAssignmentState = false
+            ticketAssignedToCurrentUserIDs = []
             return
         }
 
@@ -446,6 +522,21 @@ final class ProdConnectStore: ObservableObject {
                 }
                 DispatchQueue.main.async {
                     self.ideas = values
+                }
+            }
+
+        ticketsListener = queryForUsersTeamCode(collection: "tickets", code: code)
+            .addSnapshotListener { snapshot, _ in
+                guard let docs = snapshot?.documents else { return }
+                let values: [SupportTicket] = docs.compactMap { doc in
+                    var data = doc.data()
+                    data["id"] = doc.documentID
+                    return self.decodeDocument(data, as: SupportTicket.self)
+                }
+                DispatchQueue.main.async {
+                    self.processTicketAssignmentNotifications(with: values)
+                    self.tickets = values
+                    self.refreshGearTicketState()
                 }
             }
 
@@ -584,6 +675,58 @@ final class ProdConnectStore: ObservableObject {
         UNUserNotificationCenter.current().add(request)
     }
 
+    private func processTicketAssignmentNotifications(with tickets: [SupportTicket]) {
+        guard let currentUser = user else { return }
+
+        let currentUserID = currentUser.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentName = currentUser.displayName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let currentAssignedIDs = Set(
+            tickets.compactMap { ticket in
+                let assignedID = ticket.assignedAgentID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if !currentUserID.isEmpty, assignedID == currentUserID {
+                    return ticket.id
+                }
+
+                let assignedName = ticket.assignedAgentName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+                if !currentName.isEmpty, assignedName == currentName {
+                    return ticket.id
+                }
+
+                return nil
+            }
+        )
+
+        guard hasPrimedTicketAssignmentState else {
+            ticketAssignedToCurrentUserIDs = currentAssignedIDs
+            hasPrimedTicketAssignmentState = true
+            return
+        }
+
+        let newlyAssignedIDs = currentAssignedIDs.subtracting(ticketAssignedToCurrentUserIDs)
+        for ticketID in newlyAssignedIDs {
+            guard let ticket = tickets.first(where: { $0.id == ticketID }) else { continue }
+            scheduleTicketAssignmentNotification(for: ticket)
+        }
+
+        ticketAssignedToCurrentUserIDs = currentAssignedIDs
+    }
+
+    private func scheduleTicketAssignmentNotification(for ticket: SupportTicket) {
+        let content = UNMutableNotificationContent()
+        content.title = "Ticket Assigned"
+        let trimmedTitle = ticket.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        content.body = trimmedTitle.isEmpty ? "A ticket was assigned to you." : "\"\(trimmedTitle)\" was assigned to you."
+        content.sound = .default
+        content.userInfo = ["ticketId": ticket.id]
+
+        let request = UNNotificationRequest(
+            identifier: "ticket-assigned-\(ticket.id)-\(Int(ticket.updatedAt.timeIntervalSince1970))",
+            content: content,
+            trigger: UNTimeIntervalNotificationTrigger(timeInterval: 0.2, repeats: false)
+        )
+        UNUserNotificationCenter.current().add(request)
+    }
+
     func listenToTeamMembers() {
         teamMembersListener?.remove()
         guard let code = teamCode, !code.isEmpty else { return }
@@ -638,6 +781,134 @@ final class ProdConnectStore: ObservableObject {
     }
     func saveChecklist(_ item: ChecklistTemplate) { save(item, collection: "checklists", id: item.id) }
     func saveIdea(_ item: IdeaCard) { save(item, collection: "ideas", id: item.id) }
+    func saveTicket(_ item: SupportTicket) {
+        var ticket = item
+        let now = Date()
+        let existingTicket = tickets.first(where: { $0.id == ticket.id })
+        let activeTeamCode = ensureActiveTeamCodeForTicketing() ?? ticket.teamCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+
+        ticket.title = ticket.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        ticket.detail = ticket.detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !activeTeamCode.isEmpty {
+            ticket.teamCode = activeTeamCode
+        } else {
+            print("Ticket save skipped: no active team code available")
+            return
+        }
+        ticket.campus = ticket.campus.trimmingCharacters(in: .whitespacesAndNewlines)
+        ticket.room = ticket.room.trimmingCharacters(in: .whitespacesAndNewlines)
+        ticket.assignedAgentID = ticket.assignedAgentID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        ticket.assignedAgentName = ticket.assignedAgentName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        ticket.linkedGearID = ticket.linkedGearID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        ticket.linkedGearName = ticket.linkedGearName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if ticket.createdAt.timeIntervalSince1970 <= 0 {
+            ticket.createdAt = now
+        }
+        ticket.updatedAt = now
+
+        if ticket.status == .resolved {
+            ticket.resolvedAt = ticket.resolvedAt ?? now
+        } else {
+            ticket.resolvedAt = nil
+        }
+
+        var activity = existingTicket?.activity ?? ticket.activity
+        if let existingTicket {
+            if existingTicket.status != ticket.status {
+                activity.append(
+                    TicketActivityEntry(
+                        message: "Status changed to \(ticket.status.rawValue)",
+                        createdAt: now,
+                        author: ticket.lastUpdatedBy
+                    )
+                )
+            }
+            if existingTicket.assignedAgentID != ticket.assignedAgentID {
+                let assignee = ticket.assignedAgentName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let message = assignee.isEmpty ? "Agent cleared" : "Assigned to \(assignee)"
+                activity.append(
+                    TicketActivityEntry(
+                        message: message,
+                        createdAt: now,
+                        author: ticket.lastUpdatedBy
+                    )
+                )
+            }
+            if existingTicket.linkedGearID != ticket.linkedGearID {
+                let gearName = ticket.linkedGearName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let message = gearName.isEmpty ? "Gear link removed" : "Linked gear: \(gearName)"
+                activity.append(
+                    TicketActivityEntry(
+                        message: message,
+                        createdAt: now,
+                        author: ticket.lastUpdatedBy
+                    )
+                )
+            }
+        } else {
+            activity.append(
+                TicketActivityEntry(
+                    message: "Ticket created",
+                    createdAt: now,
+                    author: ticket.createdBy
+                )
+            )
+        }
+        ticket.activity = Array(activity.suffix(25))
+
+        save(ticket, collection: "tickets", id: ticket.id)
+        if !ticket.room.isEmpty {
+            saveRoom(ticket.room)
+        }
+        if let index = tickets.firstIndex(where: { $0.id == ticket.id }) {
+            tickets[index] = ticket
+        } else {
+            tickets.append(ticket)
+        }
+        refreshGearTicketState()
+    }
+
+    private func ensureActiveTeamCodeForTicketing() -> String? {
+        let storeTeamCode = teamCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let userTeamCode = user?.teamCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if let existing = [storeTeamCode, userTeamCode].first(where: { !$0.isEmpty }) {
+            let normalized = existing.uppercased()
+            if teamCode?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() != normalized {
+                teamCode = normalized
+            }
+            if user?.teamCode?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() != normalized {
+                user?.teamCode = normalized
+            }
+            return normalized
+        }
+
+        guard var currentUser = user, currentUser.isAdmin || currentUser.isOwner else {
+            return nil
+        }
+
+        let generatedCode = generateTeamCode()
+        currentUser.teamCode = generatedCode
+        user = currentUser
+        teamCode = generatedCode
+
+        let uid = Auth.auth().currentUser?.uid ?? currentUser.id
+        db.collection("users").document(uid).setData([
+            "teamCode": generatedCode,
+            "isAdmin": currentUser.isAdmin,
+            "isOwner": currentUser.isOwner
+        ], merge: true)
+        db.collection("teams").document(generatedCode).setData([
+            "code": generatedCode,
+            "createdAt": FieldValue.serverTimestamp(),
+            "createdBy": currentUser.email,
+            "isActive": true,
+            "ownerId": currentUser.isOwner ? currentUser.id : (currentUser.isAdmin ? currentUser.id : ""),
+            "ownerEmail": currentUser.isOwner ? currentUser.email : (currentUser.isAdmin ? currentUser.email : "")
+        ], merge: true)
+        listenToTeamData()
+        listenToTeamMembers()
+        return generatedCode
+    }
     func deletePatch(_ item: PatchRow) {
         db.collection("patchsheet").document(item.id).delete()
         patchsheet.removeAll { $0.id == item.id }
@@ -649,6 +920,11 @@ final class ProdConnectStore: ObservableObject {
     func deleteIdea(_ item: IdeaCard) {
         db.collection("ideas").document(item.id).delete()
         ideas.removeAll { $0.id == item.id }
+    }
+    func deleteTicket(_ item: SupportTicket) {
+        db.collection("tickets").document(item.id).delete()
+        tickets.removeAll { $0.id == item.id }
+        refreshGearTicketState()
     }
     func saveChannel(_ item: ChatChannel) {
         save(item, collection: "channels", id: item.id)
@@ -783,7 +1059,8 @@ final class ProdConnectStore: ObservableObject {
                 ("gear", "location"),
                 ("gear", "campus"),
                 ("patchsheet", "campus"),
-                ("users", "assignedCampus")
+                ("users", "assignedCampus"),
+                ("tickets", "campus")
             ]
 
             for (collection, field) in tasks {
@@ -813,6 +1090,11 @@ final class ProdConnectStore: ObservableObject {
                 self.teamMembers = self.teamMembers.map { member in
                     var updated = member
                     if updated.assignedCampus.caseInsensitiveCompare(oldTrimmed) == .orderedSame { updated.assignedCampus = newTrimmed }
+                    return updated
+                }
+                self.tickets = self.tickets.map { ticket in
+                    var updated = ticket
+                    if updated.campus.caseInsensitiveCompare(oldTrimmed) == .orderedSame { updated.campus = newTrimmed }
                     return updated
                 }
                 if self.user?.assignedCampus.caseInsensitiveCompare(oldTrimmed) == .orderedSame {
@@ -858,5 +1140,46 @@ final class ProdConnectStore: ObservableObject {
     func replaceAllPatch(_ rows: [PatchRow]) {
         patchsheet = rows
         rows.forEach(savePatch)
+    }
+
+    private func refreshGearTicketState() {
+        guard !gear.isEmpty else { return }
+
+        var updatedGear = gear
+        var hasChanges = false
+        for index in updatedGear.indices {
+            var item = updatedGear[index]
+            let linkedTickets = tickets
+                .filter { $0.linkedGearID == item.id }
+                .sorted { $0.updatedAt > $1.updatedAt }
+
+            let newActiveIDs = linkedTickets
+                .filter { $0.status != .resolved }
+                .map(\.id)
+
+            let newHistory = linkedTickets.map {
+                GearTicketHistoryEntry(
+                    ticketID: $0.id,
+                    ticketTitle: $0.title,
+                    status: $0.status,
+                    campus: $0.campus,
+                    room: $0.room,
+                    updatedAt: $0.updatedAt,
+                    resolvedAt: $0.resolvedAt
+                )
+            }
+
+            if item.activeTicketIDs != newActiveIDs || item.ticketHistory != newHistory {
+                item.activeTicketIDs = newActiveIDs
+                item.ticketHistory = newHistory
+                updatedGear[index] = item
+                save(item, collection: "gear", id: item.id)
+                hasChanges = true
+            }
+        }
+
+        if hasChanges {
+            gear = updatedGear
+        }
     }
 }
