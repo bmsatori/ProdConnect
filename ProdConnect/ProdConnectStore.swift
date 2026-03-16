@@ -1,9 +1,12 @@
 import Foundation
 import SwiftUI
 import Combine
-import FirebaseFirestore
+@preconcurrency import FirebaseFirestore
+#if canImport(FirebaseFirestoreInternal)
+@preconcurrency import FirebaseFirestoreInternal
+#endif
 import FirebaseStorage
-import FirebaseAuth
+@preconcurrency import FirebaseAuth
 #if canImport(OneSignalFramework)
 import OneSignalFramework
 #endif
@@ -16,6 +19,12 @@ import AppKit
 
 @MainActor
 final class ProdConnectStore: ObservableObject {
+    struct ChecklistNotificationNotice: Identifiable {
+        let id: String
+        let checklist: ChecklistTemplate
+        let item: ChecklistItem
+    }
+
     private func pushLogin(_ externalID: String) {
         #if canImport(OneSignalFramework)
         OneSignal.login(externalID)
@@ -38,7 +47,7 @@ final class ProdConnectStore: ObservableObject {
         #endif
     }
 
-    private func deleteStorageObject(forDownloadURL urlString: String?) {
+    nonisolated private func deleteStorageObject(forDownloadURL urlString: String?) {
         guard let raw = urlString?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return }
         guard raw.hasPrefix("gs://") || raw.contains("firebasestorage.googleapis.com") || raw.contains("storage.googleapis.com") else {
             return
@@ -50,14 +59,59 @@ final class ProdConnectStore: ObservableObject {
         }
     }
 
-        // Add deleteGear method for compatibility
-        func deleteGear(items: [GearItem]) {
-            for item in items {
-                deleteStorageObject(forDownloadURL: item.imageURL)
-                db.collection("gear").document(item.id).delete()
-            }
-            gear.removeAll { g in items.contains(where: { $0.id == g.id }) }
+    private func deleteGearDocuments(ids: [String], completion: (() -> Void)? = nil) {
+        let cleanedIDs = Array(Set(ids.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })).filter { !$0.isEmpty }
+        guard !cleanedIDs.isEmpty else {
+            completion?()
+            return
         }
+
+        let chunkSize = 400
+        let chunks = stride(from: 0, to: cleanedIDs.count, by: chunkSize).map {
+            Array(cleanedIDs[$0..<min($0 + chunkSize, cleanedIDs.count)])
+        }
+
+        func commitChunk(index: Int) {
+            guard index < chunks.count else {
+                completion?()
+                return
+            }
+
+            let batch = db.batch()
+            for id in chunks[index] {
+                batch.deleteDocument(db.collection("gear").document(id))
+            }
+            batch.commit { error in
+                if let error {
+                    print("Error deleting gear batch:", error.localizedDescription)
+                }
+                Task { @MainActor in
+                    commitChunk(index: index + 1)
+                }
+            }
+        }
+
+        commitChunk(index: 0)
+    }
+
+    // Add deleteGear method for compatibility
+    func deleteGear(items: [GearItem]) {
+        let ids = Set(items.map(\.id))
+        guard !ids.isEmpty else { return }
+
+        DispatchQueue.main.async {
+            self.gear.removeAll { ids.contains($0.id) }
+        }
+
+        let imageURLs = items.map(\.imageURL)
+        DispatchQueue.global(qos: .utility).async {
+            for url in imageURLs {
+                self.deleteStorageObject(forDownloadURL: url)
+            }
+        }
+
+        deleteGearDocuments(ids: Array(ids))
+    }
     static let shared = ProdConnectStore()
 
     let db = Firestore.firestore()
@@ -71,10 +125,12 @@ final class ProdConnectStore: ObservableObject {
     private var locationsListener: ListenerRegistration?
     private var roomsListener: ListenerRegistration?
     private var authStateListener: AuthStateDidChangeListenerHandle?
+    private var activeTeamListenersCode: String?
     private var hasInitializedChannelsSnapshot = false
     private var activeChatChannelID: String?
     private var hasPrimedTicketAssignmentState = false
     private var ticketAssignedToCurrentUserIDs: Set<String> = []
+    private let userDefaults = UserDefaults.standard
 
     @Published var gear: [GearItem] = []
     @Published var patchsheet: [PatchRow] = []
@@ -87,6 +143,9 @@ final class ProdConnectStore: ObservableObject {
     @Published var teamMembers: [UserProfile] = []
     @Published var locations: [String] = []
     @Published var rooms: [String] = []
+    @Published private var seenChatMessageIDsByChannel: [String: String] = [:]
+    @Published private var seenTicketUpdateTokens: [String: TimeInterval] = [:]
+    @Published private var seenChecklistNotificationIDs: Set<String> = []
     var canEditPatchsheet: Bool {
         guard let user else { return false }
         return user.isAdmin || user.isOwner || user.canEditPatchsheet
@@ -124,11 +183,10 @@ final class ProdConnectStore: ObservableObject {
         if user.isAdmin || user.isOwner {
             return true
         }
-        let assignedCampus = user.assignedCampus.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !assignedCampus.isEmpty {
-            return false
+        if user.isTicketAgent {
+            return true
         }
-        return user.isTicketAgent
+        return false
     }
     var visibleTickets: [SupportTicket] {
         guard canUseTickets, let user else { return [] }
@@ -158,6 +216,65 @@ final class ProdConnectStore: ObservableObject {
 
         return scopedTickets.sorted { $0.updatedAt > $1.updatedAt }
     }
+
+    var notificationIncomingChannels: [ChatChannel] {
+        guard let currentEmail = user?.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !currentEmail.isEmpty else { return [] }
+
+        return channels
+            .filter { channel in
+                guard let last = channel.messages.last else { return false }
+                let messageID = last.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !messageID.isEmpty else { return false }
+                guard last.author.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != currentEmail else {
+                    return false
+                }
+                return seenChatMessageIDsByChannel[channel.id] != messageID
+            }
+            .sorted { lhs, rhs in
+                let leftDate = lhs.lastMessageAt ?? lhs.messages.last?.timestamp ?? .distantPast
+                let rightDate = rhs.lastMessageAt ?? rhs.messages.last?.timestamp ?? .distantPast
+                return leftDate > rightDate
+            }
+    }
+
+    var notificationAssignedTickets: [SupportTicket] {
+        guard let currentUser = user else { return [] }
+
+        let currentUserID = currentUser.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentName = currentUser.displayName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        return tickets
+            .filter { ticket in
+                let assignedID = ticket.assignedAgentID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let assignedName = ticket.assignedAgentName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+                let isAssigned = (!currentUserID.isEmpty && assignedID == currentUserID)
+                    || (!currentName.isEmpty && assignedName == currentName)
+                guard isAssigned else { return false }
+                return seenTicketUpdateTokens[ticket.id] != ticket.updatedAt.timeIntervalSince1970
+            }
+            .sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    var checklistNotificationNotices: [ChecklistNotificationNotice] {
+        guard let currentUser = user else { return [] }
+
+        return checklists
+            .flatMap { checklist in
+                checklist.items.compactMap { item in
+                    guard item.completedAt == nil, checklistItemMentionsCurrentUser(item.text, user: currentUser) else {
+                        return nil
+                    }
+                    let noticeID = "\(checklist.id)-\(item.id)"
+                    guard !seenChecklistNotificationIDs.contains(noticeID) else { return nil }
+                    return ChecklistNotificationNotice(id: noticeID, checklist: checklist, item: item)
+                }
+            }
+    }
+
+    var notificationBadgeCount: Int {
+        notificationIncomingChannels.count + notificationAssignedTickets.count + checklistNotificationNotices.count
+    }
     @Published var isAdmin = false
     @Published var teamCode: String?
 
@@ -168,6 +285,7 @@ final class ProdConnectStore: ObservableObject {
             guard let authUser else {
                 Task { @MainActor in
                     self.user = nil
+                    self.resetNotificationState()
                 }
                 return
             }
@@ -225,7 +343,7 @@ final class ProdConnectStore: ObservableObject {
         }
     }
 
-    private func teamCodeVariants(for rawCode: String) -> [String] {
+    nonisolated private func teamCodeVariants(for rawCode: String) -> [String] {
         let trimmed = rawCode.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
         var variants: [String] = [trimmed]
@@ -245,6 +363,160 @@ final class ProdConnectStore: ObservableObject {
             return db.collection(collection).whereField("teamCode", isEqualTo: first)
         }
         return db.collection(collection).whereField("teamCode", in: variants)
+    }
+
+    nonisolated private func invalidTeamCodeError() -> NSError {
+        NSError(
+            domain: "InvalidTeamCode",
+            code: 0,
+            userInfo: [NSLocalizedDescriptionKey: "Team code does not exist."]
+        )
+    }
+
+    private func resolveSignUpTeamCode(_ rawCode: String, completion: @escaping (Result<String, Error>) -> Void) {
+        let trimmed = rawCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = trimmed.uppercased()
+        let variants = teamCodeVariants(for: trimmed)
+        let db = self.db
+        guard normalized.range(of: "^[A-Z0-9]{6}$", options: .regularExpression) != nil else {
+            completion(.failure(invalidTeamCodeError()))
+            return
+        }
+
+        db.collection("teams").document(normalized).getDocument { snapshot, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+
+            if let snapshot, snapshot.exists, snapshot.data()?["isActive"] as? Bool != false {
+                let resolvedCode = (snapshot.data()?["code"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .uppercased()
+                completion(.success(resolvedCode?.isEmpty == false ? resolvedCode! : normalized))
+                return
+            }
+
+            let query: Query
+            if variants.count == 1, let only = variants.first {
+                query = db.collection("teams").whereField("code", isEqualTo: only)
+            } else {
+                query = db.collection("teams").whereField("code", in: variants)
+            }
+
+            query.limit(to: 1).getDocuments { snapshot, error in
+                if let error {
+                    completion(.failure(error))
+                    return
+                }
+
+                guard let doc = snapshot?.documents.first else {
+                    completion(.failure(self.invalidTeamCodeError()))
+                    return
+                }
+
+                if doc.data()["isActive"] as? Bool == false {
+                    completion(.failure(self.invalidTeamCodeError()))
+                    return
+                }
+
+                let resolvedCode = (doc.data()["code"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .uppercased()
+                completion(.success(resolvedCode?.isEmpty == false ? resolvedCode! : doc.documentID.uppercased()))
+            }
+        }
+    }
+
+    private func notificationDefaultsKey(_ suffix: String, userID: String) -> String {
+        "prodconnect.notifications.\(suffix).\(userID)"
+    }
+
+    private func loadNotificationState(for userID: String) {
+        guard !userID.isEmpty else {
+            resetNotificationState()
+            return
+        }
+
+        seenChatMessageIDsByChannel =
+            (userDefaults.dictionary(forKey: notificationDefaultsKey("chat", userID: userID)) as? [String: String]) ?? [:]
+        seenTicketUpdateTokens =
+            (userDefaults.dictionary(forKey: notificationDefaultsKey("tickets", userID: userID)) as? [String: Double]) ?? [:]
+        seenChecklistNotificationIDs = Set(
+            (userDefaults.array(forKey: notificationDefaultsKey("checklists", userID: userID)) as? [String]) ?? []
+        )
+    }
+
+    private func persistNotificationState() {
+        guard let userID = user?.id.trimmingCharacters(in: .whitespacesAndNewlines), !userID.isEmpty else { return }
+        userDefaults.set(seenChatMessageIDsByChannel, forKey: notificationDefaultsKey("chat", userID: userID))
+        userDefaults.set(seenTicketUpdateTokens, forKey: notificationDefaultsKey("tickets", userID: userID))
+        userDefaults.set(Array(seenChecklistNotificationIDs), forKey: notificationDefaultsKey("checklists", userID: userID))
+    }
+
+    private func resetNotificationState() {
+        seenChatMessageIDsByChannel = [:]
+        seenTicketUpdateTokens = [:]
+        seenChecklistNotificationIDs = []
+    }
+
+    func markAllNotificationsSeen() {
+        for channel in notificationIncomingChannels {
+            guard let messageID = channel.messages.last?.id.trimmingCharacters(in: .whitespacesAndNewlines), !messageID.isEmpty else {
+                continue
+            }
+            seenChatMessageIDsByChannel[channel.id] = messageID
+        }
+
+        for ticket in notificationAssignedTickets {
+            seenTicketUpdateTokens[ticket.id] = ticket.updatedAt.timeIntervalSince1970
+        }
+
+        for notice in checklistNotificationNotices {
+            seenChecklistNotificationIDs.insert(notice.id)
+        }
+
+        persistNotificationState()
+        clearDeliveredNotifications()
+    }
+
+    private func clearDeliveredNotifications() {
+        UNUserNotificationCenter.current().removeAllDeliveredNotifications()
+        #if canImport(UIKit)
+        UIApplication.shared.applicationIconBadgeNumber = 0
+        #elseif canImport(AppKit)
+        NSApplication.shared.dockTile.badgeLabel = nil
+        #endif
+    }
+
+    private func checklistItemMentionsCurrentUser(_ text: String, user: UserProfile) -> Bool {
+        let tags = mentionTokens(in: text)
+        return !mentionMatchTokens(for: user).isDisjoint(with: tags)
+    }
+
+    private func mentionTokens(in text: String) -> Set<String> {
+        let pattern = "(?<!\\S)@([A-Za-z0-9._-]+)"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(text.startIndex..., in: text)
+        return Set(regex.matches(in: text, options: [], range: range).compactMap {
+            guard $0.numberOfRanges > 1, let tokenRange = Range($0.range(at: 1), in: text) else { return nil }
+            return String(text[tokenRange]).lowercased()
+        })
+    }
+
+    private func mentionMatchTokens(for user: UserProfile) -> Set<String> {
+        var tokens: Set<String> = []
+        let email = user.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let localPart = email.split(separator: "@").first, !localPart.isEmpty {
+            tokens.insert(String(localPart))
+        }
+        let name = user.displayName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !name.isEmpty {
+            tokens.insert(name.replacingOccurrences(of: " ", with: ""))
+            tokens.insert(name.replacingOccurrences(of: " ", with: "."))
+            tokens.insert(name.replacingOccurrences(of: " ", with: "_"))
+        }
+        return tokens
     }
 
     func signIn(email: String, password: String, completion: @escaping (Result<Void, Error>) -> Void) {
@@ -272,6 +544,7 @@ final class ProdConnectStore: ObservableObject {
                 self.user = fallbackProfile
                 self.teamCode = fallbackProfile.teamCode
                 self.isAdmin = fallbackProfile.isAdmin
+                self.loadNotificationState(for: fallbackProfile.id)
                 self.pushLogin(fallbackProfile.email)
                 self.listenToTeamData()
                 completion(.success(()))
@@ -311,13 +584,16 @@ final class ProdConnectStore: ObservableObject {
                 } else {
                     // Backfill a profile doc for existing auth users missing Firestore user data.
                     profile = fallbackProfile
-                    self.save(profile, collection: "users", id: uid)
+                    Task { @MainActor in
+                        self.save(profile, collection: "users", id: uid)
+                    }
                 }
 
                 Task { @MainActor in
                     self.user = profile
                     self.teamCode = profile.teamCode
                     self.isAdmin = profile.isAdmin
+                    self.loadNotificationState(for: profile.id)
                     self.listenToTeamData()
                 }
             }
@@ -325,40 +601,58 @@ final class ProdConnectStore: ObservableObject {
     }
 
     func signUp(email: String, password: String, teamCode: String? = nil, isAdmin: Bool = false, completion: @escaping (Result<Void, Error>) -> Void) {
-        Auth.auth().createUser(withEmail: email, password: password) { result, error in
-            if let error {
-                completion(.failure(error))
-                return
-            }
+        let trimmedTeamCode = teamCode?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let completeSignUp: (String?) -> Void = { validatedTeamCode in
+            Auth.auth().createUser(withEmail: email, password: password) { result, error in
+                if let error {
+                    completion(.failure(error))
+                    return
+                }
 
-            let uid = result?.user.uid ?? UUID().uuidString
-            let normalizedTeamCode = teamCode?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let hasTeamCode = normalizedTeamCode?.isEmpty == false
-            let subscriptionTier = (hasTeamCode || isAdmin) ? "basic" : "free"
-            let canUseChatAndTraining = subscriptionTier != "free"
-            let profile = UserProfile(
-                id: uid,
-                displayName: email.components(separatedBy: "@").first ?? "User",
-                email: email,
-                teamCode: normalizedTeamCode,
-                isAdmin: isAdmin,
-                subscriptionTier: subscriptionTier,
-                canEditPatchsheet: subscriptionTier != "free",
-                canEditTraining: subscriptionTier != "free",
-                canEditGear: subscriptionTier != "free",
-                canEditIdeas: subscriptionTier != "free",
-                canEditChecklists: subscriptionTier != "free",
-                canSeeChat: canUseChatAndTraining,
-                canSeeTraining: canUseChatAndTraining,
-                canSeeTickets: false
-            )
-            self.user = profile
-            self.teamCode = normalizedTeamCode
-            self.isAdmin = isAdmin
-            self.save(profile, collection: "users", id: uid)
-            self.pushLogin(email)
-            self.listenToTeamData()
-            completion(.success(()))
+                let uid = result?.user.uid ?? UUID().uuidString
+                let normalizedTeamCode = validatedTeamCode?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let hasTeamCode = normalizedTeamCode?.isEmpty == false
+                let subscriptionTier = (hasTeamCode || isAdmin) ? "basic" : "free"
+                let canUseChatAndTraining = subscriptionTier != "free"
+                let profile = UserProfile(
+                    id: uid,
+                    displayName: email.components(separatedBy: "@").first ?? "User",
+                    email: email,
+                    teamCode: normalizedTeamCode,
+                    isAdmin: isAdmin,
+                    subscriptionTier: subscriptionTier,
+                    canEditPatchsheet: subscriptionTier != "free",
+                    canEditTraining: subscriptionTier != "free",
+                    canEditGear: subscriptionTier != "free",
+                    canEditIdeas: subscriptionTier != "free",
+                    canEditChecklists: subscriptionTier != "free",
+                    canSeeChat: canUseChatAndTraining,
+                    canSeeTraining: canUseChatAndTraining,
+                    canSeeTickets: false
+                )
+                self.user = profile
+                self.teamCode = normalizedTeamCode
+                self.isAdmin = isAdmin
+                self.loadNotificationState(for: profile.id)
+                self.save(profile, collection: "users", id: uid)
+                self.pushLogin(email)
+                self.listenToTeamData()
+                completion(.success(()))
+            }
+        }
+
+        guard let trimmedTeamCode, !trimmedTeamCode.isEmpty else {
+            completeSignUp(nil)
+            return
+        }
+
+        resolveSignUpTeamCode(trimmedTeamCode) { result in
+            switch result {
+            case .success(let resolvedCode):
+                completeSignUp(resolvedCode)
+            case .failure(let error):
+                completion(.failure(error))
+            }
         }
     }
 
@@ -367,16 +661,9 @@ final class ProdConnectStore: ObservableObject {
         pushLogout()
         KeychainHelper.shared.delete(for: "prodconnect_email")
         KeychainHelper.shared.delete(for: "prodconnect_password")
-        teamMembersListener?.remove()
-        checklistsListener?.remove()
-        ideasListener?.remove()
-        ticketsListener?.remove()
-        channelsListener?.remove()
-        lessonsListener?.remove()
-        gearListener?.remove()
-        locationsListener?.remove()
-        roomsListener?.remove()
+        removeTeamDataListeners()
         user = nil
+        resetNotificationState()
         gear = []
         patchsheet = []
         lessons = []
@@ -389,30 +676,55 @@ final class ProdConnectStore: ObservableObject {
         rooms = []
         teamCode = nil
         isAdmin = false
+        activeTeamListenersCode = nil
         activeChatChannelID = nil
         hasInitializedChannelsSnapshot = false
         hasPrimedTicketAssignmentState = false
         ticketAssignedToCurrentUserIDs = []
     }
 
+    private func removeTeamDataListeners() {
+        teamMembersListener?.remove()
+        checklistsListener?.remove()
+        ideasListener?.remove()
+        ticketsListener?.remove()
+        channelsListener?.remove()
+        lessonsListener?.remove()
+        gearListener?.remove()
+        locationsListener?.remove()
+        roomsListener?.remove()
+        teamMembersListener = nil
+        checklistsListener = nil
+        ideasListener = nil
+        ticketsListener = nil
+        channelsListener = nil
+        lessonsListener = nil
+        gearListener = nil
+        locationsListener = nil
+        roomsListener = nil
+    }
+
     private func restoreSession(for authUser: FirebaseAuth.User) {
+        let authUID = authUser.uid
+        let authEmail = authUser.email ?? ""
         let fallbackProfile = UserProfile(
-            id: authUser.uid,
-            displayName: authUser.email?.components(separatedBy: "@").first ?? "User",
-            email: authUser.email ?? ""
+            id: authUID,
+            displayName: authEmail.components(separatedBy: "@").first ?? "User",
+            email: authEmail
         )
 
         Task { @MainActor in
             self.user = fallbackProfile
             self.teamCode = fallbackProfile.teamCode
             self.isAdmin = fallbackProfile.isAdmin
+            self.loadNotificationState(for: fallbackProfile.id)
             if !fallbackProfile.email.isEmpty {
                 self.pushLogin(fallbackProfile.email)
             }
             self.listenToTeamData()
         }
 
-        db.collection("users").document(authUser.uid).getDocument { snapshot, fetchError in
+        db.collection("users").document(authUID).getDocument { snapshot, fetchError in
             if let fetchError {
                 print("Session restore profile fetch failed:", fetchError.localizedDescription)
                 return
@@ -421,9 +733,9 @@ final class ProdConnectStore: ObservableObject {
             let profile: UserProfile
             if let data = snapshot?.data() {
                 profile = UserProfile(
-                    id: authUser.uid,
-                    displayName: (data["displayName"] as? String) ?? authUser.email?.components(separatedBy: "@").first ?? "User",
-                    email: (data["email"] as? String) ?? authUser.email ?? "",
+                    id: authUID,
+                    displayName: (data["displayName"] as? String) ?? authEmail.components(separatedBy: "@").first ?? "User",
+                    email: (data["email"] as? String) ?? authEmail,
                     teamCode: data["teamCode"] as? String,
                     isAdmin: data["isAdmin"] as? Bool ?? false,
                     isOwner: data["isOwner"] as? Bool ?? false,
@@ -445,13 +757,16 @@ final class ProdConnectStore: ObservableObject {
                 )
             } else {
                 profile = fallbackProfile
-                self.save(profile, collection: "users", id: authUser.uid)
+                Task { @MainActor in
+                    self.save(profile, collection: "users", id: authUID)
+                }
             }
 
             Task { @MainActor in
                 self.user = profile
                 self.teamCode = profile.teamCode
                 self.isAdmin = profile.isAdmin
+                self.loadNotificationState(for: profile.id)
                 if !profile.email.isEmpty {
                     self.pushLogin(profile.email)
                 }
@@ -461,18 +776,16 @@ final class ProdConnectStore: ObservableObject {
     }
 
     func listenToTeamData() {
-        teamMembersListener?.remove()
-        checklistsListener?.remove()
-        ideasListener?.remove()
-        ticketsListener?.remove()
-        channelsListener?.remove()
-        lessonsListener?.remove()
-        gearListener?.remove()
-        locationsListener?.remove()
-        roomsListener?.remove()
-        hasInitializedChannelsSnapshot = false
+        let normalizedCode = teamCode?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let normalizedCode, !normalizedCode.isEmpty, activeTeamListenersCode == normalizedCode {
+            return
+        }
 
-        guard let code = teamCode, !code.isEmpty else {
+        removeTeamDataListeners()
+        hasInitializedChannelsSnapshot = false
+        activeTeamListenersCode = normalizedCode
+
+        guard let code = normalizedCode, !code.isEmpty else {
             if let user {
                 teamMembers = [user]
             }
@@ -540,8 +853,7 @@ final class ProdConnectStore: ObservableObject {
                 }
             }
 
-        channelsListener = db.collection("channels")
-            .whereField("teamCode", isEqualTo: code)
+        channelsListener = queryForUsersTeamCode(collection: "channels", code: code)
             .addSnapshotListener { snapshot, _ in
                 guard let docs = snapshot?.documents else { return }
                 let values: [ChatChannel] = docs.compactMap { doc in
@@ -728,8 +1040,12 @@ final class ProdConnectStore: ObservableObject {
     }
 
     func listenToTeamMembers() {
+        let normalizedCode = teamCode?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let code = normalizedCode, !code.isEmpty else { return }
+        if activeTeamListenersCode == code, teamMembersListener != nil {
+            return
+        }
         teamMembersListener?.remove()
-        guard let code = teamCode, !code.isEmpty else { return }
         teamMembersListener = queryForUsersTeamCode(collection: "users", code: code)
             .addSnapshotListener { snapshot, _ in
                 guard let docs = snapshot?.documents else { return }
@@ -857,6 +1173,22 @@ final class ProdConnectStore: ObservableObject {
         ticket.activity = Array(activity.suffix(25))
 
         save(ticket, collection: "tickets", id: ticket.id)
+        let ticketRef = db.collection("tickets").document(ticket.id)
+        var assignmentPayload: [String: Any] = [
+            "updatedAt": ticket.updatedAt,
+            "lastUpdatedBy": ticket.lastUpdatedBy ?? ""
+        ]
+        if let assignedAgentID = ticket.assignedAgentID, !assignedAgentID.isEmpty {
+            assignmentPayload["assignedAgentID"] = assignedAgentID
+        } else {
+            assignmentPayload["assignedAgentID"] = FieldValue.delete()
+        }
+        if let assignedAgentName = ticket.assignedAgentName, !assignedAgentName.isEmpty {
+            assignmentPayload["assignedAgentName"] = assignedAgentName
+        } else {
+            assignmentPayload["assignedAgentName"] = FieldValue.delete()
+        }
+        ticketRef.setData(assignmentPayload, merge: true)
         if !ticket.room.isEmpty {
             saveRoom(ticket.room)
         }
@@ -999,6 +1331,7 @@ final class ProdConnectStore: ObservableObject {
             return
         }
 
+        let db = self.db
         let locationsRef = db.collection("teams").document(code).collection("locations")
         let locationBatch = db.batch()
         locationBatch.setData([:], forDocument: locationsRef.document(newTrimmed))
@@ -1030,7 +1363,7 @@ final class ProdConnectStore: ObservableObject {
                             done(nil)
                             return
                         }
-                        let batch = self.db.batch()
+                        let batch = db.batch()
                         for doc in chunks[index] {
                             batch.updateData([field: newTrimmed], forDocument: doc.reference)
                         }
@@ -1038,7 +1371,9 @@ final class ProdConnectStore: ObservableObject {
                             if let chunkError = chunkError {
                                 done(chunkError)
                             } else {
-                                commitChunk(index + 1)
+                                DispatchQueue.main.async {
+                                    commitChunk(index + 1)
+                                }
                             }
                         }
                     }
@@ -1065,9 +1400,11 @@ final class ProdConnectStore: ObservableObject {
 
             for (collection, field) in tasks {
                 group.enter()
-                updateCollectionField(collection: collection, field: field) { err in
-                    if firstError == nil, let err = err { firstError = err }
-                    group.leave()
+                DispatchQueue.main.async {
+                    updateCollectionField(collection: collection, field: field) { err in
+                        if firstError == nil, let err = err { firstError = err }
+                        group.leave()
+                    }
                 }
             }
 
@@ -1116,30 +1453,183 @@ final class ProdConnectStore: ObservableObject {
         rooms.removeAll { $0 == room }
     }
 
-    func deleteAllGear() {
-        gear.forEach { item in
-            deleteStorageObject(forDownloadURL: item.imageURL)
-            db.collection("gear").document(item.id).delete()
+    func deleteAllGear(completion: ((Result<Void, Error>) -> Void)? = nil) {
+        let itemsToDelete = gear
+        guard !itemsToDelete.isEmpty else {
+            completion?(.success(()))
+            return
         }
+
+        let ids = itemsToDelete.map(\.id)
+        let imageURLs = itemsToDelete.map(\.imageURL)
+
+        gearListener?.remove()
+        gearListener = nil
         gear = []
-    }
 
-    func deletePatchesByCategory(_ category: String) {
-        let toDelete = patchsheet.filter { $0.category == category }
-        toDelete.forEach { item in
-            db.collection("patchsheet").document(item.id).delete()
+        DispatchQueue.global(qos: .utility).async {
+            for url in imageURLs {
+                self.deleteStorageObject(forDownloadURL: url)
+            }
         }
-        patchsheet.removeAll { $0.category == category }
+
+        deleteGearDocuments(ids: ids) {
+            DispatchQueue.main.async {
+                if self.gearListener == nil, let code = self.teamCode, !code.isEmpty {
+                    self.gearListener = self.queryForUsersTeamCode(collection: "gear", code: code)
+                        .addSnapshotListener { snapshot, _ in
+                            guard let docs = snapshot?.documents else { return }
+                            let values: [GearItem] = docs.compactMap { doc in
+                                var data = doc.data()
+                                data["id"] = doc.documentID
+                                return self.decodeDocument(data, as: GearItem.self)
+                            }
+                            DispatchQueue.main.async {
+                                self.gear = values
+                            }
+                        }
+                }
+                completion?(.success(()))
+            }
+        }
     }
 
-    func replaceAllGear(_ items: [GearItem]) {
+    func deletePatchesByCategory(_ category: String, completion: ((Result<Void, Error>) -> Void)? = nil) {
+        let toDelete = patchsheet.filter { $0.category == category }
+        guard !toDelete.isEmpty else {
+            completion?(.success(()))
+            return
+        }
+
+        let group = DispatchGroup()
+        var firstError: Error?
+        toDelete.forEach { item in
+            group.enter()
+            db.collection("patchsheet").document(item.id).delete { error in
+                if firstError == nil, let error {
+                    firstError = error
+                }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) {
+            self.patchsheet.removeAll { $0.category == category }
+            if let firstError {
+                completion?(.failure(firstError))
+            } else {
+                completion?(.success(()))
+            }
+        }
+    }
+
+    func replaceAllGear(_ items: [GearItem], completion: ((Result<Void, Error>) -> Void)? = nil) {
         gear = items
-        items.forEach(saveGear)
+
+        let locationsToSave = Set(items.flatMap { item in
+            [item.location, item.campus]
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        })
+        locationsToSave.forEach(saveLocation)
+
+        let chunkSize = 250
+        let chunks = stride(from: 0, to: items.count, by: chunkSize).map {
+            Array(items[$0..<min($0 + chunkSize, items.count)])
+        }
+        var firstError: Error?
+
+        guard !chunks.isEmpty else {
+            completion?(.success(()))
+            return
+        }
+
+        func commitChunk(index: Int) {
+            guard index < chunks.count else {
+                DispatchQueue.main.async {
+                    if let firstError {
+                        completion?(.failure(firstError))
+                    } else {
+                        completion?(.success(()))
+                    }
+                }
+                return
+            }
+
+            let batch = db.batch()
+            for item in chunks[index] {
+                do {
+                    try batch.setData(from: item, forDocument: db.collection("gear").document(item.id))
+                } catch {
+                    if firstError == nil {
+                        firstError = error
+                    }
+                }
+            }
+            batch.commit { error in
+                if firstError == nil, let error {
+                    firstError = error
+                }
+                Task { @MainActor in
+                    commitChunk(index: index + 1)
+                }
+            }
+        }
+
+        commitChunk(index: 0)
     }
 
-    func replaceAllPatch(_ rows: [PatchRow]) {
+    func replaceAllPatch(_ rows: [PatchRow], completion: ((Result<Void, Error>) -> Void)? = nil) {
         patchsheet = rows
-        rows.forEach(savePatch)
+
+        let locationsToSave = Set(rows.map(\.campus)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty })
+        locationsToSave.forEach(saveLocation)
+
+        let chunkSize = 250
+        let chunks = stride(from: 0, to: rows.count, by: chunkSize).map {
+            Array(rows[$0..<min($0 + chunkSize, rows.count)])
+        }
+        var firstError: Error?
+
+        guard !chunks.isEmpty else {
+            completion?(.success(()))
+            return
+        }
+
+        func commitChunk(index: Int) {
+            guard index < chunks.count else {
+                DispatchQueue.main.async {
+                    if let firstError {
+                        completion?(.failure(firstError))
+                    } else {
+                        completion?(.success(()))
+                    }
+                }
+                return
+            }
+
+            let batch = db.batch()
+            for row in chunks[index] {
+                do {
+                    try batch.setData(from: row, forDocument: db.collection("patchsheet").document(row.id))
+                } catch {
+                    if firstError == nil {
+                        firstError = error
+                    }
+                }
+            }
+            batch.commit { error in
+                if firstError == nil, let error {
+                    firstError = error
+                }
+                Task { @MainActor in
+                    commitChunk(index: index + 1)
+                }
+            }
+        }
+
+        commitChunk(index: 0)
     }
 
     private func refreshGearTicketState() {

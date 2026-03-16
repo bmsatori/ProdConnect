@@ -14,6 +14,40 @@ import SafariServices
 import AVFoundation
 import Vision
 
+private func currentCurrencyIdentifier() -> String {
+    if #available(iOS 16.0, macOS 13.0, *) {
+        return Locale.current.currency?.identifier ?? "USD"
+    } else {
+        return Locale.current.currencyCode ?? "USD"
+    }
+}
+
+private func jsonSafeFirestoreValue(_ value: Any) -> Any {
+    switch value {
+    case let timestamp as Timestamp:
+        return timestamp.dateValue().timeIntervalSinceReferenceDate
+    case let date as Date:
+        return date.timeIntervalSinceReferenceDate
+    case let dict as [String: Any]:
+        return dict.mapValues { jsonSafeFirestoreValue($0) }
+    case let array as [Any]:
+        return array.map { jsonSafeFirestoreValue($0) }
+    default:
+        return value
+    }
+}
+
+private func decodeFirestoreDocument<T: Decodable>(_ data: [String: Any], as type: T.Type) -> T? {
+    do {
+        let safeData = jsonSafeFirestoreValue(data)
+        guard JSONSerialization.isValidJSONObject(safeData) else { return nil }
+        let json = try JSONSerialization.data(withJSONObject: safeData, options: [])
+        return try JSONDecoder().decode(type, from: json)
+    } catch {
+        return nil
+    }
+}
+
 // NOTE: Preserved legacy block for reference, excluded from compilation to fix parser conflicts.
 /*
 // Restored UsersView for More tab
@@ -1528,7 +1562,9 @@ struct ContentView: View {
             }
 
             do {
-                var profile = try snap.data(as: UserProfile.self)
+                guard let data = snap.data(), var profile = decodeFirestoreDocument(data, as: UserProfile.self) else {
+                    throw NSError(domain: "ProfileDecode", code: 0, userInfo: [NSLocalizedDescriptionKey: "Unable to decode user profile."])
+                }
                 if profile.displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     profile.displayName = profile.email.components(separatedBy: "@").first ?? "New User"
                 }
@@ -1826,7 +1862,7 @@ struct ContentView: View {
 
                 let docs = snap?.documents ?? []
                 patchItems = docs.compactMap { doc in
-                    return try? doc.data(as: PatchRow.self)
+                    decodeFirestoreDocument(doc.data(), as: PatchRow.self)
                 }
                 group.leave()
             }
@@ -1845,20 +1881,15 @@ struct ContentView: View {
         lastGearSnapshot = nil
         hasMoreGear = true
         
-        var query: Query = db.collection("gear")
+        let query: Query = db.collection("gear")
             .whereField("teamCode", isEqualTo: teamCode)
             .limit(to: gearPageSize)
         
         // Use real-time listener so items appear immediately when added
-        query.addSnapshotListener { snap, error in
+        query.addSnapshotListener { snap, _ in
             
             DispatchQueue.main.async {
                 self.isLoadingMoreGear = false
-                
-                if let error = error {
-                    return
-                }
-                
                 let docs = snap?.documents ?? []
                 
                 var decoded = docs.compactMap { doc -> GearItem? in
@@ -1970,14 +2001,11 @@ struct ContentView: View {
                     print("DEBUG: Got \(docs.count) patchsheet docs for \(teamCode)")
                     
                     let decoded = docs.compactMap { doc -> PatchRow? in
-                        do {
-                            let patch = try doc.data(as: PatchRow.self)
-                            print("DEBUG: Decoded patch: \(patch.name) (cat: \(patch.category), pos: \(patch.position))")
-                            return patch
-                        } catch {
-                            print("DEBUG: Error decoding patch doc: \(error)")
+                        guard let patch = decodeFirestoreDocument(doc.data(), as: PatchRow.self) else {
                             return nil
                         }
+                        print("DEBUG: Decoded patch: \(patch.name) (cat: \(patch.category), pos: \(patch.position))")
+                        return patch
                     }
                     
                     self.patchsheet = decoded.sorted { $0.position < $1.position }
@@ -1996,7 +2024,7 @@ struct ContentView: View {
         isSearchingGear = true
         let searchTerm = query.lowercased()
         
-        var firestoreQuery: Query = db.collection("gear")
+        let firestoreQuery: Query = db.collection("gear")
             .whereField("teamCode", isEqualTo: teamCode)
             .limit(to: 10000)  // Safety limit for database reads
         
@@ -2115,12 +2143,8 @@ struct ContentView: View {
                     return
                 }
                 let docs = snap?.documents ?? []
-                let decoded = docs.compactMap { doc -> TrainingLesson? in
-                    do {
-                        return try doc.data(as: TrainingLesson.self)
-                    } catch {
-                        return nil
-                    }
+                let decoded = docs.compactMap { doc in
+                    decodeFirestoreDocument(doc.data(), as: TrainingLesson.self)
                 }
                 DispatchQueue.main.async {
                     self.processLessonAssignmentNotifications(with: decoded)
@@ -2146,12 +2170,8 @@ struct ContentView: View {
                         return
                     }
                     let docs = snap?.documents ?? []
-                    let decoded = docs.compactMap { doc -> ChecklistTemplate? in
-                        do {
-                            return try doc.data(as: ChecklistTemplate.self)
-                        } catch {
-                            return nil
-                        }
+                    let decoded = docs.compactMap { doc in
+                        decodeFirestoreDocument(doc.data(), as: ChecklistTemplate.self)
                     }
                     DispatchQueue.main.async {
                         self.processChecklistMentionNotifications(with: decoded)
@@ -2177,12 +2197,8 @@ struct ContentView: View {
                         return
                     }
                     let docs = snap?.documents ?? []
-                    let decoded = docs.compactMap { doc -> IdeaCard? in
-                        do {
-                            return try doc.data(as: IdeaCard.self)
-                        } catch {
-                            return nil
-                        }
+                    let decoded = docs.compactMap { doc in
+                        decodeFirestoreDocument(doc.data(), as: IdeaCard.self)
                     }
                     DispatchQueue.main.async {
                         self.ideas = decoded
@@ -2200,12 +2216,8 @@ struct ContentView: View {
                     return
                 }
                 let docs = snap?.documents ?? []
-                let decoded = docs.compactMap { doc -> ChatChannel? in
-                    do {
-                        return try doc.data(as: ChatChannel.self)
-                    } catch {
-                        return nil
-                    }
+                let decoded = docs.compactMap { doc in
+                    decodeFirestoreDocument(doc.data(), as: ChatChannel.self)
                 }
                 DispatchQueue.main.async {
                     self.channels = decoded.sorted { lhs, rhs in
@@ -2226,12 +2238,8 @@ struct ContentView: View {
                     return
                 }
                 let docs = snap?.documents ?? []
-                let decoded = docs.compactMap { doc -> ChatChannel? in
-                    do {
-                        return try doc.data(as: ChatChannel.self)
-                    } catch {
-                        return nil
-                    }
+                let decoded = docs.compactMap { doc in
+                    decodeFirestoreDocument(doc.data(), as: ChatChannel.self)
                 }
                 DispatchQueue.main.async {
                     self.channels = decoded.sorted { lhs, rhs in
@@ -2256,12 +2264,8 @@ struct ContentView: View {
                 return
             }
             let docs = snap?.documents ?? []
-            let decoded = docs.compactMap { doc -> T? in
-                do {
-                    return try doc.data(as: T.self)
-                } catch {
-                    return nil
-                }
+            let decoded = docs.compactMap { doc in
+                decodeFirestoreDocument(doc.data(), as: T.self)
             }
             self[keyPath: keyPath] = decoded
         }
@@ -2454,7 +2458,7 @@ struct ContentView: View {
     }
 
     private func decodeGearItem(from doc: QueryDocumentSnapshot) -> GearItem? {
-        if let item = try? doc.data(as: GearItem.self) {
+        if let item = decodeFirestoreDocument(doc.data(), as: GearItem.self) {
             return item
         }
 
@@ -2853,11 +2857,17 @@ struct ContentView: View {
         }
     }
     
-    func deleteAllGear() {
+    func deleteAllGear(completion: ((Result<Void, Error>) -> Void)? = nil) {
         // Split into chunks of 250 to avoid exceeding Firestore batch limits (16MB)
         let chunkSize = 250
         let chunks = stride(from: 0, to: gear.count, by: chunkSize).map {
             Array(gear[$0..<min($0 + chunkSize, gear.count)])
+        }
+        var firstError: Error?
+
+        guard !chunks.isEmpty else {
+            completion?(.success(()))
+            return
         }
         
         // Commit each chunk asynchronously
@@ -2865,6 +2875,11 @@ struct ContentView: View {
             guard index < chunks.count else {
                 DispatchQueue.main.async {
                     self.gear.removeAll()
+                    if let firstError {
+                        completion?(.failure(firstError))
+                    } else {
+                        completion?(.success(()))
+                    }
                 }
                 return
             }
@@ -2876,6 +2891,9 @@ struct ContentView: View {
             batch.commit { error in
                 if let error = error {
                     print("Error deleting gear batch:", error)
+                    if firstError == nil {
+                        firstError = error
+                    }
                 }
                 // Commit next chunk after this one completes
                 commitChunk(index: index + 1)
@@ -2885,7 +2903,7 @@ struct ContentView: View {
         commitChunk(index: 0)
     }
     
-    func deletePatchesByCategory(_ category: String) {
+    func deletePatchesByCategory(_ category: String, completion: ((Result<Void, Error>) -> Void)? = nil) {
         let patchesToDelete = patchsheet.filter { $0.category == category }
         
         // Split into chunks of 250 to avoid exceeding Firestore batch limits (16MB)
@@ -2893,12 +2911,23 @@ struct ContentView: View {
         let chunks = stride(from: 0, to: patchesToDelete.count, by: chunkSize).map {
             Array(patchesToDelete[$0..<min($0 + chunkSize, patchesToDelete.count)])
         }
+        var firstError: Error?
+
+        guard !chunks.isEmpty else {
+            completion?(.success(()))
+            return
+        }
         
         // Commit each chunk asynchronously
         func commitChunk(index: Int) {
             guard index < chunks.count else {
                 DispatchQueue.main.async {
                     self.patchsheet.removeAll { $0.category == category }
+                    if let firstError {
+                        completion?(.failure(firstError))
+                    } else {
+                        completion?(.success(()))
+                    }
                 }
                 return
             }
@@ -2910,6 +2939,9 @@ struct ContentView: View {
             batch.commit { error in
                 if let error = error {
                     print("Error deleting patch batch:", error)
+                    if firstError == nil {
+                        firstError = error
+                    }
                 }
                 // Commit next chunk after this one completes
                 commitChunk(index: index + 1)
@@ -2919,17 +2951,30 @@ struct ContentView: View {
         commitChunk(index: 0)
     }
     
-    func replaceAllGear(_ items: [GearItem]) {
+    func replaceAllGear(_ items: [GearItem], completion: ((Result<Void, Error>) -> Void)? = nil) {
         // Split into chunks of 250 to avoid exceeding Firestore batch limits (16MB)
         let chunkSize = 250
         let chunks = stride(from: 0, to: items.count, by: chunkSize).map {
             Array(items[$0..<min($0 + chunkSize, items.count)])
+        }
+        var firstError: Error?
+
+        guard !chunks.isEmpty else {
+            completion?(.success(()))
+            return
         }
         
         // Commit each chunk asynchronously, waiting for previous to complete
         func commitChunk(index: Int) {
             guard index < chunks.count else {
                 print("Completed writing all \(items.count) gear items")
+                DispatchQueue.main.async {
+                    if let firstError {
+                        completion?(.failure(firstError))
+                    } else {
+                        completion?(.success(()))
+                    }
+                }
                 return
             }
             
@@ -2944,6 +2989,9 @@ struct ContentView: View {
             batch.commit { error in
                 if let error = error {
                     print("Error committing gear batch \(index + 1)/\(chunks.count):", error)
+                    if firstError == nil {
+                        firstError = error
+                    }
                 } else {
                     print("Completed gear batch \(index + 1)/\(chunks.count)")
                 }
@@ -2955,17 +3003,30 @@ struct ContentView: View {
         commitChunk(index: 0)
     }
     
-    func replaceAllPatch(_ rows: [PatchRow]) {
+    func replaceAllPatch(_ rows: [PatchRow], completion: ((Result<Void, Error>) -> Void)? = nil) {
         // Split into chunks of 250 to avoid exceeding Firestore batch limits (16MB)
         let chunkSize = 250
         let chunks = stride(from: 0, to: rows.count, by: chunkSize).map {
             Array(rows[$0..<min($0 + chunkSize, rows.count)])
+        }
+        var firstError: Error?
+
+        guard !chunks.isEmpty else {
+            completion?(.success(()))
+            return
         }
         
         // Commit each chunk asynchronously, waiting for previous to complete
         func commitChunk(index: Int) {
             guard index < chunks.count else {
                 print("Completed writing all \(rows.count) patch items")
+                DispatchQueue.main.async {
+                    if let firstError {
+                        completion?(.failure(firstError))
+                    } else {
+                        completion?(.success(()))
+                    }
+                }
                 return
             }
             
@@ -2980,6 +3041,9 @@ struct ContentView: View {
             batch.commit { error in
                 if let error = error {
                     print("Error committing patch batch \(index + 1)/\(chunks.count):", error)
+                    if firstError == nil {
+                        firstError = error
+                    }
                 } else {
                     print("Completed patch batch \(index + 1)/\(chunks.count)")
                 }
@@ -3529,7 +3593,7 @@ struct LoginView: View {
         NavigationStack {
             ZStack {
                 Group {
-                    if let uiImage = UIImage(named: "BackgroundImage") {
+                    if let uiImage = UIImage(named: "Background") {
                         Image(uiImage: uiImage)
                             .resizable()
                             .scaledToFill()
@@ -4123,27 +4187,35 @@ struct AccountView: View {
             }
         }
 
+        let db = store.db
+
         // Validate team code exists
-        store.db.collection("teams").document(code).getDocument { snap, error in
+        db.collection("teams").document(code).getDocument { snap, error in
             if error == nil, snap?.exists == true {
-                applyJoinUpdates(resolvedCode: code)
+                DispatchQueue.main.async {
+                    applyJoinUpdates(resolvedCode: code)
+                }
                 return
             }
 
-            store.db.collection("teams").document(codeLower).getDocument { lowerSnap, lowerError in
+            db.collection("teams").document(codeLower).getDocument { lowerSnap, lowerError in
                 if lowerError == nil, let lowerSnap, lowerSnap.exists {
                     let foundCode = (lowerSnap.data()?["code"] as? String) ?? codeLower
-                    applyJoinUpdates(resolvedCode: foundCode.uppercased())
+                    DispatchQueue.main.async {
+                        applyJoinUpdates(resolvedCode: foundCode.uppercased())
+                    }
                     return
                 }
 
-                store.db.collection("teams")
+                db.collection("teams")
                     .whereField("code", in: [code, codeLower])
                     .limit(to: 1)
                     .getDocuments { teamSnap, teamError in
                         if teamError == nil, let doc = teamSnap?.documents.first {
                             let foundCode = (doc.data()["code"] as? String) ?? doc.documentID
-                            applyJoinUpdates(resolvedCode: foundCode.uppercased())
+                            DispatchQueue.main.async {
+                                applyJoinUpdates(resolvedCode: foundCode.uppercased())
+                            }
                             return
                         }
 
@@ -4595,9 +4667,11 @@ struct EditAccountView: View {
             guard let uid = store.user?.id else { completion(.success(())); return }
             store.db.collection("users").document(uid).updateData(["displayName": trimmedName]) { error in
                 if let error = error { completion(.failure(error)); return }
-                store.user?.displayName = trimmedName
-                store.listenToTeamMembers()
-                completion(.success(()))
+                DispatchQueue.main.async {
+                    store.user?.displayName = trimmedName
+                    store.listenToTeamMembers()
+                    completion(.success(()))
+                }
             }
         }
 
@@ -4607,9 +4681,11 @@ struct EditAccountView: View {
                 if let error = error { completion(.failure(error)); return }
                 store.db.collection("users").document(currentUser.uid).updateData(["email": trimmedEmail]) { err in
                     if let err = err { completion(.failure(err)); return }
-                    store.user?.email = trimmedEmail
-                    OneSignal.login(trimmedEmail)
-                    completion(.success(()))
+                    DispatchQueue.main.async {
+                        store.user?.email = trimmedEmail
+                        OneSignal.login(trimmedEmail)
+                        completion(.success(()))
+                    }
                 }
             }
         }
@@ -4702,6 +4778,7 @@ struct ContactView: View {
 // MARK: - CustomizeView (Admin Only)
 struct CustomizeView: View {
     @EnvironmentObject var store: ProdConnectStore
+    @AppStorage(preferredMainTabSectionsStorageKey) private var preferredMainTabSections = ""
     @State private var newCampus = ""
     @State private var newRoom = ""
     @State private var gearSheetLink = ""
@@ -4725,6 +4802,27 @@ struct CustomizeView: View {
     @State private var editingCampusOriginal = ""
     @State private var editingCampusName = ""
     @State private var isRenamingCampus = false
+    @State private var bulkOperationMessage = ""
+    @State private var isBulkOperationInProgress = false
+
+    private var availableSections: [MainAppSection] {
+        availableMainAppSections(for: store)
+    }
+
+    private var isPrivilegedUser: Bool {
+        store.user?.isAdmin == true || store.user?.isOwner == true
+    }
+
+    private var featuredSections: [MainAppSection] {
+        resolvedPreferredMainTabSections(
+            storedValue: preferredMainTabSections,
+            availableSections: availableSections
+        )
+    }
+
+    private var overflowSections: [MainAppSection] {
+        availableSections.filter { !featuredSections.contains($0) }
+    }
 
     private func presentResultAlert(_ message: String, delay: TimeInterval = 0.2) {
         let title = message.hasPrefix("✓") ? "Success" : "Error"
@@ -4763,12 +4861,88 @@ struct CustomizeView: View {
     }
 
     @ViewBuilder
+    private var progressOverlay: some View {
+        if isBulkOperationInProgress {
+            ZStack {
+                Color.black.opacity(0.35)
+                    .ignoresSafeArea()
+
+                VStack(spacing: 12) {
+                    ProgressView()
+                    Text(bulkOperationMessage)
+                        .font(.headline)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(20)
+                .frame(maxWidth: 320)
+                .background(Color(.systemBackground))
+                .cornerRadius(12)
+                .shadow(radius: 10)
+                .padding(.horizontal, 24)
+            }
+        }
+    }
+
+    @ViewBuilder
     private var campusAndRoomsSection: some View {
         if store.user?.hasCampusRoomFeatures ?? false {
             campusSection
             roomsSection
         } else {
             premiumCampusSection
+        }
+    }
+
+    private var tabCustomizationSection: some View {
+        Section {
+            ForEach(Array(featuredSections.enumerated()), id: \.element) { index, section in
+                HStack(spacing: 12) {
+                    Label(section.title, systemImage: section.icon)
+                    Spacer()
+                    Button {
+                        moveFeaturedSection(from: index, to: index - 1)
+                    } label: {
+                        Image(systemName: "arrow.up")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(index == 0)
+
+                    Button {
+                        moveFeaturedSection(from: index, to: index + 1)
+                    } label: {
+                        Image(systemName: "arrow.down")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(index == featuredSections.count - 1)
+
+                    Button("More") {
+                        removeFeaturedSection(section)
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(featuredSections.count <= 1)
+                }
+            }
+
+            if !overflowSections.isEmpty {
+                ForEach(overflowSections) { section in
+                    HStack {
+                        Label(section.title, systemImage: section.icon)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Button("Add") {
+                            addFeaturedSection(section)
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(featuredSections.count >= 4)
+                    }
+                }
+            }
+        } header: {
+            Text("Bottom Tab Bar")
+        } footer: {
+            Text("Choose up to 4 tabs for the bottom bar on this device. Everything else stays in More.")
+                .font(.caption)
+                .foregroundColor(.gray)
         }
     }
 
@@ -5015,12 +5189,16 @@ struct CustomizeView: View {
     private var customizeBaseView: some View {
         NavigationStack {
             Form {
-                campusAndRoomsSection
-                importSection
-                resetSection
+                tabCustomizationSection
+                if isPrivilegedUser {
+                    campusAndRoomsSection
+                    importSection
+                    resetSection
+                }
             }
             .navigationTitle("Customize")
             .toolbarColorScheme(.dark, for: .navigationBar)
+            .disabled(isBulkOperationInProgress)
         }
     }
 
@@ -5070,8 +5248,16 @@ struct CustomizeView: View {
         .alert("Delete All Assets?", isPresented: $showDeleteAllConfirmation) {
             Button("Cancel", role: .cancel) { }
             Button("Delete All", role: .destructive) {
-                store.deleteAllGear()
-                presentResultAlert("✓ All assets have been deleted")
+                beginBulkOperation("Deleting, please wait")
+                store.deleteAllGear { result in
+                    endBulkOperation()
+                    switch result {
+                    case .success:
+                        presentResultAlert("✓ All assets have been deleted")
+                    case .failure(let error):
+                        presentResultAlert("Delete failed: \(error.localizedDescription)", delay: 0)
+                    }
+                }
             }
         } message: {
             Text("Are you sure you want to delete all asset items? This cannot be undone.")
@@ -5079,8 +5265,16 @@ struct CustomizeView: View {
         .alert("Delete Audio Patchsheet?", isPresented: $showDeleteAudioConfirmation) {
             Button("Cancel", role: .cancel) { }
             Button("Delete", role: .destructive) {
-                store.deletePatchesByCategory("Audio")
-                presentResultAlert("✓ Audio patchsheet has been deleted")
+                beginBulkOperation("Deleting, please wait")
+                store.deletePatchesByCategory("Audio") { result in
+                    endBulkOperation()
+                    switch result {
+                    case .success:
+                        presentResultAlert("✓ Audio patchsheet has been deleted")
+                    case .failure(let error):
+                        presentResultAlert("Delete failed: \(error.localizedDescription)", delay: 0)
+                    }
+                }
             }
         } message: {
             Text("Are you sure you want to delete all audio patches? This cannot be undone.")
@@ -5088,8 +5282,16 @@ struct CustomizeView: View {
         .alert("Delete Lighting Patchsheet?", isPresented: $showDeleteLightingConfirmation) {
             Button("Cancel", role: .cancel) { }
             Button("Delete", role: .destructive) {
-                store.deletePatchesByCategory("Lighting")
-                presentResultAlert("✓ Lighting patchsheet has been deleted")
+                beginBulkOperation("Deleting, please wait")
+                store.deletePatchesByCategory("Lighting") { result in
+                    endBulkOperation()
+                    switch result {
+                    case .success:
+                        presentResultAlert("✓ Lighting patchsheet has been deleted")
+                    case .failure(let error):
+                        presentResultAlert("Delete failed: \(error.localizedDescription)", delay: 0)
+                    }
+                }
             }
         } message: {
             Text("Are you sure you want to delete all lighting patches? This cannot be undone.")
@@ -5097,17 +5299,49 @@ struct CustomizeView: View {
         .alert("Delete Video Patchsheet?", isPresented: $showDeleteVideoConfirmation) {
             Button("Cancel", role: .cancel) { }
             Button("Delete", role: .destructive) {
-                store.deletePatchesByCategory("Video")
-                presentResultAlert("✓ Video patchsheet has been deleted")
+                beginBulkOperation("Deleting, please wait")
+                store.deletePatchesByCategory("Video") { result in
+                    endBulkOperation()
+                    switch result {
+                    case .success:
+                        presentResultAlert("✓ Video patchsheet has been deleted")
+                    case .failure(let error):
+                        presentResultAlert("Delete failed: \(error.localizedDescription)", delay: 0)
+                    }
+                }
             }
         } message: {
             Text("Are you sure you want to delete all video patches? This cannot be undone.")
         }
         .overlay(resultOverlay)
+        .overlay(progressOverlay)
     }
 
     var body: some View {
         customizeFinalView
+    }
+
+    private func saveFeaturedSections(_ sections: [MainAppSection]) {
+        preferredMainTabSections = encodePreferredMainTabSections(Array(sections.prefix(4)))
+    }
+
+    private func addFeaturedSection(_ section: MainAppSection) {
+        guard !featuredSections.contains(section) else { return }
+        saveFeaturedSections(featuredSections + [section])
+    }
+
+    private func removeFeaturedSection(_ section: MainAppSection) {
+        saveFeaturedSections(featuredSections.filter { $0 != section })
+    }
+
+    private func moveFeaturedSection(from sourceIndex: Int, to destinationIndex: Int) {
+        guard featuredSections.indices.contains(sourceIndex),
+              featuredSections.indices.contains(destinationIndex),
+              sourceIndex != destinationIndex else { return }
+        var updated = featuredSections
+        let moved = updated.remove(at: sourceIndex)
+        updated.insert(moved, at: destinationIndex)
+        saveFeaturedSections(updated)
     }
 
     private func saveCampusRename() {
@@ -5219,10 +5453,18 @@ struct CustomizeView: View {
             let gearItems = parseGearCSV(csvString)
             
             DispatchQueue.main.async {
-                store.replaceAllGear(gearItems)
-                gearSheetLink = ""
-                isImporting = false
-                presentResultAlert("✓ Imported \(gearItems.count) asset items", delay: 0)
+                beginBulkOperation("Importing, please wait")
+                store.replaceAllGear(gearItems) { result in
+                    endBulkOperation()
+                    isImporting = false
+                    switch result {
+                    case .success:
+                        gearSheetLink = ""
+                        presentResultAlert("✓ Imported \(gearItems.count) asset items", delay: 0)
+                    case .failure(let error):
+                        presentResultAlert("Import failed: \(error.localizedDescription)", delay: 0)
+                    }
+                }
             }
         }.resume()
     }
@@ -5253,16 +5495,32 @@ struct CustomizeView: View {
             patchRows = patchRows.map { var row = $0; row.category = category; return row }
             
             DispatchQueue.main.async {
-                store.replaceAllPatch(patchRows)
-                // Clear the appropriate field
-                if category == "Audio" { audioPatchSheetLink = "" }
-                else if category == "Video" { videoPatchSheetLink = "" }
-                else if category == "Lighting" { lightingPatchSheetLink = "" }
-                
-                isImporting = false
-                presentResultAlert("✓ Imported \(patchRows.count) \(category) patches", delay: 0)
+                beginBulkOperation("Importing, please wait")
+                store.replaceAllPatch(patchRows) { result in
+                    endBulkOperation()
+                    isImporting = false
+                    switch result {
+                    case .success:
+                        if category == "Audio" { audioPatchSheetLink = "" }
+                        else if category == "Video" { videoPatchSheetLink = "" }
+                        else if category == "Lighting" { lightingPatchSheetLink = "" }
+                        presentResultAlert("✓ Imported \(patchRows.count) \(category) patches", delay: 0)
+                    case .failure(let error):
+                        presentResultAlert("Import failed: \(error.localizedDescription)", delay: 0)
+                    }
+                }
             }
         }.resume()
+    }
+
+    private func beginBulkOperation(_ message: String) {
+        bulkOperationMessage = message
+        isBulkOperationInProgress = true
+    }
+
+    private func endBulkOperation() {
+        isBulkOperationInProgress = false
+        bulkOperationMessage = ""
     }
     
     private func convertGoogleSheetLinkToCSV(_ link: String) -> URL {
@@ -5461,6 +5719,12 @@ struct UserDetailView: View {
     @State private var isSaving = false
     @State private var errorMessage: String?
     @State private var showTransferConfirm = false
+    @State private var showDeleteConfirm = false
+
+    private var canDeleteUser: Bool {
+        guard let currentUser = store.user else { return false }
+        return currentUser.canDelete(user)
+    }
 
     var body: some View {
         Form {
@@ -5560,6 +5824,15 @@ struct UserDetailView: View {
                 }
             }
 
+            if canDeleteUser {
+                Section {
+                    Button("Delete User", role: .destructive) {
+                        showDeleteConfirm = true
+                    }
+                    .disabled(isSaving)
+                }
+            }
+
             if let err = errorMessage {
                 Section { Text(err).foregroundColor(.red) }
             }
@@ -5579,6 +5852,14 @@ struct UserDetailView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("This will move the Owner role and subscription control to this user.")
+        }
+        .alert("Delete User?", isPresented: $showDeleteConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                deleteUser()
+            }
+        } message: {
+            Text("This permanently deletes \(user.displayName)'s user profile.")
         }
     }
 
@@ -5724,6 +6005,26 @@ struct UserDetailView: View {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    private func deleteUser() {
+        guard canDeleteUser else { return }
+
+        isSaving = true
+        errorMessage = nil
+
+        store.db.collection("users").document(user.id).delete { error in
+            DispatchQueue.main.async {
+                self.isSaving = false
+                if let error = error {
+                    self.errorMessage = "Delete failed: \(error.localizedDescription)"
+                    return
+                }
+
+                self.store.teamMembers.removeAll { $0.id == self.user.id }
+                dismiss()
             }
         }
     }
@@ -6336,7 +6637,7 @@ struct GearDetailView: View {
                 TextField("Cost", value: Binding(
                     get: { item.cost ?? 0 },
                     set: { item.cost = $0 }
-                ), format: .currency(code: Locale.current.currencyCode ?? "USD"))
+                ), format: .currency(code: currentCurrencyIdentifier()))
                 .keyboardType(.decimalPad)
                 .disabled(!canEdit)
             }
@@ -6346,7 +6647,7 @@ struct GearDetailView: View {
                 TextField("Cost", value: Binding(
                     get: { item.maintenanceCost ?? 0 },
                     set: { item.maintenanceCost = $0 }
-                ), format: .currency(code: Locale.current.currencyCode ?? "USD"))
+                ), format: .currency(code: currentCurrencyIdentifier()))
                 .keyboardType(.decimalPad)
                 .disabled(!canEdit)
 
@@ -6602,12 +6903,12 @@ struct AddGearView: View {
                 Section("Purchase Info") {
                     DatePicker("Purchase Date", selection: $purchaseDate, displayedComponents: .date)
                     TextField("Purchased From", text: $purchasedFrom)
-                    TextField("Cost", value: $cost, format: .currency(code: Locale.current.currencyCode ?? "USD"))
+                    TextField("Cost", value: $cost, format: .currency(code: currentCurrencyIdentifier()))
                         .keyboardType(.decimalPad)
                 }
                 Section("Maintenance") {
                     TextField("Issue", text: $maintenanceIssue)
-                    TextField("Cost", value: $maintenanceCost, format: .currency(code: Locale.current.currencyCode ?? "USD"))
+                    TextField("Cost", value: $maintenanceCost, format: .currency(code: currentCurrencyIdentifier()))
                         .keyboardType(.decimalPad)
                     DatePicker("Repair Date", selection: $maintenanceRepairDate, displayedComponents: .date)
                     TextEditor(text: $maintenanceNotes)
@@ -6911,7 +7212,7 @@ struct TicketsListView: View {
             .sorted()
     }
 
-    private var availableAgents: [UserProfile] {
+    private var availableAssignees: [UserProfile] {
         store.teamMembers
             .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
     }
@@ -7021,15 +7322,13 @@ struct TicketsListView: View {
     }
 
     private var ticketFilterBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 12) {
-                ticketLocationMenu
-                ticketStatusMenu
-                ticketAgentMenu
-            }
-            .padding(.horizontal)
-            .padding(.vertical, 8)
+        HStack(spacing: 12) {
+            ticketLocationMenu
+            ticketStatusMenu
+            ticketAgentMenu
         }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
     }
 
     private var ticketLocationMenu: some View {
@@ -7050,6 +7349,7 @@ struct TicketsListView: View {
                 isActive: !locationFilter.isEmpty
             )
         }
+        .frame(maxWidth: .infinity)
     }
 
     private var ticketStatusMenu: some View {
@@ -7066,6 +7366,7 @@ struct TicketsListView: View {
                 isActive: !statusFilter.isEmpty
             )
         }
+        .frame(maxWidth: .infinity)
     }
 
     private var ticketAgentMenu: some View {
@@ -7073,9 +7374,9 @@ struct TicketsListView: View {
             Button("Clear") { agentFilter = "" }
             Divider()
             Button("Unassigned") { agentFilter = unassignedAgentFilter }
-            if !availableAgents.isEmpty {
+            if !availableAssignees.isEmpty {
                 Divider()
-                ForEach(availableAgents) { agent in
+                ForEach(availableAssignees) { agent in
                     Button(agent.displayName) { agentFilter = agent.id }
                 }
             }
@@ -7086,20 +7387,24 @@ struct TicketsListView: View {
                 isActive: !agentFilter.isEmpty
             )
         }
+        .frame(maxWidth: .infinity)
     }
 
     private var agentFilterTitle: String {
         if agentFilter.isEmpty { return "Agent" }
         if agentFilter == unassignedAgentFilter { return "Unassigned" }
-        return availableAgents.first(where: { $0.id == agentFilter })?.displayName ?? "Agent"
+        return availableAssignees.first(where: { $0.id == agentFilter })?.displayName ?? "Agent"
     }
 
     private func ticketFilterChip(title: String, icon: String, isActive: Bool) -> some View {
         HStack(spacing: 4) {
             Image(systemName: icon)
-            Text(title).lineLimit(1)
+            Text(title)
+                .lineLimit(1)
+                .truncationMode(.tail)
         }
         .font(.caption)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(isActive ? Color.blue : Color.gray.opacity(0.3))
@@ -7114,17 +7419,19 @@ struct TicketDetailView: View {
     @State private var ticket: SupportTicket
     @State private var isEditing = false
     @State private var originalTicket: SupportTicket?
+    @State private var selectedAgentID = ""
     @State private var showAssetPicker = false
 
     init(ticket: SupportTicket) {
         _ticket = State(initialValue: ticket)
+        _selectedAgentID = State(initialValue: ticket.assignedAgentID ?? "")
     }
 
     private var canAssignAgents: Bool {
         store.canSeeAllTickets
     }
 
-    private var availableAgents: [UserProfile] {
+    private var availableAssignees: [UserProfile] {
         store.teamMembers
             .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
     }
@@ -7271,29 +7578,18 @@ struct TicketDetailView: View {
                 ticketAttachmentPreview
             }
 
-            Section("Assignment") {
+            Section("Agent") {
                 if isEditing, canAssignAgents {
                     Picker(
                         "Agent",
-                        selection: Binding(
-                            get: { ticket.assignedAgentID ?? "" },
-                            set: { newValue in
-                                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                                if trimmed.isEmpty {
-                                    ticket.assignedAgentID = nil
-                                    ticket.assignedAgentName = nil
-                                } else if let member = availableAgents.first(where: { $0.id == trimmed }) {
-                                    ticket.assignedAgentID = member.id
-                                    ticket.assignedAgentName = member.displayName
-                                }
-                            }
-                        )
+                        selection: $selectedAgentID
                     ) {
                         Text("Unassigned").tag("")
-                        ForEach(availableAgents) { member in
-                            Text(member.displayName).tag(member.id)
+                        ForEach(availableAssignees) { member in
+                            Text(displayName(for: member)).tag(member.id)
                         }
                     }
+                    .pickerStyle(.menu)
                 } else {
                     Text(ticket.assignedAgentName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? (ticket.assignedAgentName ?? "") : "Unassigned")
                         .foregroundColor((ticket.assignedAgentName ?? "").isEmpty ? .secondary : .primary)
@@ -7301,8 +7597,8 @@ struct TicketDetailView: View {
 
                 if !isEditing, let currentUser = store.user, ticket.assignedAgentID != currentUser.id {
                     Button("Assign to Me") {
-                        ticket.assignedAgentID = currentUser.id
-                        ticket.assignedAgentName = currentUser.displayName
+                        selectedAgentID = currentUser.id
+                        applySelectedAgent()
                         ticket.lastUpdatedBy = currentUserLabel
                         store.saveTicket(ticket)
                     }
@@ -7336,6 +7632,7 @@ struct TicketDetailView: View {
             Section {
                 Button(isEditing ? "Save" : "Close") {
                     if isEditing {
+                        applySelectedAgent()
                         ticket.lastUpdatedBy = currentUserLabel
                         store.saveTicket(ticket)
                     }
@@ -7363,6 +7660,7 @@ struct TicketDetailView: View {
                         Button("Cancel") {
                             if let originalTicket {
                                 ticket = originalTicket
+                                selectedAgentID = originalTicket.assignedAgentID ?? ""
                             }
                             isEditing = false
                             originalTicket = nil
@@ -7370,16 +7668,21 @@ struct TicketDetailView: View {
                     }
                     Button(isEditing ? "Done" : "Edit") {
                         if isEditing {
+                            applySelectedAgent()
                             ticket.lastUpdatedBy = currentUserLabel
                             store.saveTicket(ticket)
                             dismiss()
                         } else {
                             originalTicket = ticket
+                            selectedAgentID = ticket.assignedAgentID ?? ""
                             isEditing = true
                         }
                     }
                 }
             }
+        }
+        .onAppear {
+            selectedAgentID = ticket.assignedAgentID ?? ""
         }
     }
 
@@ -7400,6 +7703,30 @@ struct TicketDetailView: View {
 
     private var selectedAssetLabel: String {
         selectedAssetName ?? "Select Asset"
+    }
+
+    private func applySelectedAgent() {
+        let trimmed = selectedAgentID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            ticket.assignedAgentID = nil
+            ticket.assignedAgentName = nil
+            return
+        }
+
+        guard let member = availableAssignees.first(where: { $0.id == trimmed }) else {
+            ticket.assignedAgentID = nil
+            ticket.assignedAgentName = nil
+            return
+        }
+
+        ticket.assignedAgentID = member.id
+        ticket.assignedAgentName = displayName(for: member)
+    }
+
+    private func displayName(for member: UserProfile) -> String {
+        let trimmed = member.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        return member.email.components(separatedBy: "@").first ?? member.email
     }
 
     private var hasDueDateBinding: Binding<Bool> {
@@ -7459,7 +7786,7 @@ struct CreateTicketView: View {
 
     var onSave: (SupportTicket) -> Void
 
-    private var availableAgents: [UserProfile] {
+    private var availableAssignees: [UserProfile] {
         store.teamMembers
             .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
     }
@@ -7617,13 +7944,14 @@ struct CreateTicketView: View {
     @ViewBuilder
     private var assignmentSection: some View {
         if store.canSeeAllTickets {
-            Section("Assignment") {
+            Section("Agent") {
                 Picker("Agent", selection: $assignedAgentID) {
                     Text("Unassigned").tag("")
-                    ForEach(availableAgents) { member in
-                        Text(member.displayName).tag(member.id)
+                    ForEach(availableAssignees) { member in
+                        Text(displayName(for: member)).tag(member.id)
                     }
                 }
+                .pickerStyle(.menu)
             }
         }
     }
@@ -7669,7 +7997,7 @@ struct CreateTicketView: View {
             store.user?.teamCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         ].first(where: { !$0.isEmpty }) ?? ""
         let linkedGear = availableGear.first(where: { $0.id == linkedGearID })
-        let assignedAgent = availableAgents.first(where: { $0.id == assignedAgentID })
+        let assignedAgent = availableAssignees.first(where: { $0.id == assignedAgentID })
         var ticket = SupportTicket(
             title: title.trimmingCharacters(in: .whitespacesAndNewlines),
             detail: detail.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -7680,7 +8008,7 @@ struct CreateTicketView: View {
             createdBy: store.user?.email ?? Auth.auth().currentUser?.email,
             createdByUserID: store.user?.id,
             assignedAgentID: assignedAgent?.id,
-            assignedAgentName: assignedAgent?.displayName,
+            assignedAgentName: assignedAgent.map(displayName(for:)),
             linkedGearID: linkedGear?.id,
             linkedGearName: linkedGear?.name,
             dueDate: hasDueDate ? dueDate : nil,
@@ -7698,6 +8026,12 @@ struct CreateTicketView: View {
         ]
         onSave(ticket)
         dismiss()
+    }
+
+    private func displayName(for member: UserProfile) -> String {
+        let trimmed = member.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        return member.email.components(separatedBy: "@").first ?? member.email
     }
 }
 
@@ -9848,11 +10182,173 @@ struct ShareSheet: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
+private enum MainAppSection: String, CaseIterable, Identifiable {
+    case chat
+    case patchsheet
+    case training
+    case assets
+    case notifications
+    case checklist
+    case ideas
+    case tickets
+    case customize
+    case account
+    case users
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .chat: return "Chat"
+        case .patchsheet: return "Patchsheet"
+        case .training: return "Training"
+        case .assets: return "Assets"
+        case .notifications: return "Notifications"
+        case .checklist: return "Checklist"
+        case .ideas: return "Ideas"
+        case .tickets: return "Tickets"
+        case .customize: return "Customize"
+        case .account: return "Account"
+        case .users: return "Users"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .chat: return "message"
+        case .patchsheet: return "square.grid.3x2"
+        case .training: return "graduationcap"
+        case .assets: return "shippingbox"
+        case .notifications: return "bell"
+        case .checklist: return "checklist"
+        case .ideas: return "lightbulb"
+        case .tickets: return "ticket"
+        case .customize: return "slider.horizontal.3"
+        case .account: return "person.crop.circle"
+        case .users: return "person.3"
+        }
+    }
+}
+
+private let preferredMainTabSectionsStorageKey = "preferredMainTabSections"
+private let defaultPreferredMainTabSections: [MainAppSection] = [.chat, .patchsheet, .training, .assets]
+
+private func availableMainAppSections(for store: ProdConnectStore) -> [MainAppSection] {
+    let isPrivilegedUser = store.user?.isAdmin == true || store.user?.isOwner == true
+    var sections: [MainAppSection] = [.notifications]
+
+    if (store.user?.hasChatAndTrainingFeatures ?? false) && (isPrivilegedUser || store.user?.canSeeChat == true) {
+        sections.append(.chat)
+    }
+    if isPrivilegedUser || store.user?.canSeePatchsheet == true {
+        sections.append(.patchsheet)
+    }
+    if (store.user?.hasChatAndTrainingFeatures ?? false) && (isPrivilegedUser || store.user?.canSeeTraining == true) {
+        sections.append(.training)
+    }
+    if isPrivilegedUser || store.user?.canSeeGear == true {
+        sections.append(.assets)
+    }
+    if isPrivilegedUser || store.user?.canSeeChecklists == true {
+        sections.append(.checklist)
+    }
+    if isPrivilegedUser || store.user?.canSeeIdeas == true {
+        sections.append(.ideas)
+    }
+    if store.canUseTickets {
+        sections.append(.tickets)
+    }
+    sections.append(.customize)
+
+    sections.append(.account)
+
+    if isPrivilegedUser {
+        sections.append(.users)
+    }
+
+    return sections
+}
+
+private func decodePreferredMainTabSections(from rawValue: String) -> [MainAppSection] {
+    rawValue
+        .split(separator: ",")
+        .compactMap { MainAppSection(rawValue: String($0)) }
+}
+
+private func encodePreferredMainTabSections(_ sections: [MainAppSection]) -> String {
+    sections.map(\.rawValue).joined(separator: ",")
+}
+
+private func resolvedPreferredMainTabSections(
+    storedValue: String,
+    availableSections: [MainAppSection],
+    maxCount: Int = 4
+) -> [MainAppSection] {
+    let availableSet = Set(availableSections)
+    let storedSections = decodePreferredMainTabSections(from: storedValue).filter { availableSet.contains($0) }
+    var ordered: [MainAppSection] = []
+
+    if !storedSections.isEmpty {
+        for section in storedSections where !ordered.contains(section) {
+            ordered.append(section)
+        }
+
+        if ordered.isEmpty, let firstAvailable = availableSections.first {
+            ordered.append(firstAvailable)
+        }
+
+        return Array(ordered.prefix(maxCount))
+    }
+
+    for section in defaultPreferredMainTabSections where availableSet.contains(section) {
+        if !ordered.contains(section) {
+            ordered.append(section)
+        }
+    }
+
+    for section in availableSections where !ordered.contains(section) {
+        ordered.append(section)
+    }
+
+    return Array(ordered.prefix(maxCount))
+}
+
+@ViewBuilder
+private func mainAppSectionDestination(_ section: MainAppSection) -> some View {
+    switch section {
+    case .chat:
+        ChatListView()
+    case .patchsheet:
+        MainTabView.PatchsheetView()
+    case .training:
+        TrainingListView()
+    case .assets:
+        GearTabView()
+    case .notifications:
+        NotificationsListView()
+    case .checklist:
+        ChecklistsListView()
+    case .ideas:
+        IdeasListView()
+    case .tickets:
+        TicketsListView()
+    case .customize:
+        CustomizeView()
+    case .account:
+        AccountView()
+    case .users:
+        UsersView()
+    }
+}
+
 struct MainTabView: View {
     @EnvironmentObject var store: ProdConnectStore
     @AppStorage("reviewPromptLaunchCount") private var reviewPromptLaunchCount = 0
     @AppStorage("reviewPromptLastRequestTime") private var reviewPromptLastRequestTime: Double = 0
     @AppStorage("reviewPromptHasRequestedBefore") private var reviewPromptHasRequestedBefore = false
+    @AppStorage(preferredMainTabSectionsStorageKey) private var preferredMainTabSections = ""
+    @State private var showAppReviewPrompt = false
+    @State private var selectedAppReviewRating = 0
 
     // Restored ChatChannelListView wrapper
     struct ChatChannelListView: View {
@@ -10323,24 +10819,41 @@ struct MainTabView: View {
             }
         }
     }
-    private var isPrivilegedUser: Bool {
-        store.user?.isAdmin == true || store.user?.isOwner == true
+    private var availableSections: [MainAppSection] {
+        availableMainAppSections(for: store)
     }
 
-    private var canSeeChatTab: Bool {
-        (store.user?.hasChatAndTrainingFeatures ?? false) && (isPrivilegedUser || store.user?.canSeeChat == true)
+    private var featuredSections: [MainAppSection] {
+        resolvedPreferredMainTabSections(
+            storedValue: preferredMainTabSections,
+            availableSections: availableSections
+        )
     }
 
-    private var canSeePatchsheetTab: Bool {
-        isPrivilegedUser || store.user?.canSeePatchsheet == true
+    private var overflowSections: [MainAppSection] {
+        availableSections.filter { !featuredSections.contains($0) }
     }
 
-    private var canSeeTrainingMainTab: Bool {
-        (store.user?.hasChatAndTrainingFeatures ?? false) && (isPrivilegedUser || store.user?.canSeeTraining == true)
+    private var appStoreReviewURL: URL? {
+        URL(string: "https://apps.apple.com/app/id6758495145?action=write-review")
     }
 
-    private var canSeeGearTab: Bool {
-        isPrivilegedUser || store.user?.canSeeGear == true
+    private func completeReviewPromptCycle() {
+        reviewPromptLastRequestTime = Date().timeIntervalSince1970
+        reviewPromptHasRequestedBefore = true
+        reviewPromptLaunchCount = 0
+    }
+
+    private func submitAppReview() {
+        guard
+            selectedAppReviewRating > 0,
+            let reviewURL = appStoreReviewURL,
+            UIApplication.shared.canOpenURL(reviewURL)
+        else { return }
+
+        UIApplication.shared.open(reviewURL)
+        showAppReviewPrompt = false
+        completeReviewPromptCycle()
     }
 
     private func maybeRequestAppReview() {
@@ -10361,122 +10874,222 @@ struct MainTabView: View {
         guard shouldRequestNow else { return }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            guard let windowScene = UIApplication.shared.connectedScenes
-                .compactMap({ $0 as? UIWindowScene })
-                .first(where: { $0.activationState == .foregroundActive }) else { return }
-
-            SKStoreReviewController.requestReview(in: windowScene)
-            reviewPromptLastRequestTime = Date().timeIntervalSince1970
-            reviewPromptHasRequestedBefore = true
-            reviewPromptLaunchCount = 0
+            selectedAppReviewRating = 0
+            showAppReviewPrompt = true
         }
     }
 
     var body: some View {
         TabView {
-            if canSeeChatTab {
-                ChatListView()
+            ForEach(featuredSections) { section in
+                mainAppSectionDestination(section)
                     .tabItem {
-                        Label("Chat", systemImage: "message")
+                        Label(section.title, systemImage: section.icon)
                     }
+                    .badge(section == .notifications && store.notificationBadgeCount > 0 ? store.notificationBadgeCount : 0)
             }
-            if canSeePatchsheetTab {
-                PatchsheetView()
-                    .tabItem {
-                        Label("Patchsheet", systemImage: "square.grid.3x2")
-                    }
-            }
-            if canSeeTrainingMainTab {
-                TrainingListView()
-                    .tabItem {
-                        Label("Training", systemImage: "graduationcap")
-                    }
-            }
-            if canSeeGearTab {
-                GearTabView()
-                    .tabItem {
-                        Label("Assets", systemImage: "shippingbox")
-                    }
-            }
-            MoreTabView()
+            MoreTabView(sections: overflowSections)
                 .tabItem {
                     Label("More", systemImage: "ellipsis")
                 }
+                .badge(overflowSections.contains(.notifications) && store.notificationBadgeCount > 0 ? store.notificationBadgeCount : 0)
         }
         .onAppear {
             maybeRequestAppReview()
         }
+        .sheet(isPresented: $showAppReviewPrompt, onDismiss: {
+            selectedAppReviewRating = 0
+        }) {
+            AppReviewPromptView(
+                selectedRating: $selectedAppReviewRating,
+                onSubmit: submitAppReview,
+                onNotNow: {
+                    showAppReviewPrompt = false
+                    completeReviewPromptCycle()
+                }
+            )
+            .presentationDetents([.medium])
+            .presentationDragIndicator(.visible)
+        }
     }
 }
 
-struct MoreTabView: View {
+private struct AppReviewPromptView: View {
+    @Binding var selectedRating: Int
+    let onSubmit: () -> Void
+    let onNotNow: () -> Void
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Capsule()
+                .fill(Color.secondary.opacity(0.35))
+                .frame(width: 42, height: 5)
+                .padding(.top, 8)
+
+            VStack(spacing: 8) {
+                Text("Rate ProdConnect")
+                    .font(.title3.weight(.semibold))
+                Text("How has ProdConnect been working for you?")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+
+            HStack(spacing: 14) {
+                ForEach(1...5, id: \.self) { rating in
+                    Button {
+                        selectedRating = rating
+                    } label: {
+                        Image(systemName: rating <= selectedRating ? "star.fill" : "star")
+                            .font(.system(size: 30, weight: .semibold))
+                            .foregroundColor(rating <= selectedRating ? .yellow : .secondary)
+                            .frame(width: 44, height: 44)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("\(rating) star\(rating == 1 ? "" : "s")")
+                }
+            }
+            .padding(.vertical, 4)
+
+            Text(selectedRating == 0 ? "Select a rating to continue" : "\(selectedRating) out of 5 stars")
+                .font(.footnote)
+                .foregroundColor(.secondary)
+
+            VStack(spacing: 12) {
+                Button(action: onSubmit) {
+                    Text("Submit")
+                        .fontWeight(.semibold)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(selectedRating == 0)
+
+                Button("Not Now", action: onNotNow)
+                    .foregroundColor(.secondary)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 24)
+        .padding(.bottom, 24)
+    }
+}
+
+private struct NotificationsListView: View {
     @EnvironmentObject var store: ProdConnectStore
 
-    private var isPrivilegedUser: Bool {
-        store.user?.isAdmin == true || store.user?.isOwner == true
-    }
+    var body: some View {
+        List {
+            if store.notificationIncomingChannels.isEmpty && store.notificationAssignedTickets.isEmpty && store.checklistNotificationNotices.isEmpty {
+                Text("No new notifications")
+                    .foregroundColor(.secondary)
+            }
 
-    private var canSeeCustomize: Bool {
-        isPrivilegedUser
-    }
+            if !store.notificationIncomingChannels.isEmpty {
+                Section("Messages") {
+                    ForEach(store.notificationIncomingChannels) { channel in
+                        NavigationLink {
+                            ChatChannelDetailView(channel: channel)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(channel.name.isEmpty ? "Chat" : channel.name)
+                                    .font(.headline)
+                                if let last = channel.messages.last {
+                                    Text(last.text.isEmpty ? "New attachment" : last.text)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(2)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
-    private var canSeeIdeas: Bool {
-        isPrivilegedUser || store.user?.canSeeIdeas == true
-    }
+            if !store.notificationAssignedTickets.isEmpty {
+                Section("Assigned Tickets") {
+                    ForEach(store.notificationAssignedTickets) { ticket in
+                        NavigationLink {
+                            TicketDetailView(ticket: ticket)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(ticket.title.isEmpty ? "Untitled Ticket" : ticket.title)
+                                    .font(.headline)
+                                Text(ticket.status.rawValue)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
 
-    private var canSeeChecklists: Bool {
-        isPrivilegedUser || store.user?.canSeeChecklists == true
+            if !store.checklistNotificationNotices.isEmpty {
+                Section("Checklist Assignments") {
+                    ForEach(store.checklistNotificationNotices) { notice in
+                        NavigationLink {
+                            ChecklistRunView(template: notice.checklist)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(notice.checklist.title)
+                                    .font(.headline)
+                                Text(notice.item.text)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(2)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("Notifications")
+        .onAppear {
+            store.markAllNotificationsSeen()
+        }
+        .onChange(of: store.notificationBadgeCount) { _ in
+            store.markAllNotificationsSeen()
+        }
     }
+}
 
-    private var canSeeTickets: Bool {
-        store.canUseTickets
-    }
+private struct MoreTabView: View {
+    @EnvironmentObject var store: ProdConnectStore
+    let sections: [MainAppSection]
 
-    private var canManageUsers: Bool {
-        isPrivilegedUser
+    private var notificationRow: some View {
+        HStack {
+            Label("Notifications", systemImage: MainAppSection.notifications.icon)
+            Spacer()
+            if store.notificationBadgeCount > 0 {
+                Text(store.notificationBadgeCount > 99 ? "99+" : "\(store.notificationBadgeCount)")
+                    .font(.caption2.weight(.bold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.red, in: Capsule())
+            }
+        }
     }
 
     var body: some View {
         NavigationStack {
             List {
-                if canSeeChecklists {
-                    NavigationLink {
-                        ChecklistsListView()
-                    } label: {
-                        Text("Checklist")
-                    }
-                }
-                if canSeeIdeas {
-                    NavigationLink {
-                        IdeasListView()
-                    } label: {
-                        Text("Ideas")
-                    }
-                }
-                if canSeeTickets {
-                    NavigationLink {
-                        TicketsListView()
-                    } label: {
-                        Text("Tickets")
-                    }
-                }
-                if canSeeCustomize {
-                    NavigationLink {
-                        CustomizeView()
-                    } label: {
-                        Text("Customize")
-                    }
-                }
-                NavigationLink {
-                    AccountView()
-                } label: {
-                    Text("Account")
-                }
-                if canManageUsers {
-                    NavigationLink {
-                        UsersView()
-                    } label: {
-                        Text("Users")
+                if sections.isEmpty {
+                    Text("No additional sections")
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(sections) { section in
+                        NavigationLink {
+                            mainAppSectionDestination(section)
+                        } label: {
+                            if section == .notifications {
+                                notificationRow
+                            } else {
+                                Label(section.title, systemImage: section.icon)
+                            }
+                        }
                     }
                 }
             }

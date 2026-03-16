@@ -205,6 +205,13 @@ struct UserProfile: Identifiable, Codable {
             return false
         }
     }
+
+    func canDelete(_ target: UserProfile) -> Bool {
+        guard id != target.id else { return false }
+        guard !target.isOwner else { return false }
+        if isOwner { return true }
+        return isAdmin && !target.isAdmin
+    }
 }
 
 struct TrainingLesson: Identifiable, Codable {

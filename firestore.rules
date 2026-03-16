@@ -11,14 +11,22 @@ service cloud.firestore {
         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isAdmin == true;
     }
 
-    match /users/{userId} {
-      allow read: if isAdmin() || (isSignedIn() && request.auth.uid == userId)
-        || (isSignedIn() && resource.data.teamCode == getUserTeamCode())
-        || (isSignedIn() && resource.data.teamCode != null && normalizedTeamCode() != null
-            && resource.data.teamCode.lower() == normalizedTeamCode());
-      allow create: if isSignedIn() && request.auth.uid == userId;
-      allow update: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
-      allow delete: if isAdmin();
+    function isOwner() {
+      return isSignedIn() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isOwner == true;
+    }
+
+    function isOnRequestersTeam(teamCode) {
+      return isSignedIn() && teamCode != null && normalizedTeamCode() != null
+        && teamCode.lower() == normalizedTeamCode();
+    }
+
+    function canManageExistingUser(userId) {
+      return isSignedIn()
+        && request.auth.uid != userId
+        && !resource.data.isOwner
+        && isOnRequestersTeam(resource.data.teamCode)
+        && (isOwner() || (isAdmin() && resource.data.isAdmin != true));
     }
 
     match /invites/{inviteId} {
@@ -34,10 +42,41 @@ service cloud.firestore {
       return getUserTeamCode() != null ? getUserTeamCode().lower() : null;
     }
 
+    function requestedTeamCode() {
+      return request.resource.data.teamCode;
+    }
+
+    function hasRequestedTeamCode() {
+      return requestedTeamCode() is string && requestedTeamCode().size() > 0;
+    }
+
+    function requestedTeamCodeIsValid() {
+      return !hasRequestedTeamCode()
+        || (
+          requestedTeamCode().matches('^[A-Z0-9]{6}$')
+          && exists(/databases/$(database)/documents/teams/$(requestedTeamCode()))
+          && get(/databases/$(database)/documents/teams/$(requestedTeamCode())).data.isActive == true
+        );
+    }
+
     function belongsToUserTeam() {
       return isSignedIn() && resource.data.teamCode == getUserTeamCode()
         || (isSignedIn() && resource.data.teamCode != null && normalizedTeamCode() != null
             && resource.data.teamCode.lower() == normalizedTeamCode());
+    }
+
+    match /users/{userId} {
+      allow read: if isAdmin() || (isSignedIn() && request.auth.uid == userId)
+        || (isSignedIn() && resource.data.teamCode == getUserTeamCode())
+        || (isSignedIn() && resource.data.teamCode != null && normalizedTeamCode() != null
+            && resource.data.teamCode.lower() == normalizedTeamCode());
+      allow create: if isSignedIn()
+        && request.auth.uid == userId
+        && requestedTeamCodeIsValid()
+        && request.resource.data.isAdmin != true
+        && request.resource.data.isOwner != true;
+      allow update: if canManageExistingUser(userId) || (isSignedIn() && request.auth.uid == userId);
+      allow delete: if canManageExistingUser(userId);
     }
 
     match /teams/{teamId} {

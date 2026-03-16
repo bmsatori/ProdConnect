@@ -57,6 +57,7 @@ private enum MacRoute: String, CaseIterable, Identifiable {
 struct MacRootView: View {
     @EnvironmentObject private var store: ProdConnectStore
     @State private var selectedRoute: MacRoute? = .chat
+    @State private var isShowingNotifications = false
 
     private var sidebarRoutes: [MacRoute] {
         MacRoute.allCases.filter { route in
@@ -100,6 +101,29 @@ struct MacRootView: View {
                         detail
                     }
                     .navigationSplitViewStyle(.balanced)
+                    .toolbar {
+                        ToolbarItem(placement: .primaryAction) {
+                            Button {
+                                isShowingNotifications = true
+                            } label: {
+                                ZStack(alignment: .topTrailing) {
+                                    Image(systemName: notificationBadgeCount > 0 ? "bell.badge.fill" : "bell")
+                                        .font(.system(size: 16, weight: .semibold))
+
+                                    if notificationBadgeCount > 0 {
+                                        Text(notificationBadgeCount > 99 ? "99+" : "\(notificationBadgeCount)")
+                                            .font(.system(size: 9, weight: .bold))
+                                            .foregroundStyle(.white)
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 2)
+                                            .background(Color.red, in: Capsule())
+                                            .offset(x: 10, y: -8)
+                                    }
+                                }
+                            }
+                            .help("Notifications")
+                        }
+                    }
                 }
                 .onAppear {
                     if let selectedRoute, !sidebarRoutes.contains(selectedRoute) {
@@ -107,12 +131,18 @@ struct MacRootView: View {
                     } else if selectedRoute == nil {
                         self.selectedRoute = sidebarRoutes.first
                     }
-                    store.listenToTeamData()
-                    store.listenToTeamMembers()
+                }
+                .sheet(isPresented: $isShowingNotifications) {
+                    MacNotificationsView()
+                        .environmentObject(store)
                 }
             }
         }
         .multilineTextAlignment(.leading)
+    }
+
+    private var notificationBadgeCount: Int {
+        store.notificationBadgeCount
     }
 
     private var sidebar: some View {
@@ -148,6 +178,84 @@ struct MacRootView: View {
             MacUsersView()
         case .account:
             MacAccountView()
+        }
+    }
+}
+
+private struct MacNotificationsView: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var store: ProdConnectStore
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if store.notificationIncomingChannels.isEmpty && store.notificationAssignedTickets.isEmpty && store.checklistNotificationNotices.isEmpty {
+                    Text("No notifications")
+                        .foregroundStyle(.secondary)
+                }
+
+                if !store.notificationIncomingChannels.isEmpty {
+                    Section("Messages") {
+                        ForEach(store.notificationIncomingChannels) { channel in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(channel.name.isEmpty ? "Chat" : channel.name)
+                                    .font(.headline)
+                                if let last = channel.messages.last {
+                                    Text(last.text.isEmpty ? "New attachment" : last.text)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                }
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                }
+
+                if !store.notificationAssignedTickets.isEmpty {
+                    Section("Assigned Tickets") {
+                        ForEach(store.notificationAssignedTickets) { ticket in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(ticket.title.isEmpty ? "Untitled Ticket" : ticket.title)
+                                    .font(.headline)
+                                Text(ticket.status.rawValue)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                }
+
+                if !store.checklistNotificationNotices.isEmpty {
+                    Section("Checklist Assignments") {
+                        ForEach(store.checklistNotificationNotices) { notice in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(notice.checklist.title)
+                                    .font(.headline)
+                                Text(notice.item.text)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Notifications")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { dismiss() }
+                }
+            }
+        }
+        .frame(minWidth: 480, minHeight: 420)
+        .onAppear {
+            store.markAllNotificationsSeen()
+        }
+        .onChange(of: store.notificationBadgeCount) { _ in
+            store.markAllNotificationsSeen()
         }
     }
 }
@@ -3370,6 +3478,8 @@ private struct MacCustomizeView: View {
     @State private var isImporting = false
     @State private var resultMessage = ""
     @State private var pendingResetAction: ResetAction?
+    @State private var bulkOperationMessage = ""
+    @State private var isBulkOperationInProgress = false
 
     private enum ResetAction: String, Identifiable {
         case deleteAllGear
@@ -3514,6 +3624,7 @@ private struct MacCustomizeView: View {
         .padding()
         .background(Color.clear)
         .navigationTitle("Customize")
+        .disabled(isBulkOperationInProgress)
         .alert(item: $pendingResetAction) { action in
             Alert(
                 title: Text(action.title),
@@ -3523,6 +3634,26 @@ private struct MacCustomizeView: View {
                 },
                 secondaryButton: .cancel()
             )
+        }
+        .overlay {
+            if isBulkOperationInProgress {
+                ZStack {
+                    Color.black.opacity(0.25)
+                        .ignoresSafeArea()
+
+                    VStack(spacing: 12) {
+                        ProgressView()
+                            .controlSize(.large)
+                        Text(bulkOperationMessage)
+                            .font(.headline)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding(20)
+                    .frame(maxWidth: 320)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    .shadow(radius: 10)
+                }
+            }
         }
     }
 
@@ -3548,19 +3679,24 @@ private struct MacCustomizeView: View {
     }
 
     private func performReset(_ action: ResetAction) {
+        beginBulkOperation("Deleting, please wait")
         switch action {
         case .deleteAllGear:
-            store.deleteAllGear()
-            resultMessage = "All assets have been deleted."
+            store.deleteAllGear { result in
+                finishReset(result, successMessage: "All assets have been deleted.")
+            }
         case .deleteAudioPatchsheet:
-            store.deletePatchesByCategory("Audio")
-            resultMessage = "Audio patchsheet has been deleted."
+            store.deletePatchesByCategory("Audio") { result in
+                finishReset(result, successMessage: "Audio patchsheet has been deleted.")
+            }
         case .deleteVideoPatchsheet:
-            store.deletePatchesByCategory("Video")
-            resultMessage = "Video patchsheet has been deleted."
+            store.deletePatchesByCategory("Video") { result in
+                finishReset(result, successMessage: "Video patchsheet has been deleted.")
+            }
         case .deleteLightingPatchsheet:
-            store.deletePatchesByCategory("Lighting")
-            resultMessage = "Lighting patchsheet has been deleted."
+            store.deletePatchesByCategory("Lighting") { result in
+                finishReset(result, successMessage: "Lighting patchsheet has been deleted.")
+            }
         }
     }
 
@@ -3606,10 +3742,18 @@ private struct MacCustomizeView: View {
 
             let gearItems = parseGearCSV(csvString)
             DispatchQueue.main.async {
-                store.replaceAllGear(gearItems)
-                gearSheetLink = ""
-                isImporting = false
-                resultMessage = "Imported \(gearItems.count) asset items."
+                beginBulkOperation("Importing, please wait")
+                store.replaceAllGear(gearItems) { result in
+                    endBulkOperation()
+                    isImporting = false
+                    switch result {
+                    case .success:
+                        gearSheetLink = ""
+                        resultMessage = "Imported \(gearItems.count) asset items."
+                    case .failure(let error):
+                        resultMessage = "Import failed: \(error.localizedDescription)"
+                    }
+                }
             }
         }.resume()
     }
@@ -3642,21 +3786,49 @@ private struct MacCustomizeView: View {
             }
 
             DispatchQueue.main.async {
-                store.replaceAllPatch(patchRows)
-                switch category {
-                case "Audio":
-                    audioPatchSheetLink = ""
-                case "Video":
-                    videoPatchSheetLink = ""
-                case "Lighting":
-                    lightingPatchSheetLink = ""
-                default:
-                    break
+                beginBulkOperation("Importing, please wait")
+                store.replaceAllPatch(patchRows) { result in
+                    endBulkOperation()
+                    isImporting = false
+                    switch result {
+                    case .success:
+                        switch category {
+                        case "Audio":
+                            audioPatchSheetLink = ""
+                        case "Video":
+                            videoPatchSheetLink = ""
+                        case "Lighting":
+                            lightingPatchSheetLink = ""
+                        default:
+                            break
+                        }
+                        resultMessage = "Imported \(patchRows.count) \(category) patches."
+                    case .failure(let error):
+                        resultMessage = "Import failed: \(error.localizedDescription)"
+                    }
                 }
-                isImporting = false
-                resultMessage = "Imported \(patchRows.count) \(category) patches."
             }
         }.resume()
+    }
+
+    private func beginBulkOperation(_ message: String) {
+        bulkOperationMessage = message
+        isBulkOperationInProgress = true
+    }
+
+    private func endBulkOperation() {
+        isBulkOperationInProgress = false
+        bulkOperationMessage = ""
+    }
+
+    private func finishReset(_ result: Result<Void, Error>, successMessage: String) {
+        endBulkOperation()
+        switch result {
+        case .success:
+            resultMessage = successMessage
+        case .failure(let error):
+            resultMessage = "Delete failed: \(error.localizedDescription)"
+        }
     }
 
     private func convertGoogleSheetLinkToCSV(_ link: String) -> URL {
@@ -3833,10 +4005,17 @@ private struct MacUsersView: View {
 
 private struct MacUserDetailView: View {
     @EnvironmentObject private var store: ProdConnectStore
+    @Environment(\.dismiss) private var dismiss
     @State private var user: UserProfile
     @State private var isSaving = false
     @State private var errorMessage: String?
     @State private var showTransferConfirm = false
+    @State private var showDeleteConfirm = false
+
+    private var canDeleteUser: Bool {
+        guard let currentUser = store.user else { return false }
+        return currentUser.canDelete(user)
+    }
 
     init(user: UserProfile) {
         _user = State(initialValue: user)
@@ -3940,6 +4119,15 @@ private struct MacUserDetailView: View {
                 }
             }
 
+            if canDeleteUser {
+                Section {
+                    Button("Delete User", role: .destructive) {
+                        showDeleteConfirm = true
+                    }
+                    .disabled(isSaving)
+                }
+            }
+
             if let errorMessage {
                 Section {
                     Text(errorMessage)
@@ -3956,6 +4144,14 @@ private struct MacUserDetailView: View {
             }
         } message: {
             Text("This will move the Owner role and subscription control to this user.")
+        }
+        .alert("Delete User?", isPresented: $showDeleteConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                deleteUser()
+            }
+        } message: {
+            Text("This permanently deletes \(user.displayName)'s user profile.")
         }
         .toolbar {
             if isSaving {
@@ -4112,6 +4308,26 @@ private struct MacUserDetailView: View {
     private func replaceTeamMember() {
         guard let index = store.teamMembers.firstIndex(where: { $0.id == user.id }) else { return }
         store.teamMembers[index] = user
+    }
+
+    private func deleteUser() {
+        guard canDeleteUser else { return }
+
+        isSaving = true
+        errorMessage = nil
+
+        store.db.collection("users").document(user.id).delete { error in
+            DispatchQueue.main.async {
+                self.isSaving = false
+                if let error {
+                    self.errorMessage = "Delete failed: \(error.localizedDescription)"
+                    return
+                }
+
+                self.store.teamMembers.removeAll { $0.id == self.user.id }
+                dismiss()
+            }
+        }
     }
 }
 
