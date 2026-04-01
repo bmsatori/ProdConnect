@@ -32,7 +32,7 @@
 /* Begin PBXFileReference section */
 		2B897B502F5286D7002C581F /* StoreKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = StoreKit.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.2.sdk/System/Library/Frameworks/StoreKit.framework; sourceTree = DEVELOPER_DIR; };
 		2BB0629A2EABF1CD008325B6 /* ProdConnect.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ProdConnect.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		3C1000102F40000100000001 /* ProdConnectMac.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ProdConnectMac.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		3C1000102F40000100000001 /* ProdConnect.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ProdConnect.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		3C1000112F40000100000001 /* ProdConnect/SharedModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProdConnect/SharedModels.swift; sourceTree = SOURCE_ROOT; };
 		3C1000122F40000100000001 /* ProdConnect/ProdConnectStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProdConnect/ProdConnectStore.swift; sourceTree = SOURCE_ROOT; };
 		3C1000132F40000100000001 /* ProdConnect/GearItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProdConnect/GearItem.swift; sourceTree = SOURCE_ROOT; };
@@ -119,7 +119,7 @@
 			isa = PBXGroup;
 			children = (
 				2BB0629A2EABF1CD008325B6 /* ProdConnect.app */,
-				3C1000102F40000100000001 /* ProdConnectMac.app */,
+				3C1000102F40000100000001 /* ProdConnect.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -199,8 +199,8 @@
 				2B13ADA32F3EDD61000099A9 /* FirebaseStorage */,
 				2B13ADA52F3EDD77000099A9 /* FirebaseFirestore */,
 			);
-			productName = ProdConnectMac;
-			productReference = 3C1000102F40000100000001 /* ProdConnectMac.app */;
+			productName = ProdConnect;
+			productReference = 3C1000102F40000100000001 /* ProdConnect.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -420,7 +420,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = ProdConnect/ProdConnect.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 13;
+				CURRENT_PROJECT_VERSION = 18;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
@@ -435,7 +435,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0.7;
+				MARKETING_VERSION = 1.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = Timer.ProdConnect;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -458,7 +458,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = ProdConnect/ProdConnect.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 13;
+				CURRENT_PROJECT_VERSION = 18;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
@@ -473,7 +473,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0.7;
+				MARKETING_VERSION = 1.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = Timer.ProdConnect;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -496,18 +496,20 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = ProdConnectMac/ProdConnectMac.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 13;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = ProdConnect;
+				INFOPLIST_KEY_CFBundleName = ProdConnect;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.business";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.6;
-				MARKETING_VERSION = 1.0.5;
+				MARKETING_VERSION = 1.0.6;
 				PRODUCT_BUNDLE_IDENTIFIER = Timer.ProdConnect.mac;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_NAME = ProdConnect;
 				SDKROOT = macosx;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SUPPORTED_PLATFORMS = macosx;
@@ -526,18 +528,20 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = ProdConnectMac/ProdConnectMac.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 13;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = ProdConnect;
+				INFOPLIST_KEY_CFBundleName = ProdConnect;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.business";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.6;
-				MARKETING_VERSION = 1.0.5;
+				MARKETING_VERSION = 1.0.6;
 				PRODUCT_BUNDLE_IDENTIFIER = Timer.ProdConnect.mac;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_NAME = ProdConnect;
 				SDKROOT = macosx;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SUPPORTED_PLATFORMS = macosx;

@@ -50,6 +50,14 @@ service cloud.firestore {
       return requestedTeamCode() is string && requestedTeamCode().size() > 0;
     }
 
+    function isCreatingOwnTeam(teamId) {
+      return isSignedIn()
+        && !exists(/databases/$(database)/documents/teams/$(teamId))
+        && request.resource.data.code == teamId
+        && request.resource.data.isActive == true
+        && request.resource.data.createdBy is string;
+    }
+
     function requestedTeamCodeIsValid() {
       return !hasRequestedTeamCode()
         || (
@@ -81,14 +89,21 @@ service cloud.firestore {
 
     match /teams/{teamId} {
       allow read: if isSignedIn();
-      allow write: if isAdmin();
+      allow create: if isAdmin() || isCreatingOwnTeam(teamId);
+      allow update, delete: if isAdmin();
       
       match /locations/{locationId} {
-        allow read, write: if isSignedIn() && teamId == getUserTeamCode();
+        allow read, write: if isOnRequestersTeam(teamId);
       }
       
       match /rooms/{roomId} {
-        allow read, write: if isSignedIn() && teamId == getUserTeamCode();
+        allow read, write: if isOnRequestersTeam(teamId);
+      }
+
+      match /integrations/{integrationId} {
+        allow read, write: if isSignedIn()
+          && isOnRequestersTeam(teamId)
+          && (isAdmin() || isOwner());
       }
     }
 

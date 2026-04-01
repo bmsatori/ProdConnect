@@ -346,8 +346,7 @@ struct GearTabView: View {
             .onChange(of: selectedLocation) { _ in }
         }
         .sheet(isPresented: $showAddGear) {
-            AddGearView { newItem in
-                store.saveGear(newItem)
+            AddGearView { _ in
                 showAddGear = false
             }
         }
@@ -470,24 +469,49 @@ struct GearTabView: View {
     private func mergeDuplicates() {
         isMerging = true
         let groups = findDuplicateGearGroups()
-        var mergedCount = 0
+        mergeDuplicateGroups(groups, mergedCount: 0)
+    }
 
-        for group in groups {
-            guard var merged = group.first else { continue }
-            for item in group.dropFirst() {
-                if merged.category.isEmpty, !item.category.isEmpty { merged.category = item.category }
-                if merged.location.isEmpty, !item.location.isEmpty { merged.location = item.location }
-                if merged.maintenanceNotes.isEmpty, !item.maintenanceNotes.isEmpty { merged.maintenanceNotes = item.maintenanceNotes }
-                if merged.status == .unknown, item.status != .unknown { merged.status = item.status }
-            }
-            store.deleteGear(items: group)
-            store.saveGear(merged)
-            mergedCount += 1
+    private func mergeDuplicateGroups(_ groups: [[GearItem]], mergedCount: Int) {
+        guard let group = groups.first else {
+            isMerging = false
+            mergeResultMessage = "Merged \(mergedCount) duplicate group(s)."
+            showMergeResult = true
+            return
         }
 
-        isMerging = false
-        mergeResultMessage = "Merged \(mergedCount) duplicate group(s)."
-        showMergeResult = true
+        guard var merged = group.first else {
+            mergeDuplicateGroups(Array(groups.dropFirst()), mergedCount: mergedCount)
+            return
+        }
+
+        for item in group.dropFirst() {
+            if merged.category.isEmpty, !item.category.isEmpty { merged.category = item.category }
+            if merged.location.isEmpty, !item.location.isEmpty { merged.location = item.location }
+            if merged.maintenanceNotes.isEmpty, !item.maintenanceNotes.isEmpty { merged.maintenanceNotes = item.maintenanceNotes }
+            if merged.status == .unknown, item.status != .unknown { merged.status = item.status }
+        }
+
+        let duplicatesToDelete = Array(group.dropFirst())
+        store.deleteGear(items: duplicatesToDelete) { result in
+            switch result {
+            case .success:
+                store.saveGear(merged) { saveResult in
+                    switch saveResult {
+                    case .success:
+                        mergeDuplicateGroups(Array(groups.dropFirst()), mergedCount: mergedCount + 1)
+                    case .failure(let error):
+                        isMerging = false
+                        mergeResultMessage = "Merge failed: \(error.localizedDescription)"
+                        showMergeResult = true
+                    }
+                }
+            case .failure(let error):
+                isMerging = false
+                mergeResultMessage = "Merge failed: \(error.localizedDescription)"
+                showMergeResult = true
+            }
+        }
     }
 
     private func exportGear() {
@@ -833,8 +857,7 @@ struct GearTabView: View {
                 }
             }
             .sheet(isPresented: $showAddGear) {
-                AddGearView { item in
-                    store.saveGear(item)
+                AddGearView { _ in
                     showAddGear = false
                 }
                 .environmentObject(store)
@@ -1130,8 +1153,7 @@ struct ContentView: View {
         }
     }
     private var addGearSheetContent: some View {
-        AddGearView { newItem in
-            store.saveGear(newItem)
+        AddGearView { _ in
             showAddGear = false
         }
         .environmentObject(store)
@@ -1433,9 +1455,7 @@ struct ContentView: View {
             guard let uid = result?.user.uid else { return }
             
             let defaultName = email.components(separatedBy: "@").first ?? "New User"
-            let hasTeamCode = teamCode != nil && !teamCode!.isEmpty
-            // Basic tier for team members or admin signups; otherwise free
-            let subscriptionTier = (hasTeamCode || isAdmin) ? "basic" : "free"
+            let subscriptionTier = "free"
             let finalIsAdmin = isAdmin
             
             // Auto-generate hidden team code for free accounts
@@ -1460,14 +1480,14 @@ struct ContentView: View {
                 "isAdmin": finalIsAdmin,
                 "isOwner": false,
                 "subscriptionTier": subscriptionTier,
-                "canEditPatchsheet": subscriptionTier != "free",
-                "canEditTraining": subscriptionTier != "free",
-                "canEditGear": subscriptionTier != "free",
-                "canEditIdeas": subscriptionTier != "free",
-                "canEditChecklists": subscriptionTier != "free",
-                "canSeeChat": true,
+                "canEditPatchsheet": true,
+                "canEditTraining": false,
+                "canEditGear": true,
+                "canEditIdeas": true,
+                "canEditChecklists": true,
+                "canSeeChat": false,
                 "canSeePatchsheet": true,
-                "canSeeTraining": true,
+                "canSeeTraining": false,
                 "canSeeGear": true,
                 "canSeeIdeas": true,
                 "canSeeChecklists": true
@@ -1480,11 +1500,13 @@ struct ContentView: View {
                     } else {
                         var profile = UserProfile(id: uid, displayName: defaultName, email: email, teamCode: finalTeamCode, isAdmin: finalIsAdmin)
                         profile.subscriptionTier = subscriptionTier
-                        profile.canEditPatchsheet = subscriptionTier != "free"
-                        profile.canEditTraining = subscriptionTier != "free"
-                        profile.canEditGear = subscriptionTier != "free"
-                        profile.canEditIdeas = subscriptionTier != "free"
-                        profile.canEditChecklists = subscriptionTier != "free"
+                        profile.canEditPatchsheet = true
+                        profile.canEditTraining = false
+                        profile.canEditGear = true
+                        profile.canEditIdeas = true
+                        profile.canEditChecklists = true
+                        profile.canSeeChat = false
+                        profile.canSeeTraining = false
                         self.user = profile
                         // Set OneSignal external user ID (email)
                         OneSignal.login(profile.email)
@@ -1561,59 +1583,39 @@ struct ContentView: View {
                 return
             }
 
-            do {
-                guard let data = snap.data(), var profile = decodeFirestoreDocument(data, as: UserProfile.self) else {
-                    throw NSError(domain: "ProfileDecode", code: 0, userInfo: [NSLocalizedDescriptionKey: "Unable to decode user profile."])
-                }
-                if profile.displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    profile.displayName = profile.email.components(separatedBy: "@").first ?? "New User"
-                }
-                if profile.isAdmin && profile.subscriptionTier == "free" {
-                    profile.subscriptionTier = "basic"
-                    profile.canEditPatchsheet = true
-                    profile.canEditTraining = true
-                    profile.canEditGear = true
-                    profile.canEditIdeas = true
-                    profile.canEditChecklists = true
-                    self.db.collection("users").document(profile.id).setData([
-                        "subscriptionTier": "basic",
-                        "canEditPatchsheet": true,
-                        "canEditTraining": true,
-                        "canEditGear": true,
-                        "canEditIdeas": true,
-                        "canEditChecklists": true
-                    ], merge: true) { error in
-                        if let error = error { print("Firestore update error:", error) }
+            Task { @MainActor in
+                do {
+                    guard let data = snap.data(), var profile = decodeFirestoreDocument(data, as: UserProfile.self) else {
+                        throw NSError(domain: "ProfileDecode", code: 0, userInfo: [NSLocalizedDescriptionKey: "Unable to decode user profile."])
                     }
-                }
-                if profile.isOwner {
-                    var ownerUpdates: [String: Any] = [:]
-                    if !profile.isAdmin {
-                        profile.isAdmin = true
-                        ownerUpdates["isAdmin"] = true
+                    if profile.displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        profile.displayName = profile.email.components(separatedBy: "@").first ?? "New User"
                     }
-                    if profile.subscriptionTier == "free" {
-                        profile.subscriptionTier = "basic"
-                        ownerUpdates["subscriptionTier"] = "basic"
-                    }
-                    if !ownerUpdates.isEmpty {
-                        self.db.collection("users").document(profile.id).setData(ownerUpdates, merge: true) { error in
-                            if let error = error { print("Firestore update error:", error) }
+                    if profile.isOwner {
+                        var ownerUpdates: [String: Any] = [:]
+                        if !profile.isAdmin {
+                            profile.isAdmin = true
+                            ownerUpdates["isAdmin"] = true
+                        }
+                        if !ownerUpdates.isEmpty {
+                            self.db.collection("users").document(profile.id).setData(ownerUpdates, merge: true) { error in
+                                if let error = error { print("Firestore update error:", error) }
+                            }
                         }
                     }
-                }
 
-                self.ensureValidTeamCode(profile) { updatedProfile in
-                    self.ensureTeamDocumentExists(updatedProfile)
-                    self.user = updatedProfile
-                    // Register with OneSignal
-                    OneSignal.login(updatedProfile.email)
-                    print("DEBUG: OneSignal logged in with: \(updatedProfile.email)")
-                    self.listenToTeamData()
-                    completion(.success(updatedProfile))
+                    self.ensureValidTeamCode(profile) { updatedProfile in
+                        self.ensureTeamDocumentExists(updatedProfile)
+                        self.user = updatedProfile
+                        // Register with OneSignal
+                        OneSignal.login(updatedProfile.email)
+                        print("DEBUG: OneSignal logged in with: \(updatedProfile.email)")
+                        self.listenToTeamData()
+                        completion(.success(updatedProfile))
+                    }
+                } catch {
+                    completion(.failure(error))
                 }
-            } catch {
-                completion(.failure(error))
             }
         }
     }
@@ -1642,11 +1644,11 @@ struct ContentView: View {
             "isOwner": false,
             "subscriptionTier": "free",
             "assignedCampus": "",
-            "canEditPatchsheet": false,
+            "canEditPatchsheet": true,
             "canEditTraining": false,
-            "canEditGear": false,
-            "canEditIdeas": false,
-            "canEditChecklists": false,
+            "canEditGear": true,
+            "canEditIdeas": true,
+            "canEditChecklists": true,
             "canSeeChat": true,
             "canSeePatchsheet": true,
             "canSeeTraining": true,
@@ -1664,11 +1666,11 @@ struct ContentView: View {
             var profile = UserProfile(id: uid, displayName: defaultName, email: safeEmail, teamCode: teamCode)
             profile.subscriptionTier = "free"
             profile.assignedCampus = ""
-            profile.canEditPatchsheet = false
+            profile.canEditPatchsheet = true
             profile.canEditTraining = false
-            profile.canEditGear = false
-            profile.canEditIdeas = false
-            profile.canEditChecklists = false
+            profile.canEditGear = true
+            profile.canEditIdeas = true
+            profile.canEditChecklists = true
 
             self.user = profile
             OneSignal.login(profile.email)
@@ -1861,10 +1863,12 @@ struct ContentView: View {
                 }
 
                 let docs = snap?.documents ?? []
-                patchItems = docs.compactMap { doc in
-                    decodeFirestoreDocument(doc.data(), as: PatchRow.self)
+                Task { @MainActor in
+                    patchItems = docs.compactMap { doc in
+                        decodeFirestoreDocument(doc.data(), as: PatchRow.self)
+                    }
+                    group.leave()
                 }
-                group.leave()
             }
 
         group.notify(queue: .main) {
@@ -2008,7 +2012,7 @@ struct ContentView: View {
                         return patch
                     }
                     
-                    self.patchsheet = decoded.sorted { $0.position < $1.position }
+                    self.patchsheet = decoded.sorted(by: PatchRow.autoSort)
                     print("DEBUG: Loaded \(decoded.count) patchsheet items for \(teamCode), now have \(self.patchsheet.count) total")
                 }
             }
@@ -2216,10 +2220,10 @@ struct ContentView: View {
                     return
                 }
                 let docs = snap?.documents ?? []
-                let decoded = docs.compactMap { doc in
-                    decodeFirestoreDocument(doc.data(), as: ChatChannel.self)
-                }
-                DispatchQueue.main.async {
+                Task { @MainActor in
+                    let decoded = docs.compactMap { doc in
+                        decodeFirestoreDocument(doc.data(), as: ChatChannel.self)
+                    }
                     self.channels = decoded.sorted { lhs, rhs in
                         if lhs.position != rhs.position { return lhs.position < rhs.position }
                         return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
@@ -2442,18 +2446,49 @@ struct ContentView: View {
         save(item, collection: "ideas")
     }
     func saveChannel(_ item: ChatChannel) { save(item, collection: "channels") }
-    func savePatch(_ item: PatchRow) {
-        // Persist to Firestore
-        save(item, collection: "patchsheet")
-        let campus = item.campus.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !campus.isEmpty { saveLocation(campus) }
-        // Optimistically update local state so UI reflects changes immediately
-        DispatchQueue.main.async {
-            if let idx = self.patchsheet.firstIndex(where: { $0.id == item.id }) {
-                self.patchsheet[idx] = item
-            } else {
-                self.patchsheet.append(item)
+    func savePatch(_ item: PatchRow, completion: ((Result<Void, Error>) -> Void)? = nil) {
+        var patch = item
+        let resolvedTeamCode = (
+            user?.teamCode?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                ? user?.teamCode
+                : teamCode
+        )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        guard !resolvedTeamCode.isEmpty else {
+            let error = NSError(
+                domain: "ProdConnect",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No valid team code is available for this patch."]
+            )
+            completion?(.failure(error))
+            return
+        }
+
+        patch.teamCode = resolvedTeamCode
+
+        do {
+            try db.collection("patchsheet").document(patch.id).setData(from: patch, merge: true) { error in
+                DispatchQueue.main.async {
+                    if let error {
+                        print("Error saving patch:", error.localizedDescription)
+                        completion?(.failure(error))
+                        return
+                    }
+
+                    let campus = patch.campus.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !campus.isEmpty { self.saveLocation(campus) }
+
+                    if let idx = self.patchsheet.firstIndex(where: { $0.id == patch.id }) {
+                        self.patchsheet[idx] = patch
+                    } else {
+                        self.patchsheet.append(patch)
+                    }
+
+                    completion?(.success(()))
+                }
             }
+        } catch {
+            completion?(.failure(error))
         }
     }
 
@@ -3064,6 +3099,7 @@ class IAPManager: ObservableObject {
     static let shared = IAPManager()
     @Published var product: Product?
     @Published var isAdminActive: Bool = false
+    private var transactionListenerTask: Task<Void, Never>?
 
     // Replace with your subscription product IDs
     private let basicSubscriptionProductID = "Basic1"
@@ -3087,6 +3123,24 @@ class IAPManager: ObservableObject {
             }
         } catch {
             print("Error fetching subscription products: \(error)")
+        }
+    }
+
+    func startObservingTransactions(for store: ProdConnectStore) {
+        guard transactionListenerTask == nil else { return }
+
+        transactionListenerTask = Task {
+            await reconcileSubscriptionState(for: store)
+
+            for await update in Transaction.updates {
+                do {
+                    let transaction = try checkVerified(update)
+                    await reconcileSubscriptionState(for: store)
+                    await transaction.finish()
+                } catch {
+                    print("Transaction update handling failed:", error)
+                }
+            }
         }
     }
 
@@ -3171,7 +3225,7 @@ class IAPManager: ObservableObject {
     func restorePurchases(for store: ProdConnectStore) async {
         do {
             try await AppStore.sync()
-            await checkSubscription(for: store)
+            await reconcileSubscriptionState(for: store)
         } catch {
             print("Restore failed:", error)
         }
@@ -3179,32 +3233,27 @@ class IAPManager: ObservableObject {
 
     // MARK: - Check Current Subscription Entitlement
     func checkSubscription(for store: ProdConnectStore) async {
+        await reconcileSubscriptionState(for: store)
+    }
+
+    private func reconcileSubscriptionState(for store: ProdConnectStore) async {
         do {
+            var highestTier: String?
             for try await verification in Transaction.currentEntitlements {
                 let transaction = try checkVerified(verification)
-                let resolvedTier: String?
-                switch transaction.productID {
-                case basicSubscriptionProductID:
-                    resolvedTier = "basic"
-                case basicTicketingSubscriptionProductID:
-                    resolvedTier = "basic_ticketing"
-                case premiumSubscriptionProductID:
-                    resolvedTier = "premium"
-                case premiumTicketingSubscriptionProductID:
-                    resolvedTier = "premium_ticketing"
-                default:
-                    resolvedTier = nil
+                guard let resolvedTier = subscriptionTier(for: transaction.productID) else {
+                    continue
                 }
-                if let resolvedTier, await canApplySubscription(for: store) {
-                    await applySubscriptionTier(resolvedTier, for: store)
-                    return
+                if highestTier == nil || subscriptionTierRank(for: resolvedTier) > subscriptionTierRank(for: highestTier ?? "free") {
+                    highestTier = resolvedTier
                 }
             }
-            // No active subscription found; revoke all premium features
-            await revokePremiumFeatures(for: store)
+
+            if let highestTier {
+                await applySubscriptionTier(highestTier, for: store)
+            }
         } catch {
             print("Error checking subscription:", error)
-            await revokePremiumFeatures(for: store)
         }
     }
 
@@ -3237,14 +3286,21 @@ class IAPManager: ObservableObject {
 
     private func applySubscriptionTier(_ targetTier: String, for store: ProdConnectStore) async {
         guard var user = store.user else { return }
-        let normalizedTier = targetTier.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if user.subscriptionTier.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedTier,
-           user.isAdmin {
+        let normalizedTier = canonicalSubscriptionTier(targetTier)
+        if canonicalSubscriptionTier(user.subscriptionTier) == normalizedTier,
+           user.isAdmin,
+           user.canEditTraining,
+           user.canSeeChat,
+           user.canSeeTraining {
             return
         }
 
         user.subscriptionTier = normalizedTier
         user.isAdmin = true
+        user.canEditTraining = normalizedTier != "free"
+        user.canSeeChat = normalizedTier != "free"
+        user.canSeeTraining = normalizedTier != "free"
+        user.canSeeTickets = user.hasTicketingFeatures
 
         if user.teamCode == nil || user.teamCode?.isEmpty == true {
             var teamCode = store.generateTeamCode()
@@ -3280,7 +3336,11 @@ class IAPManager: ObservableObject {
         store.db.collection("users").document(user.id).setData([
             "subscriptionTier": user.subscriptionTier,
             "isAdmin": true,
-            "teamCode": user.teamCode ?? ""
+            "teamCode": user.teamCode ?? "",
+            "canEditTraining": user.canEditTraining,
+            "canSeeChat": user.canSeeChat,
+            "canSeeTraining": user.canSeeTraining,
+            "canSeeTickets": user.canSeeTickets
         ], merge: true) { error in
             if let error = error { print("Firestore update error:", error) }
         }
@@ -3325,9 +3385,6 @@ class IAPManager: ObservableObject {
         if user.isOwner {
             user.isAdmin = true
         }
-        if user.isAdmin && user.subscriptionTier == "free" {
-            user.subscriptionTier = "basic"
-        }
         print("Admin toggled to: \(user.isAdmin)")
         
         await MainActor.run {
@@ -3349,17 +3406,70 @@ class IAPManager: ObservableObject {
         }
     }
     
-    private func revokePremiumFeatures(for store: ProdConnectStore) async {
+    private func revokeSubscriptionEntitlements(for store: ProdConnectStore) async {
         guard var user = store.user else { return }
-        if user.subscriptionTier == "premium" && !user.isAdmin {
-            user.subscriptionTier = "free"
-            store.user = user
-            
-            store.db.collection("users").document(user.id).setData([
-                "subscriptionTier": "free"
-            ], merge: true) { error in
-                if let error = error { print("Firestore update error:", error) }
-            }
+        guard canonicalSubscriptionTier(user.subscriptionTier) != "free" else { return }
+
+        user.subscriptionTier = "free"
+        user.canEditTraining = false
+        user.canSeeChat = false
+        user.canSeeTraining = false
+        user.canSeeTickets = false
+        store.user = user
+
+        store.db.collection("users").document(user.id).setData([
+            "subscriptionTier": "free",
+            "canEditTraining": false,
+            "canSeeChat": false,
+            "canSeeTraining": false,
+            "canSeeTickets": false
+        ], merge: true) { error in
+            if let error = error { print("Firestore update error:", error) }
+        }
+    }
+
+    private func subscriptionTier(for productID: String) -> String? {
+        switch productID {
+        case basicSubscriptionProductID:
+            return "basic"
+        case basicTicketingSubscriptionProductID:
+            return "basic_ticketing"
+        case premiumSubscriptionProductID:
+            return "premium"
+        case premiumTicketingSubscriptionProductID:
+            return "premium_ticketing"
+        default:
+            return nil
+        }
+    }
+
+    private func canonicalSubscriptionTier(_ rawValue: String?) -> String {
+        switch rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "free" {
+        case "premium_ticketing", "premium w/ticketing", "premium with ticketing":
+            return "premium_ticketing"
+        case "basic_ticketing", "basic w/ticketing", "basic with ticketing":
+            return "basic_ticketing"
+        case "premium":
+            return "premium"
+        case "basic":
+            return "basic"
+        default:
+            return "free"
+        }
+    }
+
+    private func subscriptionTierRank(for tier: String) -> Int {
+        switch canonicalSubscriptionTier(tier) {
+        case "premium_ticketing":
+            return 4
+        case "premium":
+            return 3
+        case "basic_ticketing":
+            return 2
+        case "basic":
+            return 1
+        default:
+            return 0
         }
     }
 
@@ -3425,9 +3535,6 @@ class IAPManager: ObservableObject {
         var updated = user
         updated.isOwner = true
         updated.isAdmin = true
-        if updated.subscriptionTier == "free" {
-            updated.subscriptionTier = "basic"
-        }
 
         await MainActor.run {
             store.user = updated
@@ -3435,8 +3542,7 @@ class IAPManager: ObservableObject {
 
         store.db.collection("users").document(updated.id).setData([
             "isOwner": true,
-            "isAdmin": true,
-            "subscriptionTier": updated.subscriptionTier
+            "isAdmin": true
         ], merge: true) { error in
             if let error = error { print("Firestore update error:", error) }
         }
@@ -3540,11 +3646,282 @@ struct ProdConnectApp: App {
                 LoginView()
                     .environmentObject(store)
                     .preferredColorScheme(.dark)
+                    .task {
+                        iap.startObservingTransactions(for: store)
+                    }
             } else {
-                MainTabView()
+                iOSLaunchWelcomeContainer()
                     .environmentObject(store)
                     .environmentObject(iap)
                     .preferredColorScheme(.dark)
+                    .task {
+                        iap.startObservingTransactions(for: store)
+                    }
+            }
+        }
+    }
+}
+
+private struct iOSLaunchWelcomeContainer: View {
+    @EnvironmentObject private var store: ProdConnectStore
+    @AppStorage(preferredMainTabSectionsStorageKey) private var preferredMainTabSections = ""
+    @State private var showsWelcomeScreen = true
+    @State private var selectedLaunchSection: MainAppSection?
+    @State private var shouldOpenMoreTab = false
+
+    private var userDisplayName: String {
+        let trimmedName = store.user?.displayName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmedName.isEmpty {
+            return trimmedName
+        }
+
+        let fallbackEmail = store.user?.email.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if let prefix = fallbackEmail.split(separator: "@").first, !prefix.isEmpty {
+            return String(prefix)
+        }
+        return "User"
+    }
+
+    private var organizationDisplayName: String? {
+        let trimmedName = store.organizationName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedName.isEmpty ? nil : trimmedName
+    }
+
+    private var availableSections: [MainAppSection] {
+        availableMainAppSections(for: store)
+    }
+
+    private var featuredSections: [MainAppSection] {
+        resolvedPreferredMainTabSections(
+            storedValue: preferredMainTabSections,
+            availableSections: availableSections
+        )
+    }
+
+    private var hasNotificationsShortcut: Bool {
+        availableSections.contains(.notifications)
+    }
+
+    private var hasMoreShortcut: Bool {
+        availableSections.contains { !featuredSections.contains($0) }
+    }
+
+    var body: some View {
+        Group {
+            if showsWelcomeScreen {
+                iOSWelcomeView(
+                    userDisplayName: userDisplayName,
+                    organizationDisplayName: organizationDisplayName,
+                    sections: featuredSections,
+                    showsNotificationsShortcut: hasNotificationsShortcut,
+                    showsMoreShortcut: hasMoreShortcut,
+                    openSection: { section in
+                        selectedLaunchSection = section
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            showsWelcomeScreen = false
+                        }
+                    },
+                    openMore: {
+                        shouldOpenMoreTab = true
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            showsWelcomeScreen = false
+                        }
+                    }
+                )
+            } else {
+                MainTabView(
+                    selectedLaunchSection: $selectedLaunchSection,
+                    shouldOpenMoreTab: $shouldOpenMoreTab
+                )
+            }
+        }
+        .onChange(of: store.user?.id) { newValue in
+            showsWelcomeScreen = newValue != nil
+            if newValue == nil {
+                selectedLaunchSection = nil
+                shouldOpenMoreTab = false
+            }
+        }
+    }
+}
+
+private struct iOSWelcomeView: View {
+    let userDisplayName: String
+    let organizationDisplayName: String?
+    let sections: [MainAppSection]
+    let showsNotificationsShortcut: Bool
+    let showsMoreShortcut: Bool
+    let openSection: (MainAppSection) -> Void
+    let openMore: () -> Void
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 14),
+        GridItem(.flexible(), spacing: 14)
+    ]
+
+    var body: some View {
+        ZStack {
+            LinearGradient(
+                colors: [
+                    Color(red: 0.03, green: 0.07, blue: 0.11),
+                    Color(red: 0.05, green: 0.12, blue: 0.24),
+                    Color(red: 0.01, green: 0.02, blue: 0.04)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+
+            Circle()
+                .fill(Color(red: 0.2, green: 0.45, blue: 0.92).opacity(0.24))
+                .frame(width: 280, height: 280)
+                .blur(radius: 20)
+                .offset(x: -130, y: -250)
+
+            Circle()
+                .fill(Color.white.opacity(0.09))
+                .frame(width: 240, height: 240)
+                .blur(radius: 28)
+                .offset(x: 150, y: 260)
+
+            GeometryReader { proxy in
+                let compactHeight = proxy.size.height < 760
+                let veryCompactHeight = proxy.size.height < 700
+                let compactWidth = proxy.size.width < 390
+                let iconBoxSize: CGFloat = veryCompactHeight ? 64 : (compactHeight ? 72 : 86)
+                let iconSize: CGFloat = veryCompactHeight ? 26 : (compactHeight ? 30 : 34)
+                let titleSize: CGFloat = veryCompactHeight ? 30 : (compactHeight ? 34 : 40)
+                let orgSize: CGFloat = veryCompactHeight ? 19 : (compactHeight ? 21 : 24)
+                let sectionSpacing: CGFloat = veryCompactHeight ? 14 : (compactHeight ? 18 : 24)
+                let tileHeight: CGFloat = veryCompactHeight ? 62 : (compactHeight ? 72 : 86)
+                let tileSpacing: CGFloat = veryCompactHeight ? 8 : (compactHeight ? 10 : 14)
+                let horizontalPadding: CGFloat = compactWidth ? 20 : 28
+                let verticalPadding: CGFloat = veryCompactHeight ? 18 : (compactHeight ? 24 : 34)
+
+                VStack {
+                    VStack(spacing: sectionSpacing) {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                                .fill(Color.white.opacity(0.08))
+                                .frame(width: iconBoxSize, height: iconBoxSize)
+
+                            Image(systemName: "person.crop.circle.badge.checkmark")
+                                .font(.system(size: iconSize, weight: .semibold))
+                                .foregroundColor(.white)
+                        }
+
+                        VStack(spacing: compactHeight ? 8 : 10) {
+                            Text("Welcome")
+                                .font(.system(size: veryCompactHeight ? 15 : (compactHeight ? 16 : 18), weight: .semibold, design: .rounded))
+                                .foregroundColor(.white.opacity(0.68))
+
+                            Text(userDisplayName)
+                                .font(.system(size: titleSize, weight: .bold, design: .rounded))
+                                .foregroundColor(.white)
+                                .multilineTextAlignment(.center)
+                                .lineLimit(2)
+                                .minimumScaleFactor(0.6)
+                                .allowsTightening(true)
+
+                            if let organizationDisplayName, !organizationDisplayName.isEmpty {
+                                Text(organizationDisplayName)
+                                    .font(.system(size: orgSize, weight: .medium, design: .rounded))
+                                    .foregroundColor(Color.white.opacity(0.82))
+                                    .multilineTextAlignment(.center)
+                                    .lineLimit(2)
+                                    .minimumScaleFactor(0.65)
+                                    .allowsTightening(true)
+                            }
+                        }
+
+                        LazyVGrid(columns: columns, spacing: tileSpacing) {
+                            ForEach(sections) { section in
+                                Button {
+                                    openSection(section)
+                                } label: {
+                                    VStack(spacing: compactHeight ? 8 : 10) {
+                                        Image(systemName: section.icon)
+                                            .font(.system(size: veryCompactHeight ? 16 : (compactHeight ? 18 : 20), weight: .semibold))
+                                        Text(section.title)
+                                            .font(.system(size: veryCompactHeight ? 13 : (compactHeight ? 14 : 15), weight: .semibold))
+                                            .multilineTextAlignment(.center)
+                                            .lineLimit(2)
+                                            .minimumScaleFactor(0.8)
+                                    }
+                                    .foregroundColor(.white)
+                                    .frame(maxWidth: .infinity, minHeight: tileHeight)
+                                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
+
+                            if showsNotificationsShortcut {
+                                Button {
+                                    openSection(.notifications)
+                                } label: {
+                                    VStack(spacing: compactHeight ? 8 : 10) {
+                                        Image(systemName: MainAppSection.notifications.icon)
+                                            .font(.system(size: veryCompactHeight ? 16 : (compactHeight ? 18 : 20), weight: .semibold))
+                                        Text(MainAppSection.notifications.title)
+                                            .font(.system(size: veryCompactHeight ? 13 : (compactHeight ? 14 : 15), weight: .semibold))
+                                            .multilineTextAlignment(.center)
+                                            .lineLimit(2)
+                                            .minimumScaleFactor(0.8)
+                                    }
+                                    .foregroundColor(.white)
+                                    .frame(maxWidth: .infinity, minHeight: tileHeight)
+                                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
+
+                            if showsMoreShortcut {
+                                Button(action: openMore) {
+                                    VStack(spacing: compactHeight ? 8 : 10) {
+                                        Image(systemName: "ellipsis")
+                                            .font(.system(size: veryCompactHeight ? 16 : (compactHeight ? 18 : 20), weight: .semibold))
+                                        Text("More")
+                                            .font(.system(size: veryCompactHeight ? 13 : (compactHeight ? 14 : 15), weight: .semibold))
+                                            .multilineTextAlignment(.center)
+                                            .lineLimit(2)
+                                            .minimumScaleFactor(0.8)
+                                    }
+                                    .foregroundColor(.white)
+                                    .frame(maxWidth: .infinity, minHeight: tileHeight)
+                                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, horizontalPadding)
+                    .padding(.vertical, verticalPadding)
+                    .frame(maxWidth: 460)
+                    .background(
+                        RoundedRectangle(cornerRadius: 34, style: .continuous)
+                            .fill(.ultraThinMaterial)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 34, style: .continuous)
+                                    .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                            )
+                    )
+                    .shadow(color: Color.black.opacity(0.28), radius: 28, x: 0, y: 20)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.horizontal, compactWidth ? 16 : 24)
+                .padding(.vertical, veryCompactHeight ? 14 : (compactHeight ? 20 : 32))
             }
         }
     }
@@ -3791,6 +4168,8 @@ struct AccountView: View {
     @State private var showDeleteAccountStep2 = false
     @State private var deleteConfirmationText = ""
     @State private var isDeletingAccount = false
+    @State private var organizationName = ""
+    @State private var organizationStatusMessage: String?
 
     private var appVersionText: String {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
@@ -3825,6 +4204,7 @@ struct AccountView: View {
         let ownTier = canonicalSubscriptionTier(store.user?.subscriptionTier)
         let teamCode = store.user?.teamCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !teamCode.isEmpty else { return ownTier }
+        guard !store.teamMembers.isEmpty else { return ownTier }
 
         let teamMembers = store.teamMembers.filter {
             ($0.teamCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") == teamCode
@@ -3837,6 +4217,10 @@ struct AccountView: View {
 
     private var canUpgradeSubscription: Bool {
         (store.user?.isAdmin == true || store.user?.isOwner == true) && effectiveSubscriptionTier != "premium_ticketing"
+    }
+
+    private var canEditOrganizationName: Bool {
+        store.user?.isAdmin == true || store.user?.isOwner == true
     }
 
     var body: some View {
@@ -3913,6 +4297,25 @@ struct AccountView: View {
                             Text(appVersionText)
                                 .foregroundColor(.gray)
                                 .fontWeight(.medium)
+                        }
+                    }
+
+                    if canEditOrganizationName {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Organization Name")
+                                .foregroundColor(.white)
+                                .fontWeight(.medium)
+                            TextField("Organization Name", text: $organizationName)
+                                .textFieldStyle(.roundedBorder)
+                            Button("Save Organization Name") {
+                                saveOrganizationName()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            if let organizationStatusMessage {
+                                Text(organizationStatusMessage)
+                                    .font(.caption)
+                                    .foregroundColor(organizationStatusMessage.hasPrefix("Saved") ? .green : .red)
+                            }
                         }
                     }
                 }
@@ -4027,16 +4430,47 @@ struct AccountView: View {
         .navigationTitle("Account")
         .onAppear {
             loadUserInfo()
+            organizationName = store.organizationName
         }
-        .alert("Join Team", isPresented: $showJoinTeamAlert) {
-            TextField("Team Code", text: $joinTeamCode)
-            Button("Cancel", role: .cancel) {
-                joinTeamCode = ""
+        .onReceive(store.$user) { user in
+            applyAccountState(from: user)
+        }
+        .onReceive(store.$organizationName) { value in
+            organizationName = value
+        }
+        .sheet(isPresented: $showJoinTeamAlert) {
+            NavigationStack {
+                Form {
+                    Section("Join Team") {
+                        Text("Enter the team code to join an existing team.")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                        TextField("Team Code", text: $joinTeamCode)
+                            .textInputAutocapitalization(.characters)
+                            .autocorrectionDisabled(true)
+                    }
+                    Section {
+                        Button("Join") {
+                            joinTeam()
+                        }
+                        .disabled(joinTeamCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isJoiningTeam)
+                    }
+                }
+                .navigationTitle("Join Team")
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") {
+                            joinTeamCode = ""
+                            showJoinTeamAlert = false
+                        }
+                    }
+                    if isJoiningTeam {
+                        ToolbarItem(placement: .navigationBarTrailing) {
+                            ProgressView()
+                        }
+                    }
+                }
             }
-            Button("Join", action: joinTeam)
-                .disabled(joinTeamCode.trimmingCharacters(in: .whitespaces).isEmpty || isJoiningTeam)
-        } message: {
-            Text("Enter the team code to join an existing team.")
         }
         .sheet(isPresented: $showSubscriptionOptions) {
             SubscriptionOptionsSheet(
@@ -4148,14 +4582,17 @@ struct AccountView: View {
 
             let updates: [String: Any] = [
                 "teamCode": resolvedCode,
-                "subscriptionTier": "basic",
+                "subscriptionTier": "free",
                 "isAdmin": false,
                 "isOwner": false,
                 "canEditPatchsheet": true,
-                "canEditTraining": true,
+                "canEditTraining": false,
                 "canEditGear": true,
                 "canEditIdeas": true,
-                "canEditChecklists": true
+                "canEditChecklists": true,
+                "canSeeChat": false,
+                "canSeeTraining": false,
+                "canSeeTickets": false
             ]
 
             self.store.db.collection("users").document(user.uid).updateData(updates) { error in
@@ -4171,14 +4608,17 @@ struct AccountView: View {
 
                         var updated = self.store.user
                         updated?.teamCode = resolvedCode
-                        updated?.subscriptionTier = "basic"
+                        updated?.subscriptionTier = "free"
                         updated?.isAdmin = false
                         updated?.isOwner = false
                         updated?.canEditPatchsheet = true
-                        updated?.canEditTraining = true
+                        updated?.canEditTraining = false
                         updated?.canEditGear = true
                         updated?.canEditIdeas = true
                         updated?.canEditChecklists = true
+                        updated?.canSeeChat = false
+                        updated?.canSeeTraining = false
+                        updated?.canSeeTickets = false
                         self.store.user = updated
 
                         self.store.listenToTeamData()
@@ -4282,32 +4722,21 @@ struct AccountView: View {
         }
 
         NSLog("[DIAG] AccountView loadUserInfo start uid=%@", user.uid)
-        isLoading = true
         email = user.email ?? "Unknown"
 
         let fallbackDisplayName = email.components(separatedBy: "@").first ?? "User"
         let fallbackTeamCode = "N/A"
 
-        // Fail-safe so account screen cannot remain blocked forever.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-            if self.isLoading {
-                NSLog("[DIAG] AccountView loadUserInfo timeout fallback")
-                self.displayName = fallbackDisplayName
-                self.teamCode = fallbackTeamCode
-                self.isAdmin = self.store.user?.isAdmin ?? false
-                self.isLoading = false
-            }
-        }
-
-        // Use store's user data if available, otherwise fetch from Firestore
         if let storeUser = store.user {
-            displayName = storeUser.displayName
-            teamCode = storeUser.teamCode ?? "N/A"
-            isAdmin = storeUser.isAdmin
-            isLoading = false
+            applyAccountState(from: storeUser)
             NSLog("[DIAG] AccountView loadUserInfo using store.user")
             return
         }
+
+        displayName = fallbackDisplayName
+        teamCode = fallbackTeamCode
+        isAdmin = false
+        isLoading = false
 
         // Fetch profile directly by uid to avoid slow/blocked query paths.
         store.db.collection("users").document(user.uid).getDocument { snapshot, error in
@@ -4324,10 +4753,6 @@ struct AccountView: View {
 
                 guard let data = snapshot?.data() else {
                     NSLog("[DIAG] AccountView loadUserInfo missing user doc")
-                    self.displayName = fallbackDisplayName
-                    self.teamCode = fallbackTeamCode
-                    self.isAdmin = false
-                    self.isLoading = false
                     return
                 }
 
@@ -4338,6 +4763,30 @@ struct AccountView: View {
                 self.isAdmin = data["isAdmin"] as? Bool ?? false
                 self.isLoading = false
                 NSLog("[DIAG] AccountView loadUserInfo completed")
+            }
+        }
+    }
+
+    private func applyAccountState(from user: UserProfile?) {
+        guard let user else { return }
+        displayName = user.displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? (user.email.components(separatedBy: "@").first ?? "User")
+            : user.displayName
+        email = user.email
+        teamCode = user.teamCode?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? (user.teamCode ?? "N/A") : "N/A"
+        isAdmin = user.isAdmin
+        organizationName = store.organizationName
+        isLoading = false
+    }
+
+    private func saveOrganizationName() {
+        organizationStatusMessage = nil
+        store.saveOrganizationName(organizationName) { result in
+            switch result {
+            case .success:
+                organizationStatusMessage = "Saved organization name."
+            case .failure(let error):
+                organizationStatusMessage = "Save failed: \(error.localizedDescription)"
             }
         }
     }
@@ -4388,6 +4837,7 @@ struct AccountView: View {
 }
 
 struct SubscriptionOptionsSheet: View {
+    @EnvironmentObject private var store: ProdConnectStore
     @Environment(\.dismiss) private var dismiss
     @State private var basicProduct: Product?
     @State private var basicTicketingProduct: Product?
@@ -4405,63 +4855,17 @@ struct SubscriptionOptionsSheet: View {
 
     var body: some View {
         NavigationStack {
-            Group {
-                if #available(iOS 17.0, *) {
-                    subscriptionStoreContent
-                } else {
-                    fallbackSubscriptionContent
-                }
-            }
+            fallbackSubscriptionContent
             .navigationTitle("Subscribe")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Close") { dismiss() }
-                }
-                if #unavailable(iOS 17.0) {
-                    ToolbarItem(placement: .navigationBarTrailing) {
-                        Menu(isLoadingProducts ? "Loading..." : "Buy") {
-                            Button("Basic") {
-                                Task { await onPurchaseBasic() }
-                            }
-                            Button("Basic W/Ticketing") {
-                                Task { await onPurchaseBasicTicketing() }
-                            }
-                            Button("Premium") {
-                                Task { await onPurchasePremium() }
-                            }
-                            Button("Premium W/Ticketing") {
-                                Task { await onPurchasePremiumTicketing() }
-                            }
-                        }
-                        .disabled(isLoadingProducts)
-                    }
                 }
             }
             .task {
                 await loadProducts()
             }
         }
-    }
-
-    @available(iOS 17.0, *)
-    private var subscriptionStoreContent: some View {
-        SubscriptionStoreView(productIDs: subscriptionProductIDs) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("ProdConnect Subscriptions")
-                    .font(.title3)
-                    .fontWeight(.semibold)
-                Text("Choose from Free, Basic, Basic W/Ticketing, Premium, or Premium W/Ticketing.")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-            }
-            .padding(.horizontal)
-            .padding(.top, 8)
-        }
-        .subscriptionStoreButtonLabel(.multiline)
-        .subscriptionStorePolicyDestination(url: URL(string: termsURLString)!, for: .termsOfService)
-        .subscriptionStorePolicyDestination(url: URL(string: privacyPolicyURLString)!, for: .privacyPolicy)
-        .storeButton(.visible, for: .restorePurchases)
-        .storeButton(.hidden, for: .redeemCode)
     }
 
     private var fallbackSubscriptionContent: some View {
@@ -4478,28 +4882,36 @@ struct SubscriptionOptionsSheet: View {
                     title: basicProduct?.displayName ?? "Basic",
                     length: subscriptionLengthText(for: basicProduct),
                     price: priceText(for: basicProduct),
-                    details: "$99.99. Includes chat and training, but hides Locations, Rooms, and Tickets."
+                    details: "Includes chat and training, but hides Locations, Rooms, and Tickets.",
+                    buttonTitle: "Choose Basic",
+                    action: onPurchaseBasic
                 )
 
                 subscriptionCard(
                     title: basicTicketingProduct?.displayName ?? "Basic W/Ticketing",
                     length: subscriptionLengthText(for: basicTicketingProduct),
                     price: priceText(for: basicTicketingProduct, fallback: "$199.99"),
-                    details: "$199.99. Includes chat, training, and Tickets, but hides Locations and Rooms."
+                    details: "Includes chat, training, and Tickets, but hides Locations and Rooms.",
+                    buttonTitle: "Choose Basic W/Ticketing",
+                    action: onPurchaseBasicTicketing
                 )
 
                 subscriptionCard(
                     title: premiumProduct?.displayName ?? "Premium",
                     length: subscriptionLengthText(for: premiumProduct),
                     price: priceText(for: premiumProduct),
-                    details: "$249.99. Includes everything except Tickets."
+                    details: "Includes everything except Tickets.",
+                    buttonTitle: "Choose Premium",
+                    action: onPurchasePremium
                 )
 
                 subscriptionCard(
                     title: premiumTicketingProduct?.displayName ?? "Premium W/Ticketing",
                     length: subscriptionLengthText(for: premiumTicketingProduct),
                     price: priceText(for: premiumTicketingProduct, fallback: "$499.99"),
-                    details: "$499.99. Includes every feature."
+                    details: "Includes every feature.",
+                    buttonTitle: "Choose Premium W/Ticketing",
+                    action: onPurchasePremiumTicketing
                 )
 
                 if let termsURL = URL(string: termsURLString) {
@@ -4514,13 +4926,27 @@ struct SubscriptionOptionsSheet: View {
                 Text("Subscriptions renew automatically unless canceled at least 24 hours before the end of the current period.")
                     .font(.caption)
                     .foregroundColor(.secondary)
+
+                Button("Restore Purchases") {
+                    Task {
+                        await IAPManager.shared.restorePurchases(for: store)
+                    }
+                }
+                .buttonStyle(.bordered)
             }
             .padding()
         }
     }
 
     @ViewBuilder
-    private func subscriptionCard(title: String, length: String, price: String, details: String) -> some View {
+    private func subscriptionCard(
+        title: String,
+        length: String,
+        price: String,
+        details: String,
+        buttonTitle: String,
+        action: @escaping () async -> Void
+    ) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title).font(.headline)
             Text("Length: \(length)").font(.subheadline)
@@ -4528,8 +4954,16 @@ struct SubscriptionOptionsSheet: View {
             Text(details)
                 .font(.footnote)
                 .foregroundColor(.secondary)
+            Button(buttonTitle) {
+                Task {
+                    await action()
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .padding(.top, 6)
         }
         .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(.secondarySystemBackground))
         .clipShape(RoundedRectangle(cornerRadius: 10))
     }
@@ -4802,6 +5236,16 @@ struct CustomizeView: View {
     @State private var editingCampusOriginal = ""
     @State private var editingCampusName = ""
     @State private var isRenamingCampus = false
+    @State private var freshserviceAPIURL = ""
+    @State private var freshserviceAPIKey = ""
+    @State private var freshserviceEnabled = false
+    @State private var isSavingFreshserviceIntegration = false
+    @State private var isTestingFreshserviceIntegration = false
+    @State private var freshserviceStatusMessage = ""
+    @State private var externalTicketFormEnabled = false
+    @State private var externalTicketFormAccessKey = ""
+    @State private var isSavingExternalTicketForm = false
+    @State private var externalTicketStatusMessage = ""
     @State private var bulkOperationMessage = ""
     @State private var isBulkOperationInProgress = false
 
@@ -4811,6 +5255,22 @@ struct CustomizeView: View {
 
     private var isPrivilegedUser: Bool {
         store.user?.isAdmin == true || store.user?.isOwner == true
+    }
+
+    private var canManageIntegrations: Bool {
+        isPrivilegedUser && (store.user?.hasChatAndTrainingFeatures ?? false)
+    }
+
+    private var canManageExternalTicketForm: Bool {
+        isPrivilegedUser && (store.user?.hasTicketingFeatures == true)
+    }
+
+    private var externalTicketFormURLString: String {
+        let teamCode = (store.teamCode ?? store.user?.teamCode ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let accessKey = externalTicketFormAccessKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard externalTicketFormEnabled, !teamCode.isEmpty, !accessKey.isEmpty else { return "" }
+        let slug = externalTicketFormSlug(from: store.organizationName)
+        return "https://prodconnect-1ea3a.web.app/support/\(slug)?team=\(teamCode)&key=\(accessKey)"
     }
 
     private var featuredSections: [MainAppSection] {
@@ -5149,6 +5609,101 @@ struct CustomizeView: View {
         }
     }
 
+    private var integrationsSection: some View {
+        Section("Integrations") {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Connect Freshservice for API-based asset linking.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Toggle("Enable Freshservice", isOn: $freshserviceEnabled)
+
+                TextField("Freshservice URL", text: $freshserviceAPIURL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+
+                SecureField("Freshservice API Key", text: $freshserviceAPIKey)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+
+                HStack {
+                    Button {
+                        saveFreshserviceIntegration()
+                    } label: {
+                        if isSavingFreshserviceIntegration {
+                            ProgressView()
+                        } else {
+                            Text("Save Connection")
+                        }
+                    }
+                    .disabled(isSavingFreshserviceIntegration || isTestingFreshserviceIntegration)
+
+                    Button {
+                        testFreshserviceConnection()
+                    } label: {
+                        if isTestingFreshserviceIntegration {
+                            ProgressView()
+                        } else {
+                            Text("Test Connection")
+                        }
+                    }
+                    .disabled(
+                        isSavingFreshserviceIntegration
+                        || isTestingFreshserviceIntegration
+                        || freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    )
+                }
+
+                if !freshserviceStatusMessage.isEmpty {
+                    Text(freshserviceStatusMessage)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+
+    private var externalTicketFormSection: some View {
+        Section {
+            Toggle("Enable External Form", isOn: $externalTicketFormEnabled)
+
+            if !externalTicketFormURLString.isEmpty {
+                TextField("Public Link", text: .constant(externalTicketFormURLString))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+
+                Button("Copy Public Link") {
+                    UIPasteboard.general.string = externalTicketFormURLString
+                    externalTicketStatusMessage = "External ticket form link copied."
+                }
+            }
+
+            Button {
+                saveCustomizeExternalTicketForm()
+            } label: {
+                if isSavingExternalTicketForm {
+                    ProgressView()
+                } else {
+                    Text("Save External Form")
+                }
+            }
+            .disabled(isSavingExternalTicketForm)
+
+            if !externalTicketStatusMessage.isEmpty {
+                Text(externalTicketStatusMessage)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        } header: {
+            Text("External Ticket Form")
+        } footer: {
+            Text("Anyone with this link can submit a ticket to your team.")
+                .font(.caption)
+                .foregroundColor(.gray)
+        }
+    }
+
     private var resetSection: some View {
         Section(header: Text("Reset")) {
             Button(action: { showDeleteAllConfirmation = true }) {
@@ -5192,6 +5747,12 @@ struct CustomizeView: View {
                 tabCustomizationSection
                 if isPrivilegedUser {
                     campusAndRoomsSection
+                    if canManageIntegrations {
+                        integrationsSection
+                    }
+                    if canManageExternalTicketForm {
+                        externalTicketFormSection
+                    }
                     importSection
                     resetSection
                 }
@@ -5199,6 +5760,13 @@ struct CustomizeView: View {
             .navigationTitle("Customize")
             .toolbarColorScheme(.dark, for: .navigationBar)
             .disabled(isBulkOperationInProgress)
+            .onAppear(perform: loadFreshserviceIntegrationState)
+            .onReceive(store.$freshserviceIntegration) { _ in
+                loadFreshserviceIntegrationState()
+            }
+            .onReceive(store.$externalTicketFormIntegration) { _ in
+                loadExternalTicketFormCustomizeState()
+            }
         }
     }
 
@@ -5521,6 +6089,88 @@ struct CustomizeView: View {
     private func endBulkOperation() {
         isBulkOperationInProgress = false
         bulkOperationMessage = ""
+    }
+
+    private func loadFreshserviceIntegrationState() {
+        let settings = store.freshserviceIntegration
+        freshserviceAPIURL = settings.apiURL
+        freshserviceAPIKey = settings.apiKey
+        freshserviceEnabled = settings.isEnabled
+        loadExternalTicketFormCustomizeState()
+    }
+
+    private func loadExternalTicketFormCustomizeState() {
+        let settings = store.externalTicketFormIntegration
+        externalTicketFormEnabled = settings.isEnabled
+        externalTicketFormAccessKey = settings.accessKey
+        if externalTicketFormAccessKey.isEmpty, canManageExternalTicketForm {
+            externalTicketFormAccessKey = store.generateExternalTicketAccessKey()
+        }
+    }
+
+    private func saveCustomizeExternalTicketForm() {
+        isSavingExternalTicketForm = true
+        externalTicketStatusMessage = ""
+        store.saveExternalTicketFormIntegration(
+            isEnabled: externalTicketFormEnabled,
+            accessKey: externalTicketFormAccessKey
+        ) { result in
+            isSavingExternalTicketForm = false
+            switch result {
+            case .success(let settings):
+                externalTicketFormEnabled = settings.isEnabled
+                externalTicketFormAccessKey = settings.accessKey
+                externalTicketStatusMessage = settings.isEnabled ?
+                    "External ticket form is live." :
+                    "External ticket form is saved but disabled."
+            case .failure(let error):
+                externalTicketStatusMessage = "Save failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func saveFreshserviceIntegration() {
+        isSavingFreshserviceIntegration = true
+        freshserviceStatusMessage = ""
+        store.saveFreshserviceIntegration(
+            apiURL: freshserviceAPIURL,
+            apiKey: freshserviceAPIKey,
+            managedByGroup: "",
+            managedByGroupOptions: store.freshserviceIntegration.managedByGroupOptions,
+            syncMode: store.freshserviceIntegration.syncMode,
+            isEnabled: freshserviceEnabled
+        ) { result in
+            isSavingFreshserviceIntegration = false
+            switch result {
+            case .success:
+                freshserviceStatusMessage = "Freshservice connection saved."
+            case .failure(let error):
+                freshserviceStatusMessage = "Save failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func testFreshserviceConnection() {
+        let trimmedURL = freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedKey = freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedURL.isEmpty, !trimmedKey.isEmpty else {
+            freshserviceStatusMessage = "Enter both the Freshservice URL and API key."
+            return
+        }
+
+        isTestingFreshserviceIntegration = true
+        freshserviceStatusMessage = ""
+        FreshserviceAPI.fetchAssetsWithAPIKey(apiKey: trimmedKey, apiUrl: trimmedURL) { result in
+            DispatchQueue.main.async {
+                isTestingFreshserviceIntegration = false
+                switch result {
+                case .success(let assets):
+                    freshserviceStatusMessage = "Connected to Freshservice. Found \(assets.count) assets."
+                case .failure(let error):
+                    freshserviceStatusMessage = "Connection failed: \(error.localizedDescription)"
+                }
+            }
+        }
     }
     
     private func convertGoogleSheetLinkToCSV(_ link: String) -> URL {
@@ -5894,9 +6544,6 @@ struct UserDetailView: View {
             "isOwner": true,
             "isAdmin": true
         ]
-        if user.subscriptionTier == "free" {
-            newOwnerUpdates["subscriptionTier"] = "basic"
-        }
         batch.setData(newOwnerUpdates, forDocument: newOwnerRef, merge: true)
 
         batch.commit { error in
@@ -5912,9 +6559,6 @@ struct UserDetailView: View {
                 }
                 self.user.isOwner = true
                 self.user.isAdmin = true
-                if self.user.subscriptionTier == "free" {
-                    self.user.subscriptionTier = "basic"
-                }
             }
         }
     }
@@ -6041,41 +6685,110 @@ struct EditPatchView: View {
     @State private var isSaving = false
     @State private var editChannelCountText = ""
     @State private var editUniverseText = ""
+    @State private var saveErrorMessage: String?
+    @State private var showDeleteConfirmation = false
+    @State private var isDeleting = false
     
     var canEdit: Bool { store.canEditPatchsheet }
     
     var body: some View {
-        Form {
-            Section("Patch Details") {
-                TextField("Name", text: $patch.name).disabled(!canEdit)
-                
-                if patch.category == "Lighting" {
-                    TextField("DMX Channel", text: $patch.input).disabled(!canEdit)
-                    TextField("Channel Count", text: $editChannelCountText).keyboardType(.numberPad).disabled(!canEdit)
-                    TextField("Universe", text: $editUniverseText).disabled(!canEdit)
-                } else if patch.category == "Video" {
-                    TextField("Source", text: $patch.input).disabled(!canEdit)
-                    TextField("Destination", text: $patch.output).disabled(!canEdit)
-                } else {
-                    TextField("Input", text: $patch.input).disabled(!canEdit)
-                    TextField("Output", text: $patch.output).disabled(!canEdit)
-                }
-                
-                if store.locations.isEmpty {
-                    TextField("Campus", text: $patch.campus).disabled(!canEdit)
-                } else {
-                    Picker("Campus", selection: $patch.campus) {
-                        Text("Select campus").tag("")
-                        ForEach(store.locations.sorted(), id: \.self) { campus in
-                            Text(campus).tag(campus)
+        ScrollView {
+            VStack(spacing: 20) {
+                VStack(alignment: .leading, spacing: 0) {
+                    editorField("Name") {
+                        TextField("Name", text: $patch.name)
+                            .disabled(!canEdit)
+                    }
+
+                    if patch.category == "Lighting" {
+                        editorField("DMX Channel") {
+                            TextField("DMX Channel", text: $patch.input)
+                                .disabled(!canEdit)
+                        }
+                        editorField("Channel Count") {
+                            TextField("Channel Count", text: $editChannelCountText)
+                                .keyboardType(.numberPad)
+                                .disabled(!canEdit)
+                        }
+                        editorField("Universe", isLast: false) {
+                            TextField("Universe", text: $editUniverseText)
+                                .disabled(!canEdit)
+                        }
+                    } else if patch.category == "Video" {
+                        editorField("Source") {
+                            TextField("Source", text: $patch.input)
+                                .disabled(!canEdit)
+                        }
+                        editorField("Destination") {
+                            TextField("Destination", text: $patch.output)
+                                .disabled(!canEdit)
+                        }
+                    } else {
+                        editorField("Input") {
+                            TextField("Input", text: $patch.input)
+                                .disabled(!canEdit)
+                        }
+                        editorField("Output") {
+                            TextField("Output", text: $patch.output)
+                                .disabled(!canEdit)
                         }
                     }
-                    .disabled(!canEdit)
+
+                    if store.locations.isEmpty {
+                        editorField("Campus/Location") {
+                            TextField("Campus/Location", text: $patch.campus)
+                                .disabled(!canEdit)
+                        }
+                    } else {
+                        editorField("Campus/Location") {
+                            Picker("Campus/Location", selection: $patch.campus) {
+                                Text("Select campus/location").tag("")
+                                ForEach(store.locations.sorted(), id: \.self) { campus in
+                                    Text(campus).tag(campus)
+                                }
+                            }
+                            .disabled(!canEdit)
+                        }
+                    }
+
+                    if store.rooms.isEmpty {
+                        editorField("Room", isLast: true) {
+                            TextField("Room", text: $patch.room)
+                                .disabled(!canEdit)
+                        }
+                    } else {
+                        editorField("Room", isLast: true) {
+                            Picker("Room", selection: $patch.room) {
+                                Text("Select room").tag("")
+                                ForEach(store.rooms.sorted(), id: \.self) { room in
+                                    Text(room).tag(room)
+                                }
+                            }
+                            .disabled(!canEdit)
+                        }
+                    }
                 }
-                TextField("Room", text: $patch.room).disabled(!canEdit)
+                .background(Color(.secondarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+
+                if canEdit {
+                    Button("Delete Patch", role: .destructive) {
+                        showDeleteConfirmation = true
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 14)
+                    .background(Color(.secondarySystemGroupedBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .disabled(isSaving || isDeleting)
+                }
             }
+            .padding(.horizontal, 16)
+            .padding(.top, 60)
+            .padding(.bottom, 32)
         }
         .navigationTitle("Edit Patch")
+        .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             if let count = patch.channelCount, count > 0 {
                 editChannelCountText = String(count)
@@ -6093,18 +6806,64 @@ struct EditPatchView: View {
                         let parsed = Int(trimmed) ?? 0
                         patch.channelCount = parsed > 0 ? parsed : nil
                         patch.universe = editUniverseText.trimmingCharacters(in: .whitespacesAndNewlines)
-                        // Use central savePatch to persist and update local state
-                        store.savePatch(patch)
-                        DispatchQueue.main.async {
-                            isSaving = false
-                            dismiss()
+                        store.savePatch(patch) { result in
+                            DispatchQueue.main.async {
+                                isSaving = false
+                                switch result {
+                                case .success:
+                                    dismiss()
+                                case .failure(let error):
+                                    saveErrorMessage = error.localizedDescription
+                                }
+                            }
                         }
                     }
                 }
-                ToolbarItemGroup(placement: .keyboard) {
-                    Spacer()
-                    Button("Done") { UIApplication.shared.endEditing() }
+            }
+        }
+        .alert("Unable to Save Patch", isPresented: Binding(
+            get: { saveErrorMessage != nil },
+            set: { if !$0 { saveErrorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(saveErrorMessage ?? "")
+        }
+        .alert("Delete Patch?", isPresented: $showDeleteConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                isDeleting = true
+                store.deletePatch(patch) { result in
+                    DispatchQueue.main.async {
+                        isDeleting = false
+                        switch result {
+                        case .success:
+                            dismiss()
+                        case .failure(let error):
+                            saveErrorMessage = error.localizedDescription
+                        }
+                    }
                 }
+            }
+        } message: {
+            Text("This permanently deletes this patch.")
+        }
+    }
+
+    @ViewBuilder
+    private func editorField<Content: View>(_ title: String, isLast: Bool = false, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.caption)
+                .foregroundColor(.secondary)
+            content()
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .overlay(alignment: .bottom) {
+            if !isLast {
+                Divider()
+                    .padding(.horizontal, 16)
             }
         }
     }
@@ -6585,6 +7344,10 @@ struct GearDetailView: View {
     @State private var uploadProgress: Double = 0
     @State private var imageError: String?
     @State private var pendingAutoSave: DispatchWorkItem?
+    @State private var showDeleteConfirmation = false
+    @State private var deleteErrorMessage: String?
+    @State private var didDeleteAsset = false
+    @State private var saveErrorMessage: String?
 
     var canEdit: Bool { store.canEditGear }
 
@@ -6744,6 +7507,11 @@ struct GearDetailView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
+                if canEdit {
+                    Button("Delete Asset", role: .destructive) {
+                        showDeleteConfirmation = true
+                    }
+                }
                 Button("Done") {
                     dismiss()
                 }
@@ -6770,9 +7538,42 @@ struct GearDetailView: View {
         .onChange(of: item.maintenanceNotes) { _ in scheduleAutoSave() }
         .onChange(of: item.imageURL) { _ in scheduleAutoSave() }
         .onDisappear {
-            guard canEdit else { return }
+            guard canEdit, !didDeleteAsset else { return }
             pendingAutoSave?.cancel()
-            store.saveGear(item)
+            persistGear(item)
+        }
+        .alert("Delete Asset?", isPresented: $showDeleteConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                pendingAutoSave?.cancel()
+                store.deleteGear(items: [item]) { result in
+                    switch result {
+                    case .success:
+                        didDeleteAsset = true
+                        dismiss()
+                    case .failure(let error):
+                        deleteErrorMessage = error.localizedDescription
+                    }
+                }
+            }
+        } message: {
+            Text("This permanently deletes this asset.")
+        }
+        .alert("Unable to Delete Asset", isPresented: Binding(
+            get: { deleteErrorMessage != nil },
+            set: { if !$0 { deleteErrorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(deleteErrorMessage ?? "")
+        }
+        .alert("Unable to Save Asset", isPresented: Binding(
+            get: { saveErrorMessage != nil },
+            set: { if !$0 { saveErrorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(saveErrorMessage ?? "")
         }
     }
 
@@ -6781,10 +7582,24 @@ struct GearDetailView: View {
         pendingAutoSave?.cancel()
         let snapshot = item
         let work = DispatchWorkItem {
-            store.saveGear(snapshot)
+            persistGear(snapshot)
         }
         pendingAutoSave = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+    }
+
+    private func persistGear(_ snapshot: GearItem) {
+        store.saveGear(snapshot) { result in
+            switch result {
+            case .success:
+                item = snapshot
+            case .failure(let error):
+                saveErrorMessage = error.localizedDescription
+                if let persisted = store.gear.first(where: { $0.id == snapshot.id }) {
+                    item = persisted
+                }
+            }
+        }
     }
 
     private func loadAndUploadImage(from item: PhotosPickerItem) async {
@@ -6858,6 +7673,7 @@ struct AddGearView: View {
     @State private var isUploadingImage = false
     @State private var uploadProgress: Double = 0
     @State private var imageError: String?
+    @State private var serialValidationMessage: String?
 
     var onSave: (GearItem) -> Void
 
@@ -6978,16 +7794,32 @@ struct AddGearView: View {
                                     isUploadingImage = false
                                     switch result {
                                     case .success(let urlString):
-                                        onSave(createItem(urlString))
-                                        dismiss()
+                                        let newItem = createItem(urlString)
+                                        store.saveGear(newItem) { saveResult in
+                                            switch saveResult {
+                                            case .success:
+                                                onSave(newItem)
+                                                dismiss()
+                                            case .failure(let error):
+                                                serialValidationMessage = error.localizedDescription
+                                            }
+                                        }
                                     case .failure(let error):
                                         imageError = "Image upload failed: \(error.localizedDescription)"
                                     }
                                 }
                             }
                         } else {
-                            onSave(createItem(nil))
-                            dismiss()
+                            let newItem = createItem(nil)
+                            store.saveGear(newItem) { saveResult in
+                                switch saveResult {
+                                case .success:
+                                    onSave(newItem)
+                                    dismiss()
+                                case .failure(let error):
+                                    serialValidationMessage = error.localizedDescription
+                                }
+                            }
                         }
                     }.disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || isUploadingImage)
                 }
@@ -6995,6 +7827,14 @@ struct AddGearView: View {
             .onChange(of: selectedImageItem) { newValue in
                 guard let newValue else { return }
                 Task { await loadImageData(from: newValue) }
+            }
+            .alert("Unable to Save Asset", isPresented: Binding(
+                get: { serialValidationMessage != nil },
+                set: { if !$0 { serialValidationMessage = nil } }
+            )) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(serialValidationMessage ?? "")
             }
         }
     }
@@ -7199,7 +8039,7 @@ struct CreateIdeaView: View {
 
 struct TicketsListView: View {
     @EnvironmentObject var store: ProdConnectStore
-    @State private var showCreate = false
+    @State private var showSubmitForm = false
     @State private var locationFilter = ""
     @State private var statusFilter = ""
     @State private var agentFilter = ""
@@ -7255,8 +8095,14 @@ struct TicketsListView: View {
 
                         List {
                             if filteredTickets.isEmpty {
-                                Text("No matching tickets")
-                                    .foregroundColor(.secondary)
+                                VStack(alignment: .leading, spacing: 12) {
+                                    Text("No matching tickets")
+                                        .foregroundColor(.secondary)
+                                    Button("Submit Ticket") {
+                                        showSubmitForm = true
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                }
                             } else {
                                 ForEach(filteredTickets) { ticket in
                                     NavigationLink {
@@ -7309,12 +8155,16 @@ struct TicketsListView: View {
             .toolbar {
                 if store.canUseTickets {
                     ToolbarItem(placement: .navigationBarTrailing) {
-                        Button { showCreate = true } label: { Image(systemName: "plus") }
+                        Button {
+                            showSubmitForm = true
+                        } label: {
+                            Label("Submit Ticket", systemImage: "plus")
+                        }
                     }
                 }
             }
-            .sheet(isPresented: $showCreate) {
-                CreateTicketView { ticket in
+            .sheet(isPresented: $showSubmitForm) {
+                SubmitTicketView { ticket in
                     store.saveTicket(ticket)
                 }
             }
@@ -7416,11 +8266,18 @@ struct TicketsListView: View {
 struct TicketDetailView: View {
     @EnvironmentObject var store: ProdConnectStore
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openURL) private var openURL
     @State private var ticket: SupportTicket
     @State private var isEditing = false
     @State private var originalTicket: SupportTicket?
     @State private var selectedAgentID = ""
     @State private var showAssetPicker = false
+    @State private var newPrivateNote = ""
+    @State private var selectedPhotoItem: PhotosPickerItem?
+    @State private var pendingAttachmentData: Data?
+    @State private var pendingAttachmentName: String?
+    @State private var isUploadingAttachment = false
+    @State private var attachmentError: String?
 
     init(ticket: SupportTicket) {
         _ticket = State(initialValue: ticket)
@@ -7439,6 +8296,8 @@ struct TicketDetailView: View {
     private var availableGear: [GearItem] {
         store.gear.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
+
+    private let maxAttachmentBytes = 100 * 1024 * 1024
 
     var body: some View {
         Form {
@@ -7552,26 +8411,27 @@ struct TicketDetailView: View {
 
             Section("Attachment") {
                 if isEditing {
-                    TextField(
-                        "Attachment 1 Link (optional)",
-                        text: Binding(
-                            get: { ticket.attachmentURL ?? "" },
-                            set: {
-                                ticket.attachmentURL = $0
-                                ticket.attachmentName = nil
-                                ticket.attachmentKind = nil
-                            }
+                    PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
+                        Label(
+                            pendingAttachmentData == nil ? "Choose Photo" : "Replace Photo",
+                            systemImage: "photo.on.rectangle"
                         )
-                    )
-                    .keyboardType(.URL)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled(true)
-                    if !(ticket.attachmentURL?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) {
+                    }
+                    if isUploadingAttachment {
+                        ProgressView()
+                    }
+                    if hasAttachmentToClear {
                         Button("Clear Attachment", role: .destructive) {
+                            clearPendingTicketAttachment()
                             ticket.attachmentURL = nil
                             ticket.attachmentName = nil
                             ticket.attachmentKind = nil
                         }
+                    }
+                    if let attachmentError {
+                        Text(attachmentError)
+                            .font(.caption)
+                            .foregroundColor(.red)
                     }
                 }
 
@@ -7605,6 +8465,63 @@ struct TicketDetailView: View {
                 }
             }
 
+            Section("Requester") {
+                if let requesterName = requesterName {
+                    LabeledContent("Name", value: requesterName)
+                }
+                if let requesterEmail = requesterEmail {
+                    LabeledContent("Email", value: requesterEmail)
+                    Button("Email Requester") {
+                        if let url = requesterEmailURL {
+                            openURL(url)
+                        }
+                    }
+                } else {
+                    Text("No requester email")
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            Section("Private Notes") {
+                if isEditing {
+                    TextEditor(text: $newPrivateNote)
+                        .frame(minHeight: 120)
+                        .overlay(alignment: .topLeading) {
+                            if newPrivateNote.isEmpty {
+                                Text("Add a private note")
+                                    .foregroundColor(.secondary)
+                                    .padding(.top, 8)
+                                    .padding(.leading, 5)
+                            }
+                        }
+                }
+                if ticket.privateNoteEntries.isEmpty {
+                    Text("No private notes")
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(ticket.privateNoteEntries.sorted { $0.createdAt > $1.createdAt }) { entry in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(entry.message)
+                            HStack {
+                                if let author = entry.author?.trimmingCharacters(in: .whitespacesAndNewlines), !author.isEmpty {
+                                    Text(author)
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                                Spacer()
+                                Text(entry.createdAt.formatted(date: .abbreviated, time: .shortened))
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+                Text("Visible only inside ProdConnect.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
             Section("Activity") {
                 if ticket.activity.isEmpty {
                     Text("No updates yet")
@@ -7632,13 +8549,13 @@ struct TicketDetailView: View {
             Section {
                 Button(isEditing ? "Save" : "Close") {
                     if isEditing {
-                        applySelectedAgent()
-                        ticket.lastUpdatedBy = currentUserLabel
-                        store.saveTicket(ticket)
+                        saveEditedTicket()
+                        return
                     }
                     dismiss()
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(isUploadingAttachment)
             }
         }
         .navigationTitle("Ticket")
@@ -7657,21 +8574,11 @@ struct TicketDetailView: View {
             if store.canUseTickets {
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
                     if isEditing {
-                        Button("Cancel") {
-                            if let originalTicket {
-                                ticket = originalTicket
-                                selectedAgentID = originalTicket.assignedAgentID ?? ""
-                            }
-                            isEditing = false
-                            originalTicket = nil
-                        }
+                        Button("Cancel", action: cancelEditing)
                     }
                     Button(isEditing ? "Done" : "Edit") {
                         if isEditing {
-                            applySelectedAgent()
-                            ticket.lastUpdatedBy = currentUserLabel
-                            store.saveTicket(ticket)
-                            dismiss()
+                            saveEditedTicket()
                         } else {
                             originalTicket = ticket
                             selectedAgentID = ticket.assignedAgentID ?? ""
@@ -7681,8 +8588,13 @@ struct TicketDetailView: View {
                 }
             }
         }
+        .onChange(of: selectedPhotoItem) { newValue in
+            guard let newValue else { return }
+            Task { await loadTicketPhotoAttachment(from: newValue) }
+        }
         .onAppear {
             selectedAgentID = ticket.assignedAgentID ?? ""
+            newPrivateNote = ""
         }
     }
 
@@ -7690,6 +8602,60 @@ struct TicketDetailView: View {
         let name = store.user?.displayName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !name.isEmpty { return name }
         return store.user?.email ?? Auth.auth().currentUser?.email ?? "Unknown User"
+    }
+
+    private func appendPendingPrivateNoteIfNeeded() {
+        let trimmedNote = newPrivateNote.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedNote.isEmpty else { return }
+        ticket.privateNoteEntries.append(
+            TicketPrivateNoteEntry(
+                message: trimmedNote,
+                createdAt: Date(),
+                author: currentUserLabel
+            )
+        )
+        newPrivateNote = ""
+    }
+
+    private func cancelEditing() {
+        if let originalTicket {
+            ticket = originalTicket
+            selectedAgentID = originalTicket.assignedAgentID ?? ""
+        }
+        clearPendingTicketAttachment()
+        isEditing = false
+        originalTicket = nil
+    }
+
+    private func saveEditedTicket() {
+        attachmentError = nil
+        applySelectedAgent()
+        appendPendingPrivateNoteIfNeeded()
+        ticket.lastUpdatedBy = currentUserLabel
+
+        guard let pendingAttachmentData else {
+            store.saveTicket(ticket)
+            dismiss()
+            return
+        }
+
+        isUploadingAttachment = true
+        uploadTicketImage(data: pendingAttachmentData, filename: pendingAttachmentName ?? "Photo.jpg") { result in
+            DispatchQueue.main.async {
+                isUploadingAttachment = false
+                switch result {
+                case .success(let urlString):
+                    ticket.attachmentURL = urlString
+                    ticket.attachmentName = pendingAttachmentName ?? "Photo.jpg"
+                    ticket.attachmentKind = .image
+                    clearPendingTicketAttachment()
+                    store.saveTicket(ticket)
+                    dismiss()
+                case .failure(let error):
+                    attachmentError = "Attachment upload failed: \(error.localizedDescription)"
+                }
+            }
+        }
     }
 
     private var selectedAssetName: String? {
@@ -7703,6 +8669,33 @@ struct TicketDetailView: View {
 
     private var selectedAssetLabel: String {
         selectedAssetName ?? "Select Asset"
+    }
+
+    private var requesterName: String? {
+        let candidates = [
+            ticket.externalRequesterName,
+            ticket.createdBy?.components(separatedBy: "@").first
+        ]
+        return candidates
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first(where: { !$0.isEmpty })
+    }
+
+    private var requesterEmail: String? {
+        let candidates = [
+            ticket.externalRequesterEmail,
+            ticket.createdBy
+        ]
+        return candidates
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first(where: { !$0.isEmpty && $0.contains("@") })
+    }
+
+    private var requesterEmailURL: URL? {
+        guard let requesterEmail else { return nil }
+        let subject = "Re: \(ticket.title.isEmpty ? "Your Support Ticket" : ticket.title)"
+        let encodedSubject = subject.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        return URL(string: "mailto:\(requesterEmail)?subject=\(encodedSubject)")
     }
 
     private func applySelectedAgent() {
@@ -7747,84 +8740,136 @@ struct TicketDetailView: View {
 
     @ViewBuilder
     private var ticketAttachmentPreview: some View {
-        let rawURL = ticket.attachmentURL?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if rawURL.isEmpty {
-            Text("No attachment")
-                .foregroundColor(.secondary)
-        } else if let url = URL(string: rawURL) {
-            Link(destination: url) {
-                Label(
-                    ticket.attachmentName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-                        ? (ticket.attachmentName ?? "Open Attachment")
-                        : "Open Attachment",
-                    systemImage: "paperclip"
-                )
+        if pendingAttachmentData != nil {
+            Label(
+                pendingAttachmentName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                    ? (pendingAttachmentName ?? "Selected Photo")
+                    : "Selected Photo",
+                systemImage: "photo"
+            )
+        } else {
+            let rawURL = ticket.attachmentURL?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if rawURL.isEmpty {
+                Text("No attachment")
+                    .foregroundColor(.secondary)
+            } else if let url = URL(string: rawURL) {
+                Link(destination: url) {
+                    Label(
+                        ticket.attachmentName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                            ? (ticket.attachmentName ?? "Open Attachment")
+                            : "Open Attachment",
+                        systemImage: "paperclip"
+                    )
+                }
+            } else {
+                Text("Invalid attachment link")
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+
+    private var hasAttachmentToClear: Bool {
+        pendingAttachmentData != nil || !(ticket.attachmentURL?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+    }
+
+    private func clearPendingTicketAttachment() {
+        selectedPhotoItem = nil
+        pendingAttachmentData = nil
+        pendingAttachmentName = nil
+        attachmentError = nil
+    }
+
+    private func loadTicketPhotoAttachment(from item: PhotosPickerItem) async {
+        if let data = try? await item.loadTransferable(type: Data.self) {
+            if data.count > maxAttachmentBytes {
+                DispatchQueue.main.async {
+                    selectedPhotoItem = nil
+                    pendingAttachmentData = nil
+                    pendingAttachmentName = nil
+                    attachmentError = "Attachment is too large. Max size is 100 MB."
+                }
+                return
+            }
+            DispatchQueue.main.async {
+                pendingAttachmentData = data
+                pendingAttachmentName = "Photo.jpg"
+                attachmentError = nil
             }
         } else {
-            Text("Invalid attachment link")
-                .foregroundColor(.secondary)
+            DispatchQueue.main.async {
+                attachmentError = "Unable to prepare image attachment."
+            }
+        }
+    }
+
+    private func uploadTicketImage(data: Data, filename: String, completion: @escaping (Result<String, Error>) -> Void) {
+        let safeName = filename.replacingOccurrences(of: " ", with: "_")
+        let path = "ticketAttachments/\(ticket.id)/\(UUID().uuidString)-\(safeName)"
+        let storageRef = Storage.storage().reference().child(path)
+        let metadata = StorageMetadata()
+        metadata.contentType = "image/jpeg"
+        storageRef.putData(data, metadata: metadata) { _, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+            storageRef.downloadURL { url, error in
+                if let url {
+                    completion(.success(url.absoluteString))
+                } else if let error {
+                    completion(.failure(error))
+                }
+            }
         }
     }
 }
 
-struct CreateTicketView: View {
+struct SubmitTicketView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject var store: ProdConnectStore
     @State private var title = ""
     @State private var detail = ""
     @State private var campus = ""
     @State private var room = ""
-    @State private var status: TicketStatus = .new
     @State private var hasDueDate = false
     @State private var dueDate = Date()
-    @State private var linkedGearID = ""
-    @State private var assignedAgentID = ""
-    @State private var showAssetPicker = false
+    @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var attachmentURL: String?
     @State private var attachmentName: String?
     @State private var attachmentKind: TicketAttachmentKind?
+    @State private var attachmentData: Data?
+    @State private var isUploadingAttachment = false
+    @State private var uploadProgress: Double = 0
+    @State private var attachmentError: String?
 
     var onSave: (SupportTicket) -> Void
 
-    private var availableAssignees: [UserProfile] {
-        store.teamMembers
-            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
-    }
-
-    private var availableGear: [GearItem] {
-        store.gear.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-    }
+    private let maxAttachmentBytes = 100 * 1024 * 1024
 
     private var canSave: Bool {
         !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var body: some View {
         NavigationStack {
             Form {
+                requesterSection
                 overviewSection
-                statusSection
                 dueDateSection
                 locationSection
-                linkedAssetSection
                 attachmentSection
-                assignmentSection
                 createButtonSection
             }
-            .navigationTitle("New Ticket")
-            .sheet(isPresented: $showAssetPicker) {
-                AssetTicketPickerView(
-                    selectedAssetID: linkedGearID.isEmpty ? nil : linkedGearID,
-                    onSelect: { item in
-                        linkedGearID = item.id
-                    }
-                )
-                .environmentObject(store)
-            }
+            .navigationTitle("Submit Ticket")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
                 }
+            }
+            .onChange(of: selectedPhotoItem) { newValue in
+                guard let newValue else { return }
+                Task { await loadTicketPhotoAttachment(from: newValue) }
             }
             .onAppear {
                 let assignedCampus = store.user?.assignedCampus.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -7835,25 +8880,22 @@ struct CreateTicketView: View {
         }
     }
 
-    private var selectedAssetLabel: String {
-        availableGear.first(where: { $0.id == linkedGearID })?.name ?? "Select Asset"
-    }
-
-    private var overviewSection: some View {
-        Section("Overview") {
-            TextField("Title", text: $title)
-            TextEditor(text: $detail)
-                .frame(minHeight: 120)
+    private var requesterSection: some View {
+        Section("Requester") {
+            LabeledContent("Name", value: requesterName)
+            LabeledContent("Email", value: requesterEmail)
         }
     }
 
-    private var statusSection: some View {
-        Section("Status") {
-            Picker("Status", selection: $status) {
-                ForEach(TicketStatus.allCases, id: \.self) { option in
-                    Text(option.rawValue).tag(option)
-                }
-            }
+    private var overviewSection: some View {
+        Section {
+            TextField("Issue Title", text: $title)
+            TextEditor(text: $detail)
+                .frame(minHeight: 120)
+        } header: {
+            Text("Issue")
+        } footer: {
+            Text("Add enough detail for someone else to understand the issue without following up first.")
         }
     }
 
@@ -7891,76 +8933,36 @@ struct CreateTicketView: View {
         }
     }
 
-    private var linkedAssetSection: some View {
-        Section("Linked Asset") {
-            Button {
-                showAssetPicker = true
-            } label: {
-                HStack {
-                    Text("Asset")
-                    Spacer()
-                    Text(selectedAssetLabel)
-                        .foregroundColor(linkedGearID.isEmpty ? .secondary : .primary)
-                    Image(systemName: "chevron.right")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-            }
-            if !linkedGearID.isEmpty {
-                Button("Clear Asset Link", role: .destructive) {
-                    linkedGearID = ""
-                }
-            }
-        }
-    }
-
     private var attachmentSection: some View {
         Section("Attachment") {
-            TextField(
-                "Attachment 1 Link (optional)",
-                text: Binding(
-                    get: { attachmentURL ?? "" },
-                    set: {
-                        attachmentURL = $0
-                        attachmentName = nil
-                        attachmentKind = nil
-                    }
+            PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
+                Label(
+                    attachmentData == nil ? "Choose Photo" : "Replace Photo",
+                    systemImage: "photo.on.rectangle"
                 )
-            )
-            .keyboardType(.URL)
-            .textInputAutocapitalization(.never)
-            .autocorrectionDisabled(true)
+            }
             ticketAttachmentPreview
-            if !(attachmentURL?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) {
+            if attachmentData != nil {
                 Button("Clear Attachment", role: .destructive) {
-                    attachmentURL = nil
-                    attachmentName = nil
-                    attachmentKind = nil
+                    clearPendingTicketAttachment()
                 }
             }
-        }
-    }
-
-    @ViewBuilder
-    private var assignmentSection: some View {
-        if store.canSeeAllTickets {
-            Section("Agent") {
-                Picker("Agent", selection: $assignedAgentID) {
-                    Text("Unassigned").tag("")
-                    ForEach(availableAssignees) { member in
-                        Text(displayName(for: member)).tag(member.id)
-                    }
-                }
-                .pickerStyle(.menu)
+            if isUploadingAttachment {
+                ProgressView(value: uploadProgress)
+            }
+            if let attachmentError {
+                Text(attachmentError)
+                    .font(.caption)
+                    .foregroundColor(.red)
             }
         }
     }
 
     private var createButtonSection: some View {
         Section {
-            Button("Create", action: createTicket)
+            Button("Submit Ticket", action: createTicket)
                 .buttonStyle(.borderedProminent)
-                .disabled(!canSave)
+                .disabled(!canSave || isUploadingAttachment)
         }
     }
 
@@ -7972,66 +8974,148 @@ struct CreateTicketView: View {
 
     @ViewBuilder
     private var ticketAttachmentPreview: some View {
-        let rawURL = attachmentURL?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if rawURL.isEmpty {
+        if attachmentData == nil {
             Text("No attachment")
                 .foregroundColor(.secondary)
-        } else if let url = URL(string: rawURL) {
-            Link(destination: url) {
-                Label(
-                    attachmentName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-                        ? (attachmentName ?? "Open Attachment")
-                        : "Open Attachment",
-                    systemImage: "paperclip"
-                )
-            }
         } else {
-            Text("Invalid attachment link")
-                .foregroundColor(.secondary)
+            Label(
+                attachmentName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                    ? (attachmentName ?? "Selected Photo")
+                    : "Selected Photo",
+                systemImage: "photo"
+            )
         }
     }
 
     private func createTicket() {
+        attachmentError = nil
         let activeTeamCode = [
             store.teamCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
             store.user?.teamCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         ].first(where: { !$0.isEmpty }) ?? ""
-        let linkedGear = availableGear.first(where: { $0.id == linkedGearID })
-        let assignedAgent = availableAssignees.first(where: { $0.id == assignedAgentID })
         var ticket = SupportTicket(
             title: title.trimmingCharacters(in: .whitespacesAndNewlines),
             detail: detail.trimmingCharacters(in: .whitespacesAndNewlines),
             teamCode: activeTeamCode,
             campus: campus.trimmingCharacters(in: .whitespacesAndNewlines),
             room: room.trimmingCharacters(in: .whitespacesAndNewlines),
-            status: status,
+            status: .new,
             createdBy: store.user?.email ?? Auth.auth().currentUser?.email,
             createdByUserID: store.user?.id,
-            assignedAgentID: assignedAgent?.id,
-            assignedAgentName: assignedAgent.map(displayName(for:)),
-            linkedGearID: linkedGear?.id,
-            linkedGearName: linkedGear?.name,
             dueDate: hasDueDate ? dueDate : nil,
             lastUpdatedBy: currentUserLabel,
             attachmentURL: attachmentURL,
             attachmentName: attachmentName,
             attachmentKind: attachmentKind
         )
-        ticket.activity = [
-            TicketActivityEntry(
-                message: "Ticket created",
-                createdAt: ticket.createdAt,
-                author: currentUserLabel
-            )
-        ]
-        onSave(ticket)
-        dismiss()
+
+        guard let attachmentData else {
+            onSave(ticket)
+            dismiss()
+            return
+        }
+
+        isUploadingAttachment = true
+        uploadProgress = 0
+        uploadTicketImage(data: attachmentData, filename: attachmentName ?? "Photo.jpg") { result in
+            DispatchQueue.main.async {
+                isUploadingAttachment = false
+                switch result {
+                case .success(let urlString):
+                    ticket.attachmentURL = urlString
+                    ticket.attachmentName = attachmentName ?? "Photo.jpg"
+                    ticket.attachmentKind = .image
+                    onSave(ticket)
+                    dismiss()
+                case .failure(let error):
+                    attachmentError = "Attachment upload failed: \(error.localizedDescription)"
+                }
+            }
+        }
     }
 
-    private func displayName(for member: UserProfile) -> String {
-        let trimmed = member.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty { return trimmed }
-        return member.email.components(separatedBy: "@").first ?? member.email
+    private var requesterName: String {
+        let name = store.user?.displayName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !name.isEmpty { return name }
+        return "Unknown User"
+    }
+
+    private var requesterEmail: String {
+        store.user?.email ?? Auth.auth().currentUser?.email ?? "Unknown Email"
+    }
+
+    private func clearPendingTicketAttachment() {
+        selectedPhotoItem = nil
+        attachmentURL = nil
+        attachmentName = nil
+        attachmentKind = nil
+        attachmentData = nil
+        attachmentError = nil
+        uploadProgress = 0
+    }
+
+    private func loadTicketPhotoAttachment(from item: PhotosPickerItem) async {
+        if let data = try? await item.loadTransferable(type: Data.self) {
+            if data.count > maxAttachmentBytes {
+                DispatchQueue.main.async {
+                    selectedPhotoItem = nil
+                    attachmentURL = nil
+                    attachmentName = nil
+                    attachmentKind = nil
+                    attachmentData = nil
+                    uploadProgress = 0
+                    attachmentError = "Attachment is too large. Max size is 100 MB."
+                }
+                return
+            }
+            DispatchQueue.main.async {
+                attachmentData = data
+                attachmentName = "Photo.jpg"
+                attachmentKind = .image
+                attachmentURL = nil
+                attachmentError = nil
+            }
+        } else {
+            DispatchQueue.main.async {
+                attachmentError = "Unable to prepare image attachment."
+            }
+        }
+    }
+
+    private func uploadTicketImage(data: Data, filename: String, completion: @escaping (Result<String, Error>) -> Void) {
+        let safeName = filename.replacingOccurrences(of: " ", with: "_")
+        let path = "ticketAttachments/\(UUID().uuidString)/\(UUID().uuidString)-\(safeName)"
+        let storageRef = Storage.storage().reference().child(path)
+        let metadata = StorageMetadata()
+        metadata.contentType = "image/jpeg"
+        let uploadTask = storageRef.putData(data, metadata: metadata)
+
+        uploadTask.observe(.progress) { snapshot in
+            if let fraction = snapshot.progress?.fractionCompleted {
+                DispatchQueue.main.async {
+                    uploadProgress = fraction
+                }
+            }
+        }
+
+        uploadTask.observe(.success) { _ in
+            DispatchQueue.main.async {
+                uploadProgress = 1
+            }
+            storageRef.downloadURL { url, error in
+                if let url = url {
+                    completion(.success(url.absoluteString))
+                } else if let error {
+                    completion(.failure(error))
+                }
+            }
+        }
+
+        uploadTask.observe(.failure) { snapshot in
+            if let error = snapshot.error {
+                completion(.failure(error))
+            }
+        }
     }
 }
 
@@ -10162,7 +11246,11 @@ struct CreateChannelView: View {
 struct ProdConnect_Previews: PreviewProvider {
     static var previews: some View {
         let store = ProdConnectStore.shared
-        MainTabView().environmentObject(store)
+        MainTabView(
+            selectedLaunchSection: .constant(nil),
+            shouldOpenMoreTab: .constant(false)
+        )
+        .environmentObject(store)
     }
 }
 
@@ -10182,11 +11270,922 @@ struct ShareSheet: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
+private struct IntegrationsView: View {
+    private enum FreshserviceImportKind: String, CaseIterable, Identifiable {
+        case assets
+        case tickets
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .assets: return "Assets"
+            case .tickets: return "Tickets"
+            }
+        }
+    }
+
+    private enum FreshserviceDestination: String, CaseIterable, Identifiable {
+        case assetsTab
+        case ticketsTab
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .assetsTab: return "Assets Tab"
+            case .ticketsTab: return "Tickets Tab"
+            }
+        }
+    }
+
+    @EnvironmentObject private var store: ProdConnectStore
+    @State private var freshserviceAPIURL = ""
+    @State private var freshserviceAPIKey = ""
+    @State private var freshserviceEnabled = false
+    @State private var managedByGroupFilter = ""
+    @State private var managedByGroupOptions: [String] = []
+    @State private var freshserviceSyncMode: ProdConnectStore.FreshserviceSyncMode = .pull
+    @State private var selectedImportKind: FreshserviceImportKind = .assets
+    @State private var selectedDestination: FreshserviceDestination = .assetsTab
+    @State private var isSaving = false
+    @State private var isTesting = false
+    @State private var isImporting = false
+    @State private var isLoadingManagedByGroups = false
+    @State private var externalTicketFormEnabled = false
+    @State private var externalTicketFormAccessKey = ""
+    @State private var isSavingExternalTicketForm = false
+    @State private var externalTicketStatusMessage = ""
+    @State private var isSharingExternalTicketLink = false
+    @State private var statusMessage = ""
+
+    private var canManageIntegrations: Bool {
+        let isPrivilegedUser = store.user?.isAdmin == true || store.user?.isOwner == true
+        return isPrivilegedUser && (
+            (store.user?.hasChatAndTrainingFeatures ?? false)
+            || (store.user?.hasTicketingFeatures ?? false)
+        )
+    }
+
+    private var canImportTickets: Bool {
+        store.user?.hasTicketingFeatures == true
+    }
+
+    private var availableImportKinds: [FreshserviceImportKind] {
+        canImportTickets ? FreshserviceImportKind.allCases : [.assets]
+    }
+
+    private var availableDestinations: [FreshserviceDestination] {
+        canImportTickets ? FreshserviceDestination.allCases : [.assetsTab]
+    }
+
+    private var availableManagedByGroupOptions: [String] {
+        let trimmedFilter = managedByGroupFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+        let merged = trimmedFilter.isEmpty ? managedByGroupOptions : managedByGroupOptions + [trimmedFilter]
+        return Array(Set(merged)).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    private var externalTicketFormURLString: String {
+        let teamCode = (store.teamCode ?? store.user?.teamCode ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let accessKey = externalTicketFormAccessKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard externalTicketFormEnabled, !teamCode.isEmpty, !accessKey.isEmpty else { return "" }
+        let slug = externalTicketFormSlug(from: store.organizationName)
+        return "https://prodconnect-1ea3a.web.app/support/\(slug)?team=\(teamCode)&key=\(accessKey)"
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if canManageIntegrations {
+                    Section("Freshservice") {
+                        Text("Connect Freshservice API")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+
+                        Toggle("Enable Freshservice", isOn: $freshserviceEnabled)
+
+                        Picker("Import Data", selection: $selectedImportKind) {
+                            ForEach(availableImportKinds) { kind in
+                                Text(kind.title).tag(kind)
+                            }
+                        }
+
+                        Picker("Destination", selection: $selectedDestination) {
+                            ForEach(availableDestinations) { destination in
+                                Text(destination.title).tag(destination)
+                            }
+                        }
+
+                        Picker("Sync Mode", selection: $freshserviceSyncMode) {
+                            ForEach(ProdConnectStore.FreshserviceSyncMode.allCases, id: \.self) { mode in
+                                Text(mode.title).tag(mode)
+                            }
+                        }
+
+                        TextField("Freshservice URL", text: $freshserviceAPIURL)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+
+                        SecureField("Freshservice API Key", text: $freshserviceAPIKey)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+
+                        if selectedImportKind == .assets {
+                            Picker("Managed By Group", selection: $managedByGroupFilter) {
+                                Text("All Groups").tag("")
+                                ForEach(availableManagedByGroupOptions, id: \.self) { option in
+                                    Text(option).tag(option)
+                                }
+                            }
+
+                            Button {
+                                refreshManagedByGroupOptions()
+                            } label: {
+                                if isLoadingManagedByGroups {
+                                    ProgressView()
+                                } else {
+                                    Text("Refresh Groups")
+                                }
+                            }
+                            .disabled(
+                                isSaving
+                                || isTesting
+                                || isImporting
+                                || isLoadingManagedByGroups
+                                || freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                || freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            )
+                        }
+
+                        Button {
+                            saveConnection()
+                        } label: {
+                            if isSaving {
+                                ProgressView()
+                            } else {
+                                Text("Save Connection")
+                            }
+                        }
+                        .disabled(isSaving || isTesting || isImporting)
+
+                        Button {
+                            testConnection()
+                        } label: {
+                            if isTesting {
+                                ProgressView()
+                            } else {
+                                Text("Test Connection")
+                            }
+                        }
+                        .disabled(
+                            isSaving
+                            || isTesting
+                            || isImporting
+                            || freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        )
+
+                        Button {
+                            importFreshserviceData()
+                        } label: {
+                            if isImporting {
+                                ProgressView()
+                            } else {
+                                Text("Import")
+                            }
+                        }
+                        .disabled(
+                            isSaving
+                            || isTesting
+                            || isImporting
+                            || freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        )
+
+                        if !statusMessage.isEmpty {
+                            Text(statusMessage)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                } else {
+                    Section("Integrations") {
+                        Text("Integrations are available for basic and premium admin or owner accounts.")
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+            .navigationTitle("Integrations")
+            .onAppear(perform: loadState)
+            .onReceive(store.$freshserviceIntegration) { _ in
+                loadState()
+            }
+            .onReceive(store.$externalTicketFormIntegration) { _ in
+                loadState()
+            }
+            .sheet(isPresented: $isSharingExternalTicketLink) {
+                ShareSheet(items: [URL(string: externalTicketFormURLString)!])
+            }
+        }
+    }
+
+    private func loadState() {
+        let settings = store.freshserviceIntegration
+        freshserviceAPIURL = settings.apiURL
+        freshserviceAPIKey = settings.apiKey
+        freshserviceEnabled = settings.isEnabled
+        managedByGroupFilter = settings.managedByGroup
+        managedByGroupOptions = settings.managedByGroupOptions
+        freshserviceSyncMode = settings.syncMode
+        let externalSettings = store.externalTicketFormIntegration
+        externalTicketFormEnabled = externalSettings.isEnabled
+        externalTicketFormAccessKey = externalSettings.accessKey
+        if externalTicketFormAccessKey.isEmpty, canImportTickets {
+            externalTicketFormAccessKey = store.generateExternalTicketAccessKey()
+        }
+        if !canImportTickets, selectedImportKind == .tickets {
+            selectedImportKind = .assets
+        }
+        if !availableDestinations.contains(selectedDestination) {
+            selectedDestination = availableDestinations.first ?? .assetsTab
+        }
+    }
+
+    private func saveConnection() {
+        isSaving = true
+        statusMessage = ""
+        store.saveFreshserviceIntegration(
+            apiURL: freshserviceAPIURL,
+            apiKey: freshserviceAPIKey,
+            managedByGroup: managedByGroupFilter,
+            managedByGroupOptions: managedByGroupOptions,
+            syncMode: freshserviceSyncMode,
+            isEnabled: freshserviceEnabled
+        ) { result in
+            isSaving = false
+            switch result {
+            case .success:
+                statusMessage = "Freshservice connection saved."
+            case .failure(let error):
+                statusMessage = "Save failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func testConnection() {
+        let trimmedURL = freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedKey = freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedURL.isEmpty, !trimmedKey.isEmpty else {
+            statusMessage = "Enter both the Freshservice URL and API key."
+            return
+        }
+
+        isTesting = true
+        statusMessage = ""
+        let assetCompletion: (Result<([[String: Any]], Bool), Error>) -> Void = { result in
+            DispatchQueue.main.async {
+                isTesting = false
+                switch result {
+                case .success(let payload):
+                    let (items, reachedCap) = payload
+                    let filteredItems = filteredFreshserviceItems(items)
+                    if reachedCap {
+                        statusMessage = "Connected to Freshservice. Found at least \(filteredItems.count) assets (2,000 asset test cap reached)."
+                    } else {
+                        statusMessage = "Connected to Freshservice. Found \(filteredItems.count) assets."
+                    }
+                case .failure(let error):
+                    statusMessage = "Connection failed: \(error.localizedDescription)"
+                }
+            }
+        }
+        let ticketCompletion: (Result<([[String: Any]], Bool), Error>) -> Void = { result in
+            DispatchQueue.main.async {
+                isTesting = false
+                switch result {
+                case .success(let payload):
+                    let (items, reachedCap) = payload
+                    if reachedCap {
+                        statusMessage = "Connected to Freshservice. Found at least \(items.count) tickets (20,000 ticket cap reached)."
+                    } else {
+                        statusMessage = "Connected to Freshservice. Found \(items.count) tickets."
+                    }
+                case .failure(let error):
+                    statusMessage = "Connection failed: \(error.localizedDescription)"
+                }
+            }
+        }
+        switch selectedImportKind {
+        case .assets:
+            FreshserviceAPI.fetchAllAssetsWithAPIKey(apiKey: trimmedKey, apiUrl: trimmedURL, maxPages: 20, completion: assetCompletion)
+        case .tickets:
+            FreshserviceAPI.fetchAllTicketsWithAPIKey(apiKey: trimmedKey, apiUrl: trimmedURL, completion: ticketCompletion)
+        }
+    }
+
+    private func importFreshserviceData() {
+        let trimmedURL = freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedKey = freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedURL.isEmpty, !trimmedKey.isEmpty else {
+            statusMessage = "Enter both the Freshservice URL and API key."
+            return
+        }
+
+        isImporting = true
+        statusMessage = ""
+        let assetCompletion: (Result<([[String: Any]], Bool), Error>) -> Void = { result in
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let payload):
+                    let (items, reachedCap) = payload
+                    let filteredItems = filteredFreshserviceItems(items)
+                    switch selectedDestination {
+                    case .assetsTab:
+                        let imported = filteredItems.compactMap { mapFreshserviceAsset($0) }
+                        store.upsertGear(imported) { saveResult in
+                            isImporting = false
+                            switch saveResult {
+                            case .success:
+                                if reachedCap {
+                                    statusMessage = "Imported \(imported.count) Freshservice \(selectedImportKind.rawValue) into Assets and Firebase. 20,000 asset cap reached."
+                                } else {
+                                    statusMessage = "Imported \(imported.count) Freshservice \(selectedImportKind.rawValue) into Assets and Firebase."
+                                }
+                            case .failure(let error):
+                                statusMessage = "Import failed while saving assets: \(error.localizedDescription)"
+                            }
+                        }
+                    case .ticketsTab:
+                        let imported = filteredItems.compactMap { mapFreshserviceTicket($0) }
+                        store.upsertTickets(imported) { saveResult in
+                            isImporting = false
+                            switch saveResult {
+                            case .success:
+                                if reachedCap {
+                                    statusMessage = "Imported \(imported.count) Freshservice \(selectedImportKind.rawValue) into Tickets and Firebase. 20,000 asset cap reached."
+                                } else {
+                                    statusMessage = "Imported \(imported.count) Freshservice \(selectedImportKind.rawValue) into Tickets and Firebase."
+                                }
+                            case .failure(let error):
+                                statusMessage = "Import failed while saving tickets: \(error.localizedDescription)"
+                            }
+                        }
+                    }
+                case .failure(let error):
+                    isImporting = false
+                    statusMessage = "Import failed: \(error.localizedDescription)"
+                }
+            }
+        }
+        let ticketCompletion: (Result<([[String: Any]], Bool), Error>) -> Void = { result in
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let payload):
+                    let (items, reachedCap) = payload
+                    enrichFreshserviceTickets(items, apiKey: trimmedKey, apiUrl: trimmedURL) { enrichedItems in
+                        DispatchQueue.main.async {
+                            switch selectedDestination {
+                            case .assetsTab:
+                                let imported = enrichedItems.compactMap { mapFreshserviceAsset($0) }
+                                store.upsertGear(imported) { saveResult in
+                                    isImporting = false
+                                    switch saveResult {
+                                    case .success:
+                                        if reachedCap {
+                                            statusMessage = "Imported \(imported.count) Freshservice tickets into Assets and Firebase. 20,000 ticket cap reached."
+                                        } else {
+                                            statusMessage = "Imported \(imported.count) Freshservice tickets into Assets and Firebase."
+                                        }
+                                    case .failure(let error):
+                                        statusMessage = "Import failed while saving assets: \(error.localizedDescription)"
+                                    }
+                                }
+                            case .ticketsTab:
+                                let imported = enrichedItems.compactMap { mapFreshserviceTicket($0) }
+                                store.upsertTickets(imported) { saveResult in
+                                    isImporting = false
+                                    switch saveResult {
+                                    case .success:
+                                        if reachedCap {
+                                            statusMessage = "Imported \(imported.count) Freshservice tickets into Tickets and Firebase. 20,000 ticket cap reached."
+                                        } else {
+                                            statusMessage = "Imported \(imported.count) Freshservice tickets into Tickets and Firebase."
+                                        }
+                                    case .failure(let error):
+                                        statusMessage = "Import failed while saving tickets: \(error.localizedDescription)"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                case .failure(let error):
+                    isImporting = false
+                    statusMessage = "Import failed: \(error.localizedDescription)"
+                }
+            }
+        }
+        switch selectedImportKind {
+        case .assets:
+            FreshserviceAPI.fetchAllAssetsWithAPIKey(apiKey: trimmedKey, apiUrl: trimmedURL, completion: assetCompletion)
+        case .tickets:
+            FreshserviceAPI.fetchAllTicketsWithAPIKey(apiKey: trimmedKey, apiUrl: trimmedURL, completion: ticketCompletion)
+        }
+    }
+
+    private func filteredFreshserviceItems(_ items: [[String: Any]]) -> [[String: Any]] {
+        switch selectedImportKind {
+        case .assets:
+            let filter = managedByGroupFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !filter.isEmpty else { return items }
+            return items.filter { matchesManagedByGroup($0, filter: filter) }
+        case .tickets:
+            return items.filter { shouldIncludeFreshserviceTicket($0) }
+        }
+    }
+
+    private func enrichFreshserviceTickets(
+        _ tickets: [[String: Any]],
+        apiKey: String,
+        apiUrl: String,
+        completion: @escaping ([[String: Any]]) -> Void
+    ) {
+        let ids = tickets.compactMap { stringValue($0["id"]) }
+        guard !ids.isEmpty else {
+            completion(tickets)
+            return
+        }
+
+        let originalByID = Dictionary(uniqueKeysWithValues: tickets.compactMap { ticket in
+            stringValue(ticket["id"]).map { ($0, ticket) }
+        })
+
+        var enrichedByID = originalByID
+        var agentNameCache: [String: String] = [:]
+        var groupNameCache: [String: String] = [:]
+        var departmentNameCache: [String: String] = [:]
+        let group = DispatchGroup()
+
+        for ticketID in ids {
+            group.enter()
+            FreshserviceAPI.fetchTicketDetailsWithAPIKey(apiKey: apiKey, apiUrl: apiUrl, ticketID: ticketID) { result in
+                switch result {
+                case .success(let detail):
+                    var merged = originalByID[ticketID] ?? [:]
+                    merged.merge(detail) { _, new in new }
+
+                    let nestedGroup = DispatchGroup()
+
+                    if
+                        let responderID = self.stringValue(merged["responder_id"]) ?? self.stringValue(merged["agent_id"]),
+                        !responderID.isEmpty
+                    {
+                        merged["assigned_agent_id"] = responderID
+                        if let cachedName = agentNameCache[responderID] {
+                            merged["assigned_agent_name"] = cachedName
+                        } else {
+                            nestedGroup.enter()
+                            FreshserviceAPI.fetchAgentNameWithAPIKey(apiKey: apiKey, apiUrl: apiUrl, agentID: responderID) { agentResult in
+                                if case .success(let agentName) = agentResult, let agentName, !agentName.isEmpty {
+                                    agentNameCache[responderID] = agentName
+                                    merged["assigned_agent_name"] = agentName
+                                } else if self.stringValue(merged["assigned_agent_name"]) == nil {
+                                    merged["assigned_agent_name"] = "Agent \(responderID)"
+                                }
+                                nestedGroup.leave()
+                            }
+                        }
+                    }
+
+                    if let groupID = self.stringValue(merged["group_id"]), !groupID.isEmpty {
+                        if let cachedGroupName = groupNameCache[groupID] {
+                            merged["group_name"] = cachedGroupName
+                        } else {
+                            nestedGroup.enter()
+                            FreshserviceAPI.fetchGroupNameWithAPIKey(apiKey: apiKey, apiUrl: apiUrl, groupID: groupID) { groupResult in
+                                if case .success(let groupName) = groupResult, let groupName, !groupName.isEmpty {
+                                    groupNameCache[groupID] = groupName
+                                    merged["group_name"] = groupName
+                                }
+                                nestedGroup.leave()
+                            }
+                        }
+                    }
+
+                    if let departmentID = self.stringValue(merged["department_id"]), !departmentID.isEmpty {
+                        if let cachedDepartmentName = departmentNameCache[departmentID] {
+                            merged["department_name"] = cachedDepartmentName
+                        } else {
+                            nestedGroup.enter()
+                            FreshserviceAPI.fetchDepartmentNameWithAPIKey(apiKey: apiKey, apiUrl: apiUrl, departmentID: departmentID) { departmentResult in
+                                if case .success(let departmentName) = departmentResult, let departmentName, !departmentName.isEmpty {
+                                    departmentNameCache[departmentID] = departmentName
+                                    merged["department_name"] = departmentName
+                                }
+                                nestedGroup.leave()
+                            }
+                        }
+                    }
+
+                    nestedGroup.notify(queue: .global(qos: .userInitiated)) {
+                        enrichedByID[ticketID] = merged
+                        group.leave()
+                    }
+                    return
+                case .failure:
+                    break
+                }
+                group.leave()
+            }
+        }
+
+        group.notify(queue: .main) {
+            let enriched = ids.compactMap { enrichedByID[$0] }
+            completion(enriched.isEmpty ? tickets : enriched)
+        }
+    }
+
+    private func refreshManagedByGroupOptions() {
+        let trimmedURL = freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedKey = freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedURL.isEmpty, !trimmedKey.isEmpty else {
+            statusMessage = "Enter both the Freshservice URL and API key."
+            return
+        }
+
+        isLoadingManagedByGroups = true
+        FreshserviceAPI.fetchAllAssetsWithAPIKey(apiKey: trimmedKey, apiUrl: trimmedURL) { result in
+            DispatchQueue.main.async {
+                isLoadingManagedByGroups = false
+                switch result {
+                case .success(let payload):
+                    let (assets, reachedCap) = payload
+                    managedByGroupOptions = extractManagedByGroupOptions(from: assets)
+                    store.saveFreshserviceIntegration(
+                        apiURL: freshserviceAPIURL,
+                        apiKey: freshserviceAPIKey,
+                        managedByGroup: managedByGroupFilter,
+                        managedByGroupOptions: managedByGroupOptions,
+                        syncMode: freshserviceSyncMode,
+                        isEnabled: freshserviceEnabled
+                    )
+                    if managedByGroupOptions.isEmpty {
+                        statusMessage = "Connected to Freshservice. No managed-by groups were found."
+                    } else if reachedCap {
+                        statusMessage = "Loaded \(managedByGroupOptions.count) managed-by groups from the first 20,000 assets."
+                    } else {
+                        statusMessage = "Loaded \(managedByGroupOptions.count) managed-by groups from Freshservice."
+                    }
+                case .failure(let error):
+                    statusMessage = "Failed to load managed-by groups: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func regenerateExternalTicketLink() {
+        externalTicketFormEnabled = true
+        externalTicketFormAccessKey = store.generateExternalTicketAccessKey()
+        externalTicketStatusMessage = "New public link generated. Save to make it active."
+    }
+
+    private func saveExternalTicketForm() {
+        isSavingExternalTicketForm = true
+        externalTicketStatusMessage = ""
+        store.saveExternalTicketFormIntegration(
+            isEnabled: externalTicketFormEnabled,
+            accessKey: externalTicketFormAccessKey
+        ) { result in
+            isSavingExternalTicketForm = false
+            switch result {
+            case .success(let settings):
+                externalTicketFormAccessKey = settings.accessKey
+                externalTicketFormEnabled = settings.isEnabled
+                externalTicketStatusMessage = settings.isEnabled ?
+                    "External ticket form is live." :
+                    "External ticket form is saved but disabled."
+            case .failure(let error):
+                externalTicketStatusMessage = "Save failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func extractManagedByGroupOptions(from assets: [[String: Any]]) -> [String] {
+        let values = assets.compactMap { asset in
+            managedByGroupName(from: asset)
+        }
+        return Array(Set(values)).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    private func managedByGroupName(from asset: [String: Any]) -> String? {
+        let candidates: [String?] = [
+            nestedStringValue(asset["managed_by_group"], key: "name"),
+            nestedStringValue(asset["managed_by"], key: "name"),
+            nestedStringValue(asset["group"], key: "name"),
+            stringValue(asset["managed_by_group"]),
+            stringValue(asset["managed_by"]),
+            stringValue(asset["group_name"])
+        ]
+
+        return candidates
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+    }
+
+    private func mapFreshserviceAsset(_ asset: [String: Any]) -> GearItem? {
+        let freshserviceID = stringValue(asset["id"]) ?? stringValue(asset["display_id"]) ?? stringValue(asset["asset_tag"])
+        let name = stringValue(asset["name"])
+            ?? stringValue(asset["display_name"])
+            ?? nestedStringValue(asset["product"], key: "name")
+            ?? "Freshservice Asset"
+
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        var item = GearItem(
+            id: freshserviceID.map { "freshservice-\($0)" } ?? UUID().uuidString,
+            name: name,
+            category: nestedStringValue(asset["asset_type"], key: "name")
+                ?? nestedStringValue(asset["product"], key: "name")
+                ?? stringValue(asset["asset_type_name"])
+                ?? "Freshservice",
+            status: mappedStatus(from: asset),
+            teamCode: store.teamCode ?? "",
+            location: nestedStringValue(asset["location"], key: "name")
+                ?? nestedStringValue(asset["department"], key: "name")
+                ?? "",
+            serialNumber: stringValue(asset["serial_number"]) ?? "",
+            campus: nestedStringValue(asset["department"], key: "name") ?? "",
+            assetId: stringValue(asset["asset_tag"]) ?? stringValue(asset["display_id"]) ?? "",
+            maintenanceNotes: stringValue(asset["description"]) ?? "",
+            createdBy: "Freshservice Import"
+        )
+
+        item.purchasedFrom = nestedStringValue(asset["vendor"], key: "name") ?? ""
+        item.purchaseDate = parsedDate(from: asset["purchase_date"]) ?? parsedDate(from: asset["created_at"])
+        item.installDate = parsedDate(from: asset["created_at"])
+        item.cost = doubleValue(asset["cost"]) ?? doubleValue(asset["salvage_price"])
+        return item
+    }
+
+    private func mapFreshserviceTicket(_ ticket: [String: Any]) -> SupportTicket? {
+        let ticketID = stringValue(ticket["id"]) ?? stringValue(ticket["display_id"])
+        let title = stringValue(ticket["subject"]) ?? stringValue(ticket["name"]) ?? "Freshservice Ticket"
+        guard !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        let requesterName = nestedStringValue(ticket["requester"], key: "name")
+            ?? nestedStringValue(ticket["requester"], key: "email")
+            ?? stringValue(ticket["requester_name"])
+            ?? stringValue(ticket["email"])
+
+        let campusValue =
+            nestedStringValue(ticket["department"], key: "name")
+            ?? nestedStringValue(ticket["group"], key: "name")
+            ?? nestedStringValue(ticket["custom_fields"], key: "department")
+            ?? nestedStringValue(ticket["custom_fields"], key: "campus")
+            ?? stringValue(ticket["department_name"])
+            ?? stringValue(ticket["group_name"])
+            ?? stringValue(ticket["campus"])
+
+        let roomValue =
+            nestedStringValue(ticket["location"], key: "name")
+            ?? nestedStringValue(ticket["custom_fields"], key: "location")
+            ?? nestedStringValue(ticket["custom_fields"], key: "room")
+            ?? stringValue(ticket["location_name"])
+            ?? stringValue(ticket["room"])
+
+        let assignedAgentIDCandidates = [
+            stringValue(ticket["assigned_agent_id"]),
+            stringValue(ticket["responder_id"]),
+            stringValue(ticket["agent_id"]),
+            nestedStringValue(ticket["responder"], key: "id"),
+            nestedStringValue(ticket["agent"], key: "id"),
+            nestedStringValue(ticket["assigned_to"], key: "id")
+        ]
+        let assignedAgentID = assignedAgentIDCandidates.compactMap { $0 }.first
+
+        let assignedAgentNameCandidates = [
+            nestedStringValue(ticket["responder"], key: "name"),
+            nestedStringValue(ticket["responder"], key: "email"),
+            nestedStringValue(ticket["agent"], key: "name"),
+            nestedStringValue(ticket["agent"], key: "email"),
+            nestedStringValue(ticket["assigned_to"], key: "name"),
+            nestedStringValue(ticket["assigned_to"], key: "email"),
+            stringValue(ticket["responder_email"]),
+            stringValue(ticket["agent_email"]),
+            stringValue(ticket["responder_name"]),
+            stringValue(ticket["agent_name"]),
+            stringValue(ticket["assigned_agent_name"])
+        ]
+        let assignedAgentName = assignedAgentNameCandidates.compactMap { $0 }.first ?? assignedAgentID.map { "Agent \($0)" }
+
+        var item = SupportTicket(
+            id: ticketID.map { "freshservice-ticket-\($0)" } ?? UUID().uuidString,
+            title: title,
+            detail: stringValue(ticket["description_text"]) ?? stringValue(ticket["description"]) ?? "",
+            teamCode: store.teamCode ?? "",
+            campus: campusValue ?? "",
+            room: roomValue ?? "",
+            status: mappedTicketStatus(from: ticket),
+            createdBy: requesterName
+        )
+        item.createdAt = parsedDate(from: ticket["created_at"]) ?? Date()
+        item.updatedAt = parsedDate(from: ticket["updated_at"]) ?? item.createdAt
+        item.assignedAgentID = assignedAgentID
+        item.assignedAgentName = assignedAgentName
+        item.lastUpdatedBy = assignedAgentName
+        if let attachment = firstFreshserviceAttachment(from: ticket) {
+            item.attachmentURL = attachment.url
+            item.attachmentName = attachment.name
+            item.attachmentKind = attachment.kind
+        }
+        return item
+    }
+
+    private func mappedStatus(from asset: [String: Any]) -> GearItem.GearStatus {
+        let raw = (
+            nestedStringValue(asset["state"], key: "name")
+            ?? nestedStringValue(asset["ci_status"], key: "name")
+            ?? stringValue(asset["usage_type"])
+            ?? stringValue(asset["status"])
+            ?? ""
+        ).lowercased()
+
+        if raw.contains("repair") || raw.contains("maint") {
+            return .needsRepair
+        }
+        if raw.contains("retired") {
+            return .retired
+        }
+        if raw.contains("missing") || raw.contains("lost") {
+            return .missing
+        }
+        if raw.contains("use") || raw.contains("deployed") || raw.contains("assigned") || raw.contains("checkout") {
+            return .inUse
+        }
+        return .available
+    }
+
+    private func mappedTicketStatus(from ticket: [String: Any]) -> TicketStatus {
+        let statusCode = stringValue(ticket["status"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let raw = (
+            nestedStringValue(ticket["status"], key: "name")
+            ?? stringValue(ticket["status_name"])
+            ?? ""
+        ).lowercased()
+
+        if ["4", "5"].contains(statusCode) {
+            return .resolved
+        }
+        if ["3", "6", "7"].contains(statusCode) {
+            return .inProgress
+        }
+        if statusCode == "2" {
+            return .open
+        }
+        if statusCode == "1" {
+            return .new
+        }
+
+        if raw.contains("resolve") || raw.contains("closed") {
+            return .resolved
+        }
+        if raw.contains("progress") || raw.contains("pending") || raw.contains("awaiting") || raw.contains("waiting") {
+            return .inProgress
+        }
+        if raw.contains("open") {
+            return .open
+        }
+        return .new
+    }
+
+    private func firstFreshserviceAttachment(from ticket: [String: Any]) -> (url: String, name: String?, kind: TicketAttachmentKind?)? {
+        guard let attachments = ticket["attachments"] as? [[String: Any]], let first = attachments.first else {
+            return nil
+        }
+
+        guard
+            let url = stringValue(first["attachment_url"])
+                ?? stringValue(first["url"])
+                ?? stringValue(first["content_url"])
+        else {
+            return nil
+        }
+
+        let name = stringValue(first["name"]) ?? stringValue(first["file_name"])
+        let contentType = (stringValue(first["content_type"]) ?? "").lowercased()
+        let kind: TicketAttachmentKind?
+        if contentType.hasPrefix("image/") {
+            kind = .image
+        } else if contentType.hasPrefix("video/") {
+            kind = .video
+        } else {
+            kind = nil
+        }
+
+        return (url, name, kind)
+    }
+
+    private func shouldIncludeFreshserviceTicket(_ ticket: [String: Any]) -> Bool {
+        let rawStatusName = (
+            nestedStringValue(ticket["status"], key: "name")
+            ?? stringValue(ticket["status_name"])
+            ?? ""
+        ).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        let rawStatusCode = stringValue(ticket["status"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        if ["1", "2", "3", "6"].contains(rawStatusCode) {
+            return true
+        }
+
+        if rawStatusName.contains("new") {
+            return true
+        }
+        if rawStatusName.contains("open") {
+            return true
+        }
+        if rawStatusName.contains("pending") {
+            return true
+        }
+        if rawStatusName.contains("awaiting response") || rawStatusName.contains("waiting on customer") || rawStatusName.contains("waiting for customer") {
+            return true
+        }
+
+        return false
+    }
+
+    private func matchesManagedByGroup(_ asset: [String: Any], filter: String) -> Bool {
+        let normalizedFilter = filter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalizedFilter.isEmpty else { return true }
+
+        let candidates: [String?] = [
+            nestedStringValue(asset["managed_by_group"], key: "name"),
+            nestedStringValue(asset["managed_by"], key: "name"),
+            nestedStringValue(asset["group"], key: "name"),
+            stringValue(asset["managed_by_group"]),
+            stringValue(asset["managed_by"]),
+            stringValue(asset["group_name"])
+        ]
+
+        return candidates
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .contains { $0 == normalizedFilter }
+    }
+
+    private func stringValue(_ value: Any?) -> String? {
+        if let string = value as? String {
+            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        if let number = value as? NSNumber {
+            return number.stringValue
+        }
+        return nil
+    }
+
+    private func nestedStringValue(_ value: Any?, key: String) -> String? {
+        guard let dictionary = value as? [String: Any] else { return nil }
+        return stringValue(dictionary[key])
+    }
+
+    private func doubleValue(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber {
+            return number.doubleValue
+        }
+        if let string = value as? String {
+            return Double(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return nil
+    }
+
+    private func parsedDate(from value: Any?) -> Date? {
+        guard let raw = stringValue(value) else { return nil }
+        let isoFormatter = ISO8601DateFormatter()
+        if let date = isoFormatter.date(from: raw) {
+            return date
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        for format in ["yyyy-MM-dd", "yyyy-MM-dd HH:mm:ss", "MM/dd/yyyy"] {
+            formatter.dateFormat = format
+            if let date = formatter.date(from: raw) {
+                return date
+            }
+        }
+        return nil
+    }
+}
+
 private enum MainAppSection: String, CaseIterable, Identifiable {
     case chat
     case patchsheet
     case training
     case assets
+    case integrations
     case notifications
     case checklist
     case ideas
@@ -10203,6 +12202,7 @@ private enum MainAppSection: String, CaseIterable, Identifiable {
         case .patchsheet: return "Patchsheet"
         case .training: return "Training"
         case .assets: return "Assets"
+        case .integrations: return "Integrations"
         case .notifications: return "Notifications"
         case .checklist: return "Checklist"
         case .ideas: return "Ideas"
@@ -10219,6 +12219,7 @@ private enum MainAppSection: String, CaseIterable, Identifiable {
         case .patchsheet: return "square.grid.3x2"
         case .training: return "graduationcap"
         case .assets: return "shippingbox"
+        case .integrations: return "link"
         case .notifications: return "bell"
         case .checklist: return "checklist"
         case .ideas: return "lightbulb"
@@ -10232,6 +12233,29 @@ private enum MainAppSection: String, CaseIterable, Identifiable {
 
 private let preferredMainTabSectionsStorageKey = "preferredMainTabSections"
 private let defaultPreferredMainTabSections: [MainAppSection] = [.chat, .patchsheet, .training, .assets]
+
+private func externalTicketFormSlug(from organizationName: String) -> String {
+    let trimmed = organizationName.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return "prodconnect" }
+
+    let lowered = trimmed.lowercased()
+    let allowed = CharacterSet.alphanumerics
+    var slug = ""
+    var previousWasHyphen = false
+
+    for scalar in lowered.unicodeScalars {
+        if allowed.contains(scalar) {
+            slug.unicodeScalars.append(scalar)
+            previousWasHyphen = false
+        } else if !previousWasHyphen {
+            slug.append("-")
+            previousWasHyphen = true
+        }
+    }
+
+    slug = slug.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+    return slug.isEmpty ? "prodconnect" : slug
+}
 
 private func availableMainAppSections(for store: ProdConnectStore) -> [MainAppSection] {
     let isPrivilegedUser = store.user?.isAdmin == true || store.user?.isOwner == true
@@ -10248,6 +12272,9 @@ private func availableMainAppSections(for store: ProdConnectStore) -> [MainAppSe
     }
     if isPrivilegedUser || store.user?.canSeeGear == true {
         sections.append(.assets)
+    }
+    if isPrivilegedUser && (store.user?.hasChatAndTrainingFeatures ?? false) {
+        sections.append(.integrations)
     }
     if isPrivilegedUser || store.user?.canSeeChecklists == true {
         sections.append(.checklist)
@@ -10324,6 +12351,8 @@ private func mainAppSectionDestination(_ section: MainAppSection) -> some View {
         TrainingListView()
     case .assets:
         GearTabView()
+    case .integrations:
+        IntegrationsView()
     case .notifications:
         NotificationsListView()
     case .checklist:
@@ -10341,14 +12370,20 @@ private func mainAppSectionDestination(_ section: MainAppSection) -> some View {
     }
 }
 
-struct MainTabView: View {
+private struct MainTabView: View {
     @EnvironmentObject var store: ProdConnectStore
+    @Binding var selectedLaunchSection: MainAppSection?
+    @Binding var shouldOpenMoreTab: Bool
     @AppStorage("reviewPromptLaunchCount") private var reviewPromptLaunchCount = 0
     @AppStorage("reviewPromptLastRequestTime") private var reviewPromptLastRequestTime: Double = 0
     @AppStorage("reviewPromptHasRequestedBefore") private var reviewPromptHasRequestedBefore = false
     @AppStorage(preferredMainTabSectionsStorageKey) private var preferredMainTabSections = ""
     @State private var showAppReviewPrompt = false
     @State private var selectedAppReviewRating = 0
+    @State private var selectedTabID = ""
+    @State private var pendingOverflowSection: MainAppSection?
+
+    private let moreTabID = "__more__"
 
     // Restored ChatChannelListView wrapper
     struct ChatChannelListView: View {
@@ -10375,6 +12410,7 @@ struct MainTabView: View {
         @State private var field4 = ""
         @State private var selectedCampus: String = ""
         @State private var showCampusDialog = false
+        @State private var saveErrorMessage: String?
         private let categories = ["Audio", "Video", "Lighting"]
         
         private var assignedCampus: String {
@@ -10408,7 +12444,7 @@ struct MainTabView: View {
                                 showCampusDialog = true
                             } label: {
                                 HStack {
-                                    Text(selectedCampus.isEmpty ? "Campus" : selectedCampus)
+                                    Text(selectedCampus.isEmpty ? "Campus/Location" : selectedCampus)
                                     Image(systemName: "chevron.down")
                                 }
                                 .padding(.horizontal, 12)
@@ -10428,7 +12464,7 @@ struct MainTabView: View {
                         }
                     }
                     .padding([.horizontal, .top])
-                    .confirmationDialog("Select Campus", isPresented: $showCampusDialog, titleVisibility: .visible) {
+                    .confirmationDialog("Select Campus/Location", isPresented: $showCampusDialog, titleVisibility: .visible) {
                         ForEach(store.locations.sorted(), id: \.self) { campus in
                             Button(campus) { selectedCampus = campus }
                         }
@@ -10438,7 +12474,7 @@ struct MainTabView: View {
                         Button("Cancel", role: .cancel) {}
                     }
                     List(filteredPatches) { patch in
-                        NavigationLink(destination: PatchDetailView(patch: patch)) {
+                        NavigationLink(destination: EditPatchView(patch: patch).environmentObject(store)) {
                             VStack(alignment: .leading) {
                                 Text(patch.name).font(.headline)
                                 HStack {
@@ -10496,11 +12532,17 @@ struct MainTabView: View {
                             channelCount: isLighting ? parsedChannelCount : nil,
                             universe: isLighting ? field4.trimmingCharacters(in: .whitespacesAndNewlines) : nil
                         )
-                        store.savePatch(patch)
-                        field1 = ""
-                        field2 = ""
-                        field3 = ""
-                        field4 = ""
+                        store.savePatch(patch) { result in
+                            switch result {
+                            case .success:
+                                field1 = ""
+                                field2 = ""
+                                field3 = ""
+                                field4 = ""
+                            case .failure(let error):
+                                saveErrorMessage = error.localizedDescription
+                            }
+                        }
                     } label: {
                         Label("Add Patch", systemImage: "plus.rectangle.on.rectangle")
                             .fontWeight(.semibold)
@@ -10513,6 +12555,14 @@ struct MainTabView: View {
                     .padding(.bottom, 16)
                 }
                 .navigationTitle("Patchsheet")
+                .alert("Unable to Save Patch", isPresented: Binding(
+                    get: { saveErrorMessage != nil },
+                    set: { if !$0 { saveErrorMessage = nil } }
+                )) {
+                    Button("OK", role: .cancel) {}
+                } message: {
+                    Text(saveErrorMessage ?? "")
+                }
             }
         }
         private var addPatchEnabled: Bool {
@@ -10722,8 +12772,7 @@ struct MainTabView: View {
                         }
                     }
                     .sheet(isPresented: $showAddGear) {
-                        AddGearView { newItem in
-                            store.saveGear(newItem)
+                        AddGearView { _ in
                             showAddGear = false
                         }
                     }
@@ -10798,25 +12847,9 @@ struct MainTabView: View {
             }
         }
         private var filteredPatches: [PatchRow] {
-            store.patchsheet.filter { $0.category == categories[selectedTab] && (effectiveCampusFilter.isEmpty || $0.campus == effectiveCampusFilter) }
-        }
-        struct PatchDetailView: View {
-            var patch: PatchRow
-            var body: some View {
-                Form {
-                    Section(header: Text("Patch Info")) {
-                        TextField("Name", text: .constant(patch.name)).disabled(true)
-                        TextField("Input", text: .constant(patch.input)).disabled(true)
-                        TextField("Output", text: .constant(patch.output)).disabled(true)
-                        TextField("Campus", text: .constant(patch.campus)).disabled(true)
-                        TextField("Room", text: .constant(patch.room)).disabled(true)
-                        if patch.category == "Lighting" {
-                            TextField("Universe", text: .constant(patch.universe ?? "")).disabled(true)
-                        }
-                    }
-                }
-                .navigationTitle(patch.name)
-            }
+            store.patchsheet
+                .filter { $0.category == categories[selectedTab] && (effectiveCampusFilter.isEmpty || $0.campus == effectiveCampusFilter) }
+                .sorted(by: PatchRow.autoSort)
         }
     }
     private var availableSections: [MainAppSection] {
@@ -10880,22 +12913,39 @@ struct MainTabView: View {
     }
 
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTabID) {
             ForEach(featuredSections) { section in
                 mainAppSectionDestination(section)
                     .tabItem {
                         Label(section.title, systemImage: section.icon)
                     }
                     .badge(section == .notifications && store.notificationBadgeCount > 0 ? store.notificationBadgeCount : 0)
+                    .tag(section.rawValue)
             }
-            MoreTabView(sections: overflowSections)
+            MoreTabView(sections: overflowSections, pendingSection: $pendingOverflowSection)
                 .tabItem {
                     Label("More", systemImage: "ellipsis")
                 }
                 .badge(overflowSections.contains(.notifications) && store.notificationBadgeCount > 0 ? store.notificationBadgeCount : 0)
+                .tag(moreTabID)
         }
         .onAppear {
+            if selectedTabID.isEmpty {
+                selectedTabID = featuredSections.first?.rawValue ?? moreTabID
+            }
+            handleLaunchSelection(selectedLaunchSection)
+            handleOpenMoreTab()
             maybeRequestAppReview()
+        }
+        .onChange(of: selectedLaunchSection) { newValue in
+            handleLaunchSelection(newValue)
+        }
+        .onChange(of: shouldOpenMoreTab) { _ in
+            handleOpenMoreTab()
+        }
+        .onChange(of: featuredSections.map(\.rawValue)) { newValue in
+            guard !newValue.contains(selectedTabID), selectedTabID != moreTabID else { return }
+            selectedTabID = featuredSections.first?.rawValue ?? moreTabID
         }
         .sheet(isPresented: $showAppReviewPrompt, onDismiss: {
             selectedAppReviewRating = 0
@@ -10910,6 +12960,29 @@ struct MainTabView: View {
             )
             .presentationDetents([.medium])
             .presentationDragIndicator(.visible)
+        }
+    }
+
+    private func handleLaunchSelection(_ section: MainAppSection?) {
+        guard let section else { return }
+
+        if featuredSections.contains(section) {
+            selectedTabID = section.rawValue
+        } else {
+            pendingOverflowSection = section
+            selectedTabID = moreTabID
+        }
+
+        DispatchQueue.main.async {
+            selectedLaunchSection = nil
+        }
+    }
+
+    private func handleOpenMoreTab() {
+        guard shouldOpenMoreTab else { return }
+        selectedTabID = moreTabID
+        DispatchQueue.main.async {
+            shouldOpenMoreTab = false
         }
     }
 }
@@ -11057,6 +13130,9 @@ private struct NotificationsListView: View {
 private struct MoreTabView: View {
     @EnvironmentObject var store: ProdConnectStore
     let sections: [MainAppSection]
+    @Binding var pendingSection: MainAppSection?
+    @State private var presentedSection: MainAppSection?
+    @State private var isPresentingPendingSection = false
 
     private var notificationRow: some View {
         HStack {
@@ -11094,6 +13170,31 @@ private struct MoreTabView: View {
                 }
             }
             .navigationTitle("More")
+            .navigationDestination(isPresented: $isPresentingPendingSection) {
+                if let presentedSection {
+                    mainAppSectionDestination(presentedSection)
+                }
+            }
+        }
+        .onAppear {
+            openPendingSectionIfNeeded()
+        }
+        .onChange(of: pendingSection?.rawValue) { _ in
+            openPendingSectionIfNeeded()
+        }
+        .onChange(of: isPresentingPendingSection) { isPresenting in
+            if !isPresenting {
+                presentedSection = nil
+            }
+        }
+    }
+
+    private func openPendingSectionIfNeeded() {
+        guard let pendingSection, sections.contains(pendingSection) else { return }
+        presentedSection = pendingSection
+        isPresentingPendingSection = true
+        DispatchQueue.main.async {
+            self.pendingSection = nil
         }
     }
 }

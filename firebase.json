@@ -21,5 +21,31 @@
         "npm --prefix \"$RESOURCE_DIR\" run lint"
       ]
     }
-  ]
+  ],
+  "hosting": {
+    "public": "public",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "/support/**",
+        "destination": "/external-ticket.html"
+      },
+      {
+        "source": "/api/external-ticket-config",
+        "function": "getExternalTicketFormConfig"
+      },
+      {
+        "source": "/api/external-ticket-upload",
+        "function": "uploadExternalTicketAttachment"
+      },
+      {
+        "source": "/api/external-ticket-submit",
+        "function": "submitExternalTicket"
+      }
+    ]
+  }
 }

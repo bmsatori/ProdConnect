@@ -4,9 +4,7 @@ import UserNotifications
 
 final class MacAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        if FirebaseApp.app() == nil {
-            FirebaseApp.configure()
-        }
+        configureMacFirebaseIfNeeded()
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         center.requestAuthorization(options: [.badge, .sound, .alert]) { granted, error in

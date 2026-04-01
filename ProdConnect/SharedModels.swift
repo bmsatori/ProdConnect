@@ -14,6 +14,54 @@ struct PatchRow: Identifiable, Codable {
     var position: Int = 0
 }
 
+extension PatchRow {
+    nonisolated private static func firstNumber(in value: String) -> Int? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let digits = trimmed
+            .split(whereSeparator: { !$0.isNumber })
+            .first
+            .map(String.init)
+
+        guard let digits else { return nil }
+        return Int(digits)
+    }
+
+    nonisolated var sortUniverseNumber: Int {
+        Self.firstNumber(in: universe ?? "") ?? 0
+    }
+
+    nonisolated var sortSignalNumber: Int {
+        Self.firstNumber(in: input) ?? Self.firstNumber(in: output) ?? Int.max
+    }
+
+    nonisolated static func autoSort(_ lhs: PatchRow, _ rhs: PatchRow) -> Bool {
+        if lhs.sortUniverseNumber != rhs.sortUniverseNumber {
+            return lhs.sortUniverseNumber < rhs.sortUniverseNumber
+        }
+        if lhs.sortSignalNumber != rhs.sortSignalNumber {
+            return lhs.sortSignalNumber < rhs.sortSignalNumber
+        }
+
+        let lhsInput = lhs.input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rhsInput = rhs.input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let inputOrder = lhsInput.localizedCaseInsensitiveCompare(rhsInput)
+        if inputOrder != .orderedSame {
+            return inputOrder == .orderedAscending
+        }
+
+        let lhsOutput = lhs.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rhsOutput = rhs.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        let outputOrder = lhsOutput.localizedCaseInsensitiveCompare(rhsOutput)
+        if outputOrder != .orderedSame {
+            return outputOrder == .orderedAscending
+        }
+
+        return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+    }
+}
+
 struct UserProfile: Identifiable, Codable {
     var id: String = UUID().uuidString
     var displayName: String
@@ -296,8 +344,31 @@ struct IdeaCard: Identifiable, Codable {
 enum TicketStatus: String, Codable, CaseIterable, Equatable {
     case new = "New"
     case open = "Open"
-    case inProgress = "In Progress"
+    case inProgress = "Pending"
     case resolved = "Resolved"
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let rawValue = try container.decode(String.self)
+
+        switch rawValue {
+        case TicketStatus.new.rawValue:
+            self = .new
+        case TicketStatus.open.rawValue:
+            self = .open
+        case "In Progress", TicketStatus.inProgress.rawValue:
+            self = .inProgress
+        case TicketStatus.resolved.rawValue:
+            self = .resolved
+        default:
+            self = .new
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 
     var sortOrder: Int {
         switch self {
@@ -316,9 +387,17 @@ struct TicketActivityEntry: Identifiable, Codable, Equatable {
     var author: String? = nil
 }
 
+struct TicketPrivateNoteEntry: Identifiable, Codable, Equatable {
+    var id: String = UUID().uuidString
+    var message: String
+    var createdAt: Date = Date()
+    var author: String? = nil
+}
+
 enum TicketAttachmentKind: String, Codable, Equatable {
     case image
     case video
+    case document
 }
 
 struct SupportTicket: Identifiable, Codable, Equatable {
@@ -331,6 +410,8 @@ struct SupportTicket: Identifiable, Codable, Equatable {
     var status: TicketStatus = .new
     var createdBy: String? = nil
     var createdByUserID: String? = nil
+    var externalRequesterName: String? = nil
+    var externalRequesterEmail: String? = nil
     var assignedAgentID: String? = nil
     var assignedAgentName: String? = nil
     var linkedGearID: String? = nil
@@ -343,7 +424,142 @@ struct SupportTicket: Identifiable, Codable, Equatable {
     var attachmentURL: String? = nil
     var attachmentName: String? = nil
     var attachmentKind: TicketAttachmentKind? = nil
+    var externalSubmission: Bool = false
+    var privateNotes: String = ""
+    var privateNoteEntries: [TicketPrivateNoteEntry] = []
     var activity: [TicketActivityEntry] = []
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case detail
+        case teamCode
+        case campus
+        case room
+        case status
+        case createdBy
+        case createdByUserID
+        case externalRequesterName
+        case externalRequesterEmail
+        case assignedAgentID
+        case assignedAgentName
+        case linkedGearID
+        case linkedGearName
+        case dueDate
+        case createdAt
+        case updatedAt
+        case resolvedAt
+        case lastUpdatedBy
+        case attachmentURL
+        case attachmentName
+        case attachmentKind
+        case externalSubmission
+        case privateNotes
+        case privateNoteEntries
+        case activity
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        title: String,
+        detail: String = "",
+        teamCode: String,
+        campus: String = "",
+        room: String = "",
+        status: TicketStatus = .new,
+        createdBy: String? = nil,
+        createdByUserID: String? = nil,
+        externalRequesterName: String? = nil,
+        externalRequesterEmail: String? = nil,
+        assignedAgentID: String? = nil,
+        assignedAgentName: String? = nil,
+        linkedGearID: String? = nil,
+        linkedGearName: String? = nil,
+        dueDate: Date? = nil,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date(),
+        resolvedAt: Date? = nil,
+        lastUpdatedBy: String? = nil,
+        attachmentURL: String? = nil,
+        attachmentName: String? = nil,
+        attachmentKind: TicketAttachmentKind? = nil,
+        externalSubmission: Bool = false,
+        privateNotes: String = "",
+        privateNoteEntries: [TicketPrivateNoteEntry] = [],
+        activity: [TicketActivityEntry] = []
+    ) {
+        self.id = id
+        self.title = title
+        self.detail = detail
+        self.teamCode = teamCode
+        self.campus = campus
+        self.room = room
+        self.status = status
+        self.createdBy = createdBy
+        self.createdByUserID = createdByUserID
+        self.externalRequesterName = externalRequesterName
+        self.externalRequesterEmail = externalRequesterEmail
+        self.assignedAgentID = assignedAgentID
+        self.assignedAgentName = assignedAgentName
+        self.linkedGearID = linkedGearID
+        self.linkedGearName = linkedGearName
+        self.dueDate = dueDate
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.resolvedAt = resolvedAt
+        self.lastUpdatedBy = lastUpdatedBy
+        self.attachmentURL = attachmentURL
+        self.attachmentName = attachmentName
+        self.attachmentKind = attachmentKind
+        self.externalSubmission = externalSubmission
+        self.privateNotes = privateNotes
+        self.privateNoteEntries = privateNoteEntries
+        self.activity = activity
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
+        detail = try container.decodeIfPresent(String.self, forKey: .detail) ?? ""
+        teamCode = try container.decodeIfPresent(String.self, forKey: .teamCode) ?? ""
+        campus = try container.decodeIfPresent(String.self, forKey: .campus) ?? ""
+        room = try container.decodeIfPresent(String.self, forKey: .room) ?? ""
+        status = try container.decodeIfPresent(TicketStatus.self, forKey: .status) ?? .new
+        createdBy = try container.decodeIfPresent(String.self, forKey: .createdBy)
+        createdByUserID = try container.decodeIfPresent(String.self, forKey: .createdByUserID)
+        externalRequesterName = try container.decodeIfPresent(String.self, forKey: .externalRequesterName)
+        externalRequesterEmail = try container.decodeIfPresent(String.self, forKey: .externalRequesterEmail)
+        assignedAgentID = try container.decodeIfPresent(String.self, forKey: .assignedAgentID)
+        assignedAgentName = try container.decodeIfPresent(String.self, forKey: .assignedAgentName)
+        linkedGearID = try container.decodeIfPresent(String.self, forKey: .linkedGearID)
+        linkedGearName = try container.decodeIfPresent(String.self, forKey: .linkedGearName)
+        dueDate = try container.decodeIfPresent(Date.self, forKey: .dueDate)
+        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
+        resolvedAt = try container.decodeIfPresent(Date.self, forKey: .resolvedAt)
+        lastUpdatedBy = try container.decodeIfPresent(String.self, forKey: .lastUpdatedBy)
+        attachmentURL = try container.decodeIfPresent(String.self, forKey: .attachmentURL)
+        attachmentName = try container.decodeIfPresent(String.self, forKey: .attachmentName)
+        attachmentKind = try container.decodeIfPresent(TicketAttachmentKind.self, forKey: .attachmentKind)
+        externalSubmission = try container.decodeIfPresent(Bool.self, forKey: .externalSubmission) ?? false
+        let legacyPrivateNotes = try container.decodeIfPresent(String.self, forKey: .privateNotes) ?? ""
+        privateNoteEntries = try container.decodeIfPresent([TicketPrivateNoteEntry].self, forKey: .privateNoteEntries) ?? []
+        if privateNoteEntries.isEmpty {
+            let trimmedLegacyNotes = legacyPrivateNotes.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedLegacyNotes.isEmpty {
+                privateNoteEntries = [
+                    TicketPrivateNoteEntry(
+                        message: trimmedLegacyNotes,
+                        createdAt: updatedAt,
+                        author: lastUpdatedBy ?? createdBy
+                    )
+                ]
+            }
+        }
+        privateNotes = ""
+        activity = try container.decodeIfPresent([TicketActivityEntry].self, forKey: .activity) ?? []
+    }
 }
 
 struct GearTicketHistoryEntry: Identifiable, Codable, Equatable {

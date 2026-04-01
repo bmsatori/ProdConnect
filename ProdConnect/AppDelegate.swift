@@ -8,11 +8,13 @@ import OneSignalFramework
 // MARK: - App Delegate for OneSignal
 
 class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
+    private static var hasConfiguredFirebase = false
     
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey : Any]? = nil) -> Bool {
-        // Configure Firebase first
-        if FirebaseApp.app() == nil {
+        // Avoid probing Firebase state before configuration, which can emit startup warnings.
+        if !Self.hasConfiguredFirebase {
             FirebaseApp.configure()
+            Self.hasConfiguredFirebase = true
             print("DEBUG: Firebase configured in AppDelegate")
         }
         

@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Submit Ticket | ProdConnect</title>
+  <style>
+    :root {
+      --bg: #f3f4ee;
+      --panel: #fffdf7;
+      --ink: #18211f;
+      --muted: #61706d;
+      --line: #d7dbd2;
+      --accent: #0f766e;
+      --accent-strong: #115e59;
+      --danger: #b42318;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(15, 118, 110, 0.15), transparent 34%),
+        linear-gradient(180deg, #f8faf7 0%, var(--bg) 100%);
+      min-height: 100vh;
+    }
+
+    .wrap {
+      width: min(760px, calc(100vw - 32px));
+      margin: 40px auto;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: 0 18px 40px rgba(24, 33, 31, 0.08);
+      overflow: hidden;
+    }
+
+    .hero {
+      padding: 28px 28px 12px;
+    }
+
+    .eyebrow {
+      font-size: 12px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--accent-strong);
+      margin: 0 0 10px;
+    }
+
+    h1 {
+      font-size: clamp(30px, 5vw, 46px);
+      line-height: 1;
+      margin: 0 0 12px;
+    }
+
+    .subcopy {
+      margin: 0;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.55;
+    }
+
+    form {
+      padding: 20px 28px 28px;
+      display: grid;
+      gap: 18px;
+    }
+
+    .grid {
+      display: grid;
+      gap: 18px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    label {
+      display: grid;
+      gap: 8px;
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    input,
+    select,
+    textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px 15px;
+      font: inherit;
+      color: var(--ink);
+      background: white;
+    }
+
+    textarea {
+      min-height: 140px;
+      resize: vertical;
+    }
+
+    input:focus,
+    select:focus,
+    textarea:focus {
+      outline: 2px solid rgba(15, 118, 110, 0.2);
+      border-color: var(--accent);
+    }
+
+    .full {
+      grid-column: 1 / -1;
+    }
+
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 999px;
+      background: var(--accent);
+      color: white;
+      font: inherit;
+      font-weight: 700;
+      padding: 14px 22px;
+      cursor: pointer;
+    }
+
+    button:hover { background: var(--accent-strong); }
+    button:disabled { opacity: 0.65; cursor: wait; }
+
+    .status {
+      min-height: 22px;
+      font-size: 14px;
+      color: var(--muted);
+    }
+
+    .status.error { color: var(--danger); }
+    .status.success { color: var(--accent-strong); }
+
+    .footnote {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+      margin: 0;
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
+    @media (max-width: 640px) {
+      .wrap { margin: 18px auto; }
+      .hero, form { padding-left: 18px; padding-right: 18px; }
+      .grid { grid-template-columns: 1fr; }
+      .full { grid-column: auto; }
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="card">
+      <div class="hero">
+        <p class="eyebrow" id="brand-eyebrow">ProdConnect Support</p>
+        <h1>Submit a Ticket</h1>
+        <p class="subcopy">Use this form to send an issue directly to the team. Include enough detail so they can start working without needing a follow-up first.</p>
+      </div>
+
+      <form id="ticket-form">
+        <div class="grid">
+          <label>
+            Your Name
+            <input id="requester-name" name="requesterName" type="text" autocomplete="name" required>
+          </label>
+
+          <label>
+            Email
+            <input id="requester-email" name="requesterEmail" type="email" autocomplete="email" required>
+          </label>
+
+          <label class="full">
+            Issue Title
+            <input id="title" name="title" type="text" maxlength="140" required>
+          </label>
+
+          <label class="full">
+            Description
+            <textarea id="detail" name="detail" maxlength="4000" required></textarea>
+          </label>
+
+          <label>
+            Campus
+            <select id="campus" name="campus">
+              <option value="">Select campus</option>
+            </select>
+            <input id="campus-text" type="text" class="hidden" placeholder="Enter campus">
+          </label>
+
+          <label>
+            Room
+            <select id="room" name="room">
+              <option value="">Select room</option>
+            </select>
+            <input id="room-text" type="text" class="hidden" placeholder="Enter room">
+          </label>
+
+          <label class="full">
+            Attachment
+            <input id="attachment-file" name="attachment" type="file" accept="image/*,video/*,.pdf,.doc,.docx,.txt,.rtf,.heic,.heif">
+          </label>
+
+          <label class="full">
+            Uploaded File
+            <input id="uploaded-file-name" type="text" value="No file uploaded" readonly>
+          </label>
+
+          <label class="hidden" aria-hidden="true">
+            Company
+            <input id="company" name="company" type="text" tabindex="-1" autocomplete="off">
+          </label>
+        </div>
+
+        <div class="actions">
+          <button id="submit-button" type="submit">Submit Ticket</button>
+          <div id="status" class="status" role="status" aria-live="polite"></div>
+        </div>
+
+        <p class="footnote">This link is team-specific. If the team disables or rotates the link, this form will stop accepting new tickets.</p>
+      </form>
+    </section>
+  </main>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const team = (params.get("team") || "").trim().toUpperCase();
+    const key = (params.get("key") || "").trim();
+    const form = document.getElementById("ticket-form");
+    const statusEl = document.getElementById("status");
+    const button = document.getElementById("submit-button");
+    const campusSelect = document.getElementById("campus");
+    const campusTextInput = document.getElementById("campus-text");
+    const roomSelect = document.getElementById("room");
+    const roomTextInput = document.getElementById("room-text");
+    const fileInput = document.getElementById("attachment-file");
+    const uploadedFileNameInput = document.getElementById("uploaded-file-name");
+    const brandEyebrow = document.getElementById("brand-eyebrow");
+    let uploadedAttachment = null;
+
+    function setStatus(message, mode) {
+      statusEl.textContent = message || "";
+      statusEl.className = "status" + (mode ? " " + mode : "");
+    }
+
+    function applyBranding(organizationName) {
+      const trimmed = (organizationName || "").trim();
+      const brand = trimmed || "ProdConnect";
+      document.title = `Submit Ticket | ${brand}`;
+      brandEyebrow.textContent = `${brand} Support`;
+    }
+
+    function fillSelect(select, values, placeholder) {
+      select.innerHTML = "";
+      const placeholderOption = document.createElement("option");
+      placeholderOption.value = "";
+      placeholderOption.textContent = placeholder;
+      select.appendChild(placeholderOption);
+
+      values.forEach((value) => {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = value;
+        select.appendChild(option);
+      });
+    }
+
+    function configurePresetField(select, textInput, values, selectPlaceholder, textPlaceholder) {
+      if ((values || []).length > 0) {
+        fillSelect(select, values, selectPlaceholder);
+        select.classList.remove("hidden");
+        textInput.classList.add("hidden");
+        textInput.value = "";
+      } else {
+        select.classList.add("hidden");
+        textInput.classList.remove("hidden");
+        textInput.placeholder = textPlaceholder;
+      }
+    }
+
+    function fieldValue(select, textInput) {
+      if (!select.classList.contains("hidden")) {
+        return select.value.trim();
+      }
+      return textInput.value.trim();
+    }
+
+    async function loadOptions() {
+      if (!team || !key) {
+        return;
+      }
+
+      try {
+        const response = await fetch(`/api/external-ticket-config?teamCode=${encodeURIComponent(team)}&accessKey=${encodeURIComponent(key)}`);
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || "Unable to load form options.");
+        }
+
+        configurePresetField(campusSelect, campusTextInput, data.locations || [], "Select campus", "Enter campus");
+        configurePresetField(roomSelect, roomTextInput, data.rooms || [], "Select room", "Enter room");
+        applyBranding(data.organizationName);
+      } catch (error) {
+        setStatus(error.message || "Unable to load form options.", "error");
+      }
+    }
+
+    async function uploadAttachmentIfNeeded() {
+      const selectedFile = fileInput.files[0];
+      if (!selectedFile) {
+        uploadedAttachment = null;
+        uploadedFileNameInput.value = "No file uploaded";
+        return null;
+      }
+
+      if (uploadedAttachment && uploadedAttachment.originalName === selectedFile.name && uploadedAttachment.size === selectedFile.size) {
+        return uploadedAttachment;
+      }
+
+      const formData = new FormData();
+      formData.append("teamCode", team);
+      formData.append("accessKey", key);
+      formData.append("attachment", selectedFile);
+
+      setStatus("Uploading attachment...", "");
+
+      const response = await fetch("/api/external-ticket-upload", {
+        method: "POST",
+        body: formData
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.error || "Attachment upload failed.");
+      }
+
+      uploadedAttachment = {
+        attachmentURL: data.attachmentURL,
+        attachmentName: data.attachmentName,
+        attachmentKind: data.attachmentKind,
+        originalName: selectedFile.name,
+        size: selectedFile.size
+      };
+      uploadedFileNameInput.value = data.attachmentName || selectedFile.name;
+      return uploadedAttachment;
+    }
+
+    if (!team || !key) {
+      button.disabled = true;
+      setStatus("This link is incomplete. Ask the team to send you a fresh ticket form link.", "error");
+    } else {
+      loadOptions();
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+
+      if (!team || !key) {
+        return;
+      }
+
+      let attachment = null;
+
+      try {
+        attachment = await uploadAttachmentIfNeeded();
+      } catch (error) {
+        setStatus(error.message || "Attachment upload failed.", "error");
+        button.disabled = false;
+        return;
+      }
+
+      const payload = {
+        teamCode: team,
+        accessKey: key,
+        requesterName: document.getElementById("requester-name").value.trim(),
+        requesterEmail: document.getElementById("requester-email").value.trim(),
+        title: document.getElementById("title").value.trim(),
+        detail: document.getElementById("detail").value.trim(),
+        campus: fieldValue(campusSelect, campusTextInput),
+        room: fieldValue(roomSelect, roomTextInput),
+        attachmentURL: attachment ? attachment.attachmentURL : "",
+        attachmentName: attachment ? attachment.attachmentName : "",
+        attachmentKind: attachment ? attachment.attachmentKind : "",
+        company: document.getElementById("company").value.trim()
+      };
+
+      button.disabled = true;
+      setStatus("Submitting ticket...", "");
+
+      try {
+        const response = await fetch("/api/external-ticket-submit", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data.error || "Ticket submission failed.");
+        }
+
+        form.reset();
+        uploadedAttachment = null;
+        uploadedFileNameInput.value = "No file uploaded";
+        if (!campusSelect.classList.contains("hidden")) {
+          fillSelect(campusSelect, Array.from(campusSelect.options).slice(1).map((option) => option.value), "Select campus");
+        }
+        if (!roomSelect.classList.contains("hidden")) {
+          fillSelect(roomSelect, Array.from(roomSelect.options).slice(1).map((option) => option.value), "Select room");
+        }
+        campusTextInput.value = "";
+        roomTextInput.value = "";
+        setStatus("Ticket submitted. The team has your request.", "success");
+      } catch (error) {
+        setStatus(error.message || "Ticket submission failed.", "error");
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
