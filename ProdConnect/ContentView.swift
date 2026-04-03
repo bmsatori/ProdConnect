@@ -5215,6 +5215,8 @@ struct CustomizeView: View {
     @AppStorage(preferredMainTabSectionsStorageKey) private var preferredMainTabSections = ""
     @State private var newCampus = ""
     @State private var newRoom = ""
+    @State private var newTicketCategory = ""
+    @State private var newTicketSubcategory = ""
     @State private var gearSheetLink = ""
     @State private var audioPatchSheetLink = ""
     @State private var videoPatchSheetLink = ""
@@ -5350,6 +5352,100 @@ struct CustomizeView: View {
             roomsSection
         } else {
             premiumCampusSection
+        }
+    }
+
+    private var ticketCategoriesSection: some View {
+        Section {
+            HStack {
+                TextField("Add new category", text: $newTicketCategory)
+                    .textFieldStyle(.roundedBorder)
+                Button(action: addTicketCategory) {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.title2)
+                        .foregroundColor(.blue)
+                }
+                .disabled(newTicketCategory.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .listRowBackground(Color.black)
+
+            if !store.ticketCategories.isEmpty {
+                ForEach(store.ticketCategories.sorted(), id: \.self) { category in
+                    HStack {
+                        Image(systemName: "square.grid.2x2")
+                            .foregroundColor(.blue)
+                            .frame(width: 24)
+                        Text(category)
+                            .foregroundColor(.white)
+                        Spacer()
+                    }
+                    .listRowBackground(Color.black)
+                }
+                .onDelete { indexSet in
+                    let sorted = store.ticketCategories.sorted()
+                    for index in indexSet {
+                        store.deleteTicketCategory(sorted[index])
+                    }
+                }
+            } else {
+                Text("No custom categories added yet")
+                    .foregroundColor(.gray)
+                    .font(.caption)
+                    .listRowBackground(Color.black)
+            }
+        } header: {
+            Text("Ticket Categories")
+        } footer: {
+            Text("Swipe left on a category to delete it")
+                .font(.caption)
+                .foregroundColor(.gray)
+        }
+    }
+
+    private var ticketSubcategoriesSection: some View {
+        Section {
+            HStack {
+                TextField("Add new subcategory", text: $newTicketSubcategory)
+                    .textFieldStyle(.roundedBorder)
+                Button(action: addTicketSubcategory) {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.title2)
+                        .foregroundColor(.blue)
+                }
+                .disabled(newTicketSubcategory.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .listRowBackground(Color.black)
+
+            if !store.ticketSubcategories.isEmpty {
+                ForEach(store.ticketSubcategories.sorted(), id: \.self) { subcategory in
+                    HStack {
+                        Image(systemName: "tag")
+                            .foregroundColor(.blue)
+                            .frame(width: 24)
+                        Text(subcategory)
+                            .foregroundColor(.white)
+                        Spacer()
+                    }
+                    .listRowBackground(Color.black)
+                }
+                .onDelete { indexSet in
+                    let sorted = store.ticketSubcategories.sorted()
+                    for index in indexSet {
+                        store.deleteTicketSubcategory(sorted[index])
+                    }
+                }
+            } else {
+                Text("No custom subcategories added yet")
+                    .foregroundColor(.gray)
+                    .font(.caption)
+                    .listRowBackground(Color.black)
+            }
+        } header: {
+            Text("Ticket Subcategories")
+        } footer: {
+            Text("Swipe left on a subcategory to delete it")
+                .font(.caption)
+                .foregroundColor(.gray)
         }
     }
 
@@ -5747,6 +5843,8 @@ struct CustomizeView: View {
                 tabCustomizationSection
                 if isPrivilegedUser {
                     campusAndRoomsSection
+                    ticketCategoriesSection
+                    ticketSubcategoriesSection
                     if canManageIntegrations {
                         integrationsSection
                     }
@@ -5973,6 +6071,40 @@ struct CustomizeView: View {
             presentResultAlert("✓ Room '\(trimmed)' added successfully", delay: 0)
         }
         newRoom = ""
+    }
+
+    private func addTicketCategory() {
+        let trimmed = newTicketCategory.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            presentResultAlert("Category name cannot be empty", delay: 0)
+            return
+        }
+        if store.ticketCategories.contains(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
+            presentResultAlert("This category already exists", delay: 0)
+            return
+        }
+        store.saveTicketCategory(trimmed)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            presentResultAlert("✓ Category '\(trimmed)' added successfully", delay: 0)
+        }
+        newTicketCategory = ""
+    }
+
+    private func addTicketSubcategory() {
+        let trimmed = newTicketSubcategory.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            presentResultAlert("Subcategory name cannot be empty", delay: 0)
+            return
+        }
+        if store.ticketSubcategories.contains(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
+            presentResultAlert("This subcategory already exists", delay: 0)
+            return
+        }
+        store.saveTicketSubcategory(trimmed)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            presentResultAlert("✓ Subcategory '\(trimmed)' added successfully", delay: 0)
+        }
+        newTicketSubcategory = ""
     }
 
     private func syncGearLocationsToCampuses() {
@@ -7350,6 +7482,18 @@ struct GearDetailView: View {
     @State private var saveErrorMessage: String?
 
     var canEdit: Bool { store.canEditGear }
+    private var categoryOptions: [String] {
+        let current = item.category.trimmingCharacters(in: .whitespacesAndNewlines)
+        var options = ProdConnectStore.defaultGearCategories
+        let existing = store.gear.map(\.category).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        for option in existing where !options.contains(where: { $0.caseInsensitiveCompare(option) == .orderedSame }) {
+            options.append(option)
+        }
+        if !current.isEmpty && !options.contains(where: { $0.caseInsensitiveCompare(current) == .orderedSame }) {
+            options.append(current)
+        }
+        return options.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
 
     var body: some View {
         Form {
@@ -7358,7 +7502,7 @@ struct GearDetailView: View {
                 TextField("Serial Number", text: $item.serialNumber).disabled(!canEdit)
                 TextField("Asset ID", text: $item.assetId).disabled(!canEdit)
                 Picker("Category", selection: $item.category) {
-                    ForEach(["Audio","Video","Lighting","Network","Misc"], id: \.self) { Text($0) }
+                    ForEach(categoryOptions, id: \.self) { Text($0) }
                 }.pickerStyle(.menu).disabled(!canEdit)
                 if store.locations.isEmpty {
                     TextField("Location/Campus", text: $item.location).disabled(!canEdit)
@@ -7676,6 +7820,11 @@ struct AddGearView: View {
     @State private var serialValidationMessage: String?
 
     var onSave: (GearItem) -> Void
+    private var categoryOptions: [String] {
+        let existing = store.gear.map(\.category).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        return Array(Set(ProdConnectStore.defaultGearCategories + existing))
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
 
     var body: some View {
         NavigationStack {
@@ -7685,7 +7834,7 @@ struct AddGearView: View {
                     TextField("Serial Number", text: $serialNumber)
                     TextField("Asset ID", text: $assetId)
                     Picker("Category", selection: $category) {
-                        ForEach(["Audio","Video","Lighting","Network","Misc"], id: \.self) { Text($0) }
+                        ForEach(categoryOptions, id: \.self) { Text($0) }
                     }
                     if store.locations.isEmpty {
                         TextField("Location", text: $location)
@@ -8350,6 +8499,39 @@ struct TicketDetailView: View {
                 }
             }
 
+            Section("Category") {
+                if isEditing {
+                    if ticketCategoryOptions.isEmpty {
+                        TextField("Category", text: $ticket.category)
+                        TextField("Subcategory", text: $ticket.subcategory)
+                    } else {
+                        Picker("Category", selection: $ticket.category) {
+                            Text("Select category").tag("")
+                            ForEach(ticketCategoryOptions, id: \.self) { option in
+                                Text(option).tag(option)
+                            }
+                        }
+                        if ticketSubcategoryOptions.isEmpty {
+                            TextField("Subcategory", text: $ticket.subcategory)
+                        } else {
+                            Picker("Subcategory", selection: $ticket.subcategory) {
+                                Text("Select subcategory").tag("")
+                                ForEach(ticketSubcategoryOptions, id: \.self) { option in
+                                    Text(option).tag(option)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let categoryLine = [ticket.category, ticket.subcategory]
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                        .joined(separator: " • ")
+                    Text(categoryLine.isEmpty ? "Not set" : categoryLine)
+                        .foregroundColor(categoryLine.isEmpty ? .secondary : .primary)
+                }
+            }
+
             Section("Location") {
                 if isEditing {
                     if store.locations.isEmpty {
@@ -8604,6 +8786,24 @@ struct TicketDetailView: View {
         return store.user?.email ?? Auth.auth().currentUser?.email ?? "Unknown User"
     }
 
+    private var ticketCategoryOptions: [String] {
+        let current = ticket.category.trimmingCharacters(in: .whitespacesAndNewlines)
+        var options = store.availableTicketCategories
+        if !current.isEmpty && !options.contains(where: { $0.caseInsensitiveCompare(current) == .orderedSame }) {
+            options.append(current)
+        }
+        return options.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    private var ticketSubcategoryOptions: [String] {
+        let current = ticket.subcategory.trimmingCharacters(in: .whitespacesAndNewlines)
+        var options = store.availableTicketSubcategories
+        if !current.isEmpty && !options.contains(where: { $0.caseInsensitiveCompare(current) == .orderedSame }) {
+            options.append(current)
+        }
+        return options.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
     private func appendPendingPrivateNoteIfNeeded() {
         let trimmedNote = newPrivateNote.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedNote.isEmpty else { return }
@@ -8829,6 +9029,8 @@ struct SubmitTicketView: View {
     @EnvironmentObject var store: ProdConnectStore
     @State private var title = ""
     @State private var detail = ""
+    @State private var category = ""
+    @State private var subcategory = ""
     @State private var campus = ""
     @State private var room = ""
     @State private var hasDueDate = false
@@ -8851,11 +9053,20 @@ struct SubmitTicketView: View {
             && !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    private var categoryOptions: [String] {
+        store.availableTicketCategories
+    }
+
+    private var subcategoryOptions: [String] {
+        store.availableTicketSubcategories
+    }
+
     var body: some View {
         NavigationStack {
             Form {
                 requesterSection
                 overviewSection
+                categorySection
                 dueDateSection
                 locationSection
                 attachmentSection
@@ -8904,6 +9115,32 @@ struct SubmitTicketView: View {
             Toggle("Set Due Date", isOn: $hasDueDate)
             if hasDueDate {
                 DatePicker("Due", selection: $dueDate, displayedComponents: [.date, .hourAndMinute])
+            }
+        }
+    }
+
+    private var categorySection: some View {
+        Section("Category") {
+            if categoryOptions.isEmpty {
+                TextField("Category", text: $category)
+                TextField("Subcategory", text: $subcategory)
+            } else {
+                Picker("Category", selection: $category) {
+                    Text("Select category").tag("")
+                    ForEach(categoryOptions, id: \.self) { option in
+                        Text(option).tag(option)
+                    }
+                }
+                if subcategoryOptions.isEmpty {
+                    TextField("Subcategory", text: $subcategory)
+                } else {
+                    Picker("Subcategory", selection: $subcategory) {
+                        Text("Select subcategory").tag("")
+                        ForEach(subcategoryOptions, id: \.self) { option in
+                            Text(option).tag(option)
+                        }
+                    }
+                }
             }
         }
     }
@@ -8996,6 +9233,8 @@ struct SubmitTicketView: View {
         var ticket = SupportTicket(
             title: title.trimmingCharacters(in: .whitespacesAndNewlines),
             detail: detail.trimmingCharacters(in: .whitespacesAndNewlines),
+            category: category.trimmingCharacters(in: .whitespacesAndNewlines),
+            subcategory: subcategory.trimmingCharacters(in: .whitespacesAndNewlines),
             teamCode: activeTeamCode,
             campus: campus.trimmingCharacters(in: .whitespacesAndNewlines),
             room: room.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -9299,55 +9538,69 @@ private struct AssetTicketPickerView: View {
 struct ChecklistsListView: View {
     @EnvironmentObject var store: ProdConnectStore
     @State private var showCreate = false
+    @State private var checklistToEdit: ChecklistTemplate?
+    @State private var showingAddOptions = false
+    @State private var showingAddGroupAlert = false
+    @State private var newGroupName = ""
+    @State private var collapsedGroups: Set<String> = []
 
     var canEdit: Bool { store.canEditChecklists }
-    var activeChecklists: [ChecklistTemplate] {
-        store.checklists
-            .filter { !isChecklistCompleted($0) }
-            .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
-    }
-    var completedChecklists: [ChecklistTemplate] {
-        store.checklists
-            .filter { isChecklistCompleted($0) }
-            .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+    private var groupedChecklists: [(group: String, items: [ChecklistTemplate])] {
+        let grouped = Dictionary(grouping: store.checklists) { checklistGroupTitle(for: $0) }
+        let allGroups = Set(grouped.keys).union(store.availableChecklistGroups.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+        return allGroups.sorted { lhs, rhs in
+            if lhs == "Ungrouped" { return false }
+            if rhs == "Ungrouped" { return true }
+            return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
+        }
+        .map { key in
+            let items = (grouped[key] ?? []).sorted { lhs, rhs in
+                if isChecklistCompleted(lhs) != isChecklistCompleted(rhs) {
+                    return !isChecklistCompleted(lhs)
+                }
+                return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+            }
+            return (group: key, items: items)
+        }
     }
 
     var body: some View {
         NavigationStack {
             VStack {
                 List {
-                    if !activeChecklists.isEmpty {
-                        Section("Not Completed") {
-                            ForEach(activeChecklists) { template in
-                                checklistRow(template)
+                    ForEach(groupedChecklists, id: \.group) { section in
+                        Section {
+                            if !collapsedGroups.contains(section.group) {
+                                ForEach(section.items) { template in
+                                    checklistRow(template)
+                                }
+                                .onDelete { idx in
+                                    guard canEdit else { return }
+                                    for i in idx {
+                                        deleteChecklist(section.items[i])
+                                    }
+                                }
+                            } else if section.items.isEmpty {
+                                EmptyView()
                             }
-                            .onDelete { idx in
-                                guard canEdit else { return }
-                                for i in idx {
-                                    deleteChecklist(activeChecklists[i])
+                        } header: {
+                            Button {
+                                toggleGroup(section.group)
+                            } label: {
+                                HStack {
+                                    Image(systemName: collapsedGroups.contains(section.group) ? "chevron.right" : "chevron.down")
+                                        .font(.caption.weight(.semibold))
+                                    Text(section.group)
                                 }
                             }
-                        }
-                    }
-
-                    if !completedChecklists.isEmpty {
-                        Section("Completed") {
-                            ForEach(completedChecklists) { template in
-                                checklistRow(template)
-                            }
-                            .onDelete { idx in
-                                guard canEdit else { return }
-                                for i in idx {
-                                    deleteChecklist(completedChecklists[i])
-                                }
-                            }
+                            .buttonStyle(.plain)
                         }
                     }
                 }
                 .toolbar {
                     if canEdit {
                         ToolbarItem(placement: .navigationBarTrailing) {
-                            Button { showCreate = true } label: { Image(systemName: "plus") }
+                            Button { showingAddOptions = true } label: { Image(systemName: "plus") }
                         }
                     }
                 }
@@ -9355,6 +9608,30 @@ struct ChecklistsListView: View {
                     CreateChecklistView { newChecklist in
                         store.saveChecklist(newChecklist)
                     }
+                }
+                .sheet(item: $checklistToEdit) { checklist in
+                    NavigationStack {
+                        ChecklistRunView(template: checklist, startsEditing: true)
+                    }
+                }
+                .confirmationDialog("Add", isPresented: $showingAddOptions, titleVisibility: .visible) {
+                    Button("Add Group") {
+                        newGroupName = ""
+                        showingAddGroupAlert = true
+                    }
+                    Button("Add Checklist") {
+                        showCreate = true
+                    }
+                    Button("Cancel", role: .cancel) {}
+                }
+                .alert("Add Group", isPresented: $showingAddGroupAlert) {
+                    TextField("Group name", text: $newGroupName)
+                    Button("Cancel", role: .cancel) {}
+                    Button("Save") {
+                        store.addChecklistGroup(newGroupName)
+                    }
+                } message: {
+                    Text("Create a checklist group.")
                 }
             }
             .navigationTitle("Checklists")
@@ -9394,6 +9671,9 @@ struct ChecklistsListView: View {
         }
         .contextMenu {
             if canEdit {
+                Button("Edit") {
+                    checklistToEdit = template
+                }
                 Button("Duplicate") {
                     duplicateChecklist(template)
                 }
@@ -9402,6 +9682,14 @@ struct ChecklistsListView: View {
                 } label: {
                     Text("Delete")
                 }
+            }
+        }
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            if canEdit {
+                Button("Edit") {
+                    checklistToEdit = template
+                }
+                .tint(.blue)
             }
         }
     }
@@ -9430,6 +9718,19 @@ struct ChecklistsListView: View {
         store.saveChecklist(copy)
     }
 
+    private func checklistGroupTitle(for template: ChecklistTemplate) -> String {
+        let trimmed = template.groupName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Ungrouped" : trimmed
+    }
+
+    private func toggleGroup(_ group: String) {
+        if collapsedGroups.contains(group) {
+            collapsedGroups.remove(group)
+        } else {
+            collapsedGroups.insert(group)
+        }
+    }
+
     private func deleteChecklist(_ template: ChecklistTemplate) {
         guard canEdit else { return }
         store.db.collection("checklists").document(template.id).delete()
@@ -9445,14 +9746,34 @@ struct ChecklistRunView: View {
     @EnvironmentObject var store: ProdConnectStore
     @State var template: ChecklistTemplate
     @Environment(\.dismiss) private var dismiss
+    private let startsEditing: Bool
     @State private var hasDueDate = false
     @State private var draftDueDate = Date()
     @State private var isEditingChecklist = false
+    @State private var draftGroupName = ""
     @State private var newChecklistItemText = ""
     @State private var newChecklistItemNotes = ""
+    @State private var newChecklistItemAssignedUserID = ""
+    @State private var newChecklistItemHasDueDate = false
+    @State private var newChecklistItemDueDate = Date()
     @State private var activeMentionTarget: MentionTarget? = nil
     @State private var activeMentionQuery: String = ""
     var canEdit: Bool { store.canEditChecklists }
+    private var canAssignTasks: Bool { store.canAssignChecklistTasks }
+    private var showsAssignmentFeatures: Bool { store.teamHasChecklistTaskAssignmentFeatures }
+    private var canManageChecklistDueDate: Bool { store.user?.isAdmin == true || store.user?.isOwner == true }
+    private var assignableMembers: [UserProfile] {
+        store.teamMembers.sorted {
+            displayName(for: $0).localizedCaseInsensitiveCompare(displayName(for: $1)) == .orderedAscending
+        }
+    }
+    private var todoItems: [ChecklistItem] { template.items.filter { !$0.isDone } }
+    private var completedItems: [ChecklistItem] { template.items.filter(\.isDone) }
+
+    init(template: ChecklistTemplate, startsEditing: Bool = false) {
+        _template = State(initialValue: template)
+        self.startsEditing = startsEditing
+    }
 
     var body: some View {
         Form {
@@ -9463,11 +9784,32 @@ struct ChecklistRunView: View {
                     Text(template.title)
                 }
             }
+            Section(header: Text("Group")) {
+                if canEdit && isEditingChecklist {
+                    TextField("Group", text: $draftGroupName)
+                        .textInputAutocapitalization(.words)
+                    if !store.availableChecklistGroups.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(store.availableChecklistGroups, id: \.self) { group in
+                                    Button(group) {
+                                        draftGroupName = group
+                                    }
+                                    .buttonStyle(.bordered)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    Text(template.groupName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Ungrouped" : template.groupName)
+                        .foregroundColor(.secondary)
+                }
+            }
             Section(header: Text("Progress")) {
                 ProgressView(value: progress)
             }
             Section(header: Text("Due Date")) {
-                if canEdit && isEditingChecklist {
+                if canEdit && isEditingChecklist && canManageChecklistDueDate {
                     Toggle("Set due date", isOn: $hasDueDate)
                     if hasDueDate {
                         DatePicker("Due", selection: $draftDueDate, displayedComponents: [.date, .hourAndMinute])
@@ -9489,97 +9831,45 @@ struct ChecklistRunView: View {
                     Text("Completed on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
                 }
             }
-            Section {
-                ForEach($template.items) { $item in
-                    VStack(alignment: .leading, spacing: 4) {
-                        if canEdit && isEditingChecklist {
-                            inlineMentionSuggestions(for: .existingItem(item.id))
-                        }
-                        HStack {
-                            Button(action: { toggleItem(itemID: item.id) }) {
-                                Image(systemName: item.isDone ? "checkmark.circle.fill" : "circle")
-                                    .foregroundColor(item.isDone ? .green : .secondary)
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(!canEdit)
-                            if canEdit && isEditingChecklist {
-                                TextField("Checklist item", text: Binding(
-                                    get: { item.text },
-                                    set: { newValue in
-                                        item.text = newValue
-                                        updateMentionContext(for: newValue, target: .existingItem(item.id))
-                                        persistChecklistDraft()
-                                    }
-                                ))
-                            } else {
-                                Text(displayChecklistText(item.text))
-                            }
-                            if canEdit && isEditingChecklist {
-                                Button(role: .destructive) {
-                                    deleteChecklistItem(id: item.id)
-                                } label: {
-                                    Image(systemName: "trash")
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        if canEdit && isEditingChecklist {
-                            TextField("Notes (optional)", text: Binding(
-                                get: { item.notes },
-                                set: { newValue in
-                                    item.notes = newValue
-                                    persistChecklistDraft()
-                                }
-                            ), axis: .vertical)
-                            .lineLimit(2...4)
-                            .padding(.leading, 28)
-                        } else {
-                            let trimmedNotes = item.notes.trimmingCharacters(in: .whitespacesAndNewlines)
-                            if !trimmedNotes.isEmpty {
-                                Text(trimmedNotes)
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                                    .padding(.leading, 28)
-                            }
-                        }
-                        let assignedMembers = mentionedMembers(in: item.text)
-                        if !assignedMembers.isEmpty {
-                            Text("Assigned to \(assignedMembers.map(displayName(for:)).joined(separator: ", "))")
-                                .font(.caption2.weight(.regular))
-                                .foregroundColor(.secondary)
-                                .padding(.leading, 28)
-                        }
-                        if item.isDone, let completedAt = item.completedAt {
-                            let by = item.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines)
-                            if let by, !by.isEmpty {
-                                Text("Checked by \(by) on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                                    .padding(.leading, 28)
-                            } else {
-                                Text("Checked on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                                    .padding(.leading, 28)
-                            }
+            Section(header: Text("To Do")) {
+                if todoItems.isEmpty {
+                    Text("No open tasks")
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(template.items) { item in
+                        if !item.isDone {
+                            taskRow(item)
                         }
                     }
-                    .padding(.vertical, 4)
-                    .padding(.horizontal, 6)
-                    .background(isAssignedToCurrentUser(item: item) ? Color.yellow.opacity(0.20) : Color.clear)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+            }
+            if !completedItems.isEmpty {
+                Section(header: Text("Completed")) {
+                    ForEach(completedItems) { item in
+                        taskRow(item)
+                    }
                 }
             }
             if canEdit && isEditingChecklist {
-                Section(header: Text("Add Item")) {
-                    inlineMentionSuggestions(for: .newItem)
+                Section(header: Text("Add Task")) {
                     TextField("New checklist item", text: Binding(
                         get: { newChecklistItemText },
                         set: { newValue in
                             newChecklistItemText = newValue
-                            updateMentionContext(for: newValue, target: .newItem)
                         }
                     ))
+                    if canAssignTasks {
+                        Picker("Assigned To", selection: $newChecklistItemAssignedUserID) {
+                            Text("Unassigned").tag("")
+                            ForEach(assignableMembers) { member in
+                                Text(displayName(for: member)).tag(member.id)
+                            }
+                        }
+                    }
+                    Toggle("Set task due date", isOn: $newChecklistItemHasDueDate)
+                    if newChecklistItemHasDueDate {
+                        DatePicker("Task Due", selection: $newChecklistItemDueDate, displayedComponents: [.date, .hourAndMinute])
+                    }
                     TextField("Notes (optional)", text: $newChecklistItemNotes, axis: .vertical)
                         .lineLimit(2...4)
                     HStack {
@@ -9588,18 +9878,28 @@ struct ChecklistRunView: View {
                             let trimmed = newChecklistItemText.trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !trimmed.isEmpty else { return }
                             let trimmedNotes = newChecklistItemNotes.trimmingCharacters(in: .whitespacesAndNewlines)
-                            template.items.append(ChecklistItem(text: trimmed, notes: trimmedNotes))
+                            template.items.append(
+                                makeChecklistItem(
+                                    text: trimmed,
+                                    notes: trimmedNotes,
+                                    assignedUserID: newChecklistItemAssignedUserID,
+                                    dueDate: newChecklistItemHasDueDate ? newChecklistItemDueDate : nil
+                                )
+                            )
                             newChecklistItemText = ""
                             newChecklistItemNotes = ""
-                            activeMentionTarget = nil
-                            activeMentionQuery = ""
+                            newChecklistItemAssignedUserID = ""
+                            newChecklistItemHasDueDate = false
+                            newChecklistItemDueDate = Date()
                             persistChecklistDraft()
                         }
                         .disabled(newChecklistItemText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }
                 Section {
-                    Text("Tip: tag users in an item like @alex to assign it.")
+                    Text(canManageChecklistDueDate
+                         ? "Only paid subscriptions include task assignment. Only admins and owners can assign users."
+                         : "Only owners and admins can set the overall checklist due date. Only paid subscriptions include task assignment.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -9607,6 +9907,7 @@ struct ChecklistRunView: View {
             Section {
                 Button(canEdit && isEditingChecklist ? "Save & Close" : "Close") {
                     if canEdit && isEditingChecklist {
+                        template.groupName = draftGroupName.trimmingCharacters(in: .whitespacesAndNewlines)
                         template.dueDate = hasDueDate ? draftDueDate : nil
                         updateChecklistCompletionMetadata()
                         store.saveChecklist(template)
@@ -9633,7 +9934,7 @@ struct ChecklistRunView: View {
                 NSLog("[DIAG] ChecklistRunView onAppear fired")
             }
             store.listenToTeamMembers()
-            isEditingChecklist = false
+            isEditingChecklist = startsEditing
             if let dueDate = template.dueDate {
                 hasDueDate = true
                 draftDueDate = dueDate
@@ -9643,11 +9944,16 @@ struct ChecklistRunView: View {
             }
             newChecklistItemText = ""
             newChecklistItemNotes = ""
+            newChecklistItemAssignedUserID = ""
+            newChecklistItemHasDueDate = false
+            newChecklistItemDueDate = Date()
+            draftGroupName = template.groupName.trimmingCharacters(in: .whitespacesAndNewlines)
             activeMentionTarget = nil
             activeMentionQuery = ""
         }
         .onDisappear {
             if canEdit && isEditingChecklist {
+                template.groupName = draftGroupName.trimmingCharacters(in: .whitespacesAndNewlines)
                 template.dueDate = hasDueDate ? draftDueDate : nil
                 persistChecklistDraft()
             }
@@ -9687,6 +9993,88 @@ struct ChecklistRunView: View {
                 .padding(.bottom, 4)
             }
         }
+    }
+
+    @ViewBuilder
+    private func taskRow(_ item: ChecklistItem) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
+                Button(action: { toggleItem(itemID: item.id) }) {
+                    Image(systemName: item.isDone ? "checkmark.circle.fill" : "circle")
+                        .foregroundColor(item.isDone ? .green : .secondary)
+                }
+                .buttonStyle(.plain)
+                .disabled(!canEdit)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    if canEdit && isEditingChecklist {
+                        TextField("Checklist item", text: itemTextBinding(for: item.id))
+                    } else {
+                        Text(displayChecklistText(item.text))
+                            .font(.body.weight(.medium))
+                    }
+
+                    if canEdit && isEditingChecklist {
+                        if canAssignTasks {
+                            Picker("Assigned To", selection: assignmentSelection(for: item.id)) {
+                                Text("Unassigned").tag("")
+                                ForEach(assignableMembers) { member in
+                                    Text(displayName(for: member)).tag(member.id)
+                                }
+                            }
+                        }
+                        Toggle("Set task due date", isOn: itemHasDueDateBinding(for: item.id))
+                        if itemDueDateExists(item.id) {
+                            DatePicker("Task Due", selection: itemDueDateBinding(for: item.id), displayedComponents: [.date, .hourAndMinute])
+                        }
+                        TextField("Notes (optional)", text: itemNotesBinding(for: item.id), axis: .vertical)
+                            .lineLimit(2...4)
+                    } else {
+                        let trimmedNotes = item.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !trimmedNotes.isEmpty {
+                            Text(trimmedNotes)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                    if showsAssignmentFeatures {
+                        taskMetadataRow(item)
+                    }
+
+                    if item.isDone, let completedAt = item.completedAt {
+                        let by = item.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if let by, !by.isEmpty {
+                            Text("Checked by \(by) on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        } else {
+                            Text("Checked on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+
+                if canEdit && isEditingChecklist {
+                    Button(role: .destructive) {
+                        deleteChecklistItem(id: item.id)
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(.vertical, 8)
+        .padding(.horizontal, 10)
+        .background(taskRowBackground(for: item))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.white.opacity(0.07), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
     }
 
     private func toggleItem(itemID: String) {
@@ -9742,6 +10130,174 @@ struct ChecklistRunView: View {
         let trimmed = member.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty { return trimmed }
         return member.email.components(separatedBy: "@").first ?? member.email
+    }
+
+    private func itemTextBinding(for itemID: String) -> Binding<String> {
+        Binding(
+            get: { template.items.first(where: { $0.id == itemID })?.text ?? "" },
+            set: { newValue in
+                guard let index = template.items.firstIndex(where: { $0.id == itemID }) else { return }
+                template.items[index].text = newValue
+                updateMentionContext(for: newValue, target: .existingItem(itemID))
+                persistChecklistDraft()
+            }
+        )
+    }
+
+    private func itemNotesBinding(for itemID: String) -> Binding<String> {
+        Binding(
+            get: { template.items.first(where: { $0.id == itemID })?.notes ?? "" },
+            set: { newValue in
+                guard let index = template.items.firstIndex(where: { $0.id == itemID }) else { return }
+                template.items[index].notes = newValue
+                persistChecklistDraft()
+            }
+        )
+    }
+
+    private func assignmentSelection(for itemID: String) -> Binding<String> {
+        Binding(
+            get: {
+                guard let item = template.items.first(where: { $0.id == itemID }) else { return "" }
+                return item.assignedUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            },
+            set: { newValue in
+                guard let index = template.items.firstIndex(where: { $0.id == itemID }) else { return }
+                applyAssignment(selectedUserID: newValue, to: index)
+                persistChecklistDraft()
+            }
+        )
+    }
+
+    private func itemHasDueDateBinding(for itemID: String) -> Binding<Bool> {
+        Binding(
+            get: { itemDueDateExists(itemID) },
+            set: { shouldSetDueDate in
+                guard let index = template.items.firstIndex(where: { $0.id == itemID }) else { return }
+                template.items[index].dueDate = shouldSetDueDate ? (template.items[index].dueDate ?? template.dueDate ?? Date()) : nil
+                persistChecklistDraft()
+            }
+        )
+    }
+
+    private func itemDueDateBinding(for itemID: String) -> Binding<Date> {
+        Binding(
+            get: {
+                template.items.first(where: { $0.id == itemID })?.dueDate ?? template.dueDate ?? Date()
+            },
+            set: { newValue in
+                guard let index = template.items.firstIndex(where: { $0.id == itemID }) else { return }
+                template.items[index].dueDate = newValue
+                persistChecklistDraft()
+            }
+        )
+    }
+
+    private func itemDueDateExists(_ itemID: String) -> Bool {
+        template.items.first(where: { $0.id == itemID })?.dueDate != nil
+    }
+
+    private func makeChecklistItem(text: String, notes: String, assignedUserID: String, dueDate: Date?) -> ChecklistItem {
+        var item = ChecklistItem(text: text, notes: notes, dueDate: dueDate)
+        applyAssignment(selectedUserID: assignedUserID, to: &item)
+        return item
+    }
+
+    private func applyAssignment(selectedUserID: String, to index: Int) {
+        guard template.items.indices.contains(index) else { return }
+        applyAssignment(selectedUserID: selectedUserID, to: &template.items[index])
+    }
+
+    private func applyAssignment(selectedUserID: String, to item: inout ChecklistItem) {
+        let trimmedID = selectedUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedID.isEmpty,
+              let member = assignableMembers.first(where: { $0.id == trimmedID }) else {
+            item.assignedUserID = nil
+            item.assignedUserName = nil
+            item.assignedUserEmail = nil
+            return
+        }
+        item.assignedUserID = member.id
+        item.assignedUserName = displayName(for: member)
+        item.assignedUserEmail = member.email.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func assignmentLabel(for item: ChecklistItem) -> String? {
+        let explicitLabel = explicitAssignmentLabel(for: item)
+        return explicitLabel.isEmpty ? nil : explicitLabel
+    }
+
+    private func explicitAssignmentLabel(for item: ChecklistItem) -> String {
+        if let member = assignedMember(for: item) {
+            return displayName(for: member)
+        }
+
+        let storedName = item.assignedUserName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !storedName.isEmpty { return storedName }
+
+        let storedEmail = item.assignedUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !storedEmail.isEmpty {
+            return storedEmail.components(separatedBy: "@").first ?? storedEmail
+        }
+
+        return ""
+    }
+
+    private func assignedMember(for item: ChecklistItem) -> UserProfile? {
+        let assignedID = item.assignedUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !assignedID.isEmpty,
+           let member = assignableMembers.first(where: { $0.id == assignedID }) {
+            return member
+        }
+
+        let assignedEmail = item.assignedUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if !assignedEmail.isEmpty {
+            return assignableMembers.first {
+                $0.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == assignedEmail
+            }
+        }
+
+        return nil
+    }
+
+    @ViewBuilder
+    private func taskMetadataRow(_ item: ChecklistItem) -> some View {
+        HStack(spacing: 8) {
+            if let assignmentText = assignmentLabel(for: item) {
+                Label(assignmentText, systemImage: "person.crop.circle")
+                    .font(.caption2.weight(.medium))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.blue.opacity(0.14))
+                    .clipShape(Capsule())
+            }
+            if let dueDate = item.dueDate {
+                Label(dueDateLabel(for: dueDate), systemImage: dueDate < Date() && !item.isDone ? "exclamationmark.circle" : "calendar")
+                    .font(.caption2.weight(.medium))
+                    .foregroundColor(dueDate < Date() && !item.isDone ? .red : .secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background((dueDate < Date() && !item.isDone ? Color.red : Color.gray).opacity(0.12))
+                    .clipShape(Capsule())
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func dueDateLabel(for dueDate: Date) -> String {
+        if Calendar.current.isDateInToday(dueDate) { return "Today" }
+        if Calendar.current.isDateInTomorrow(dueDate) { return "Tomorrow" }
+        return dueDate.formatted(date: .abbreviated, time: .shortened)
+    }
+
+    private func taskRowBackground(for item: ChecklistItem) -> some ShapeStyle {
+        if item.isDone {
+            return AnyShapeStyle(Color.green.opacity(0.08))
+        }
+        if showsAssignmentFeatures && isAssignedToCurrentUser(item: item) {
+            return AnyShapeStyle(Color.yellow.opacity(0.16))
+        }
+        return AnyShapeStyle(Color.white.opacity(0.04))
     }
 
     private func mentionTokens(in text: String) -> Set<String> {
@@ -9810,6 +10366,16 @@ struct ChecklistRunView: View {
 
     private func isAssignedToCurrentUser(item: ChecklistItem) -> Bool {
         guard let current = store.user else { return false }
+        let assignedID = item.assignedUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !assignedID.isEmpty,
+           assignedID == current.id.trimmingCharacters(in: .whitespacesAndNewlines) {
+            return true
+        }
+        let assignedEmail = item.assignedUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if !assignedEmail.isEmpty,
+           assignedEmail == current.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            return true
+        }
         let tags = mentionTokens(in: item.text)
         if tags.isEmpty { return false }
         return !mentionMatchTokens(for: current).isDisjoint(with: tags)
@@ -9890,9 +10456,11 @@ struct CreateChecklistView: View {
     @Environment(\.dismiss) var dismiss
     @EnvironmentObject var store: ProdConnectStore
     @State private var title = ""
+    @State private var groupName = ""
     @State private var itemsText = "Item 1\nItem 2"
     @State private var hasDueDate = false
     @State private var dueDate = Date()
+    private var canManageChecklistDueDate: Bool { store.user?.isAdmin == true || store.user?.isOwner == true }
 
     var onSave: (ChecklistTemplate) -> Void
 
@@ -9900,10 +10468,31 @@ struct CreateChecklistView: View {
         NavigationStack {
             Form {
                 TextField("Title", text: $title)
+                Section("Group") {
+                    TextField("Group", text: $groupName)
+                        .textInputAutocapitalization(.words)
+                    if !store.availableChecklistGroups.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(store.availableChecklistGroups, id: \.self) { group in
+                                    Button(group) {
+                                        groupName = group
+                                    }
+                                    .buttonStyle(.bordered)
+                                }
+                            }
+                        }
+                    }
+                }
                 Section("Due Date") {
-                    Toggle("Set due date", isOn: $hasDueDate)
-                    if hasDueDate {
-                        DatePicker("Due", selection: $dueDate, displayedComponents: [.date, .hourAndMinute])
+                    if canManageChecklistDueDate {
+                        Toggle("Set due date", isOn: $hasDueDate)
+                        if hasDueDate {
+                            DatePicker("Due", selection: $dueDate, displayedComponents: [.date, .hourAndMinute])
+                        }
+                    } else {
+                        Text("Only owners and admins can set the overall checklist due date.")
+                            .foregroundColor(.secondary)
                     }
                 }
                 Section("Items (one per line)") {
@@ -9918,6 +10507,7 @@ struct CreateChecklistView: View {
                         var template = ChecklistTemplate(
                             title: title.isEmpty ? "New Checklist" : title,
                             teamCode: store.teamCode ?? "",
+                            groupName: groupName.trimmingCharacters(in: .whitespacesAndNewlines),
                             items: items
                         )
                         template.createdBy = Auth.auth().currentUser?.email
@@ -13054,7 +13644,11 @@ private struct NotificationsListView: View {
 
     var body: some View {
         List {
-            if store.notificationIncomingChannels.isEmpty && store.notificationAssignedTickets.isEmpty && store.checklistNotificationNotices.isEmpty {
+            if store.notificationIncomingChannels.isEmpty
+                && store.notificationAssignedTickets.isEmpty
+                && store.notificationTicketReminders.isEmpty
+                && store.checklistNotificationNotices.isEmpty
+                && store.checklistReminderNotices.isEmpty {
                 Text("No new notifications")
                     .foregroundColor(.secondary)
             }
@@ -13098,6 +13692,24 @@ private struct NotificationsListView: View {
                 }
             }
 
+            if !store.notificationTicketReminders.isEmpty {
+                Section("Ticket Reminders") {
+                    ForEach(store.notificationTicketReminders) { notice in
+                        NavigationLink {
+                            TicketDetailView(ticket: notice.ticket)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(notice.ticket.title.isEmpty ? "Untitled Ticket" : notice.ticket.title)
+                                    .font(.headline)
+                                Text("\(notice.kind.title) • \(notice.ticket.dueDate?.formatted(date: .abbreviated, time: .shortened) ?? "")")
+                                    .font(.caption)
+                                    .foregroundColor(notice.kind == .overdue ? .red : .secondary)
+                            }
+                        }
+                    }
+                }
+            }
+
             if !store.checklistNotificationNotices.isEmpty {
                 Section("Checklist Assignments") {
                     ForEach(store.checklistNotificationNotices) { notice in
@@ -13111,6 +13723,30 @@ private struct NotificationsListView: View {
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                                     .lineLimit(2)
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !store.checklistReminderNotices.isEmpty {
+                Section("Checklist Reminders") {
+                    ForEach(store.checklistReminderNotices) { notice in
+                        NavigationLink {
+                            ChecklistRunView(template: notice.checklist)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(notice.checklist.title)
+                                    .font(.headline)
+                                Text("\(notice.kind.title) • \(notice.checklist.dueDate?.formatted(date: .abbreviated, time: .shortened) ?? "")")
+                                    .font(.caption)
+                                    .foregroundColor(notice.kind == .overdue ? .red : .secondary)
+                                if let preview = notice.itemPreview, !preview.isEmpty {
+                                    Text(preview)
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(2)
+                                }
                             }
                         }
                     }

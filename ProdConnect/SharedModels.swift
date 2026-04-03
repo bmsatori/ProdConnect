@@ -235,6 +235,14 @@ struct UserProfile: Identifiable, Codable {
         normalizedSubscriptionTier != "free"
     }
 
+    var hasPaidSubscription: Bool {
+        normalizedSubscriptionTier != "free"
+    }
+
+    var hasChecklistTaskAssignmentFeatures: Bool {
+        hasPaidSubscription
+    }
+
     var hasCampusRoomFeatures: Bool {
         switch normalizedSubscriptionTier {
         case "premium", "premium_ticketing", "premium w/ticketing", "premium with ticketing":
@@ -278,6 +286,10 @@ struct ChecklistItem: Identifiable, Codable {
     var id: String = UUID().uuidString
     var text: String
     var notes: String = ""
+    var assignedUserID: String? = nil
+    var assignedUserName: String? = nil
+    var assignedUserEmail: String? = nil
+    var dueDate: Date? = nil
     var isDone: Bool = false
     var completedAt: Date? = nil
     var completedBy: String? = nil
@@ -286,6 +298,10 @@ struct ChecklistItem: Identifiable, Codable {
         case id
         case text
         case notes
+        case assignedUserID
+        case assignedUserName
+        case assignedUserEmail
+        case dueDate
         case isDone
         case completedAt
         case completedBy
@@ -295,6 +311,10 @@ struct ChecklistItem: Identifiable, Codable {
         id: String = UUID().uuidString,
         text: String,
         notes: String = "",
+        assignedUserID: String? = nil,
+        assignedUserName: String? = nil,
+        assignedUserEmail: String? = nil,
+        dueDate: Date? = nil,
         isDone: Bool = false,
         completedAt: Date? = nil,
         completedBy: String? = nil
@@ -302,6 +322,10 @@ struct ChecklistItem: Identifiable, Codable {
         self.id = id
         self.text = text
         self.notes = notes
+        self.assignedUserID = assignedUserID
+        self.assignedUserName = assignedUserName
+        self.assignedUserEmail = assignedUserEmail
+        self.dueDate = dueDate
         self.isDone = isDone
         self.completedAt = completedAt
         self.completedBy = completedBy
@@ -312,6 +336,10 @@ struct ChecklistItem: Identifiable, Codable {
         id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
         text = try container.decode(String.self, forKey: .text)
         notes = try container.decodeIfPresent(String.self, forKey: .notes) ?? ""
+        assignedUserID = try container.decodeIfPresent(String.self, forKey: .assignedUserID)
+        assignedUserName = try container.decodeIfPresent(String.self, forKey: .assignedUserName)
+        assignedUserEmail = try container.decodeIfPresent(String.self, forKey: .assignedUserEmail)
+        dueDate = try container.decodeIfPresent(Date.self, forKey: .dueDate)
         isDone = try container.decodeIfPresent(Bool.self, forKey: .isDone) ?? false
         completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
         completedBy = try container.decodeIfPresent(String.self, forKey: .completedBy)
@@ -322,11 +350,59 @@ struct ChecklistTemplate: Identifiable, Codable {
     var id: String = UUID().uuidString
     var title: String
     var teamCode: String
+    var groupName: String = ""
     var items: [ChecklistItem] = []
     var createdBy: String? = nil
     var dueDate: Date? = nil
     var completedAt: Date? = nil
     var completedBy: String? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case teamCode
+        case groupName
+        case items
+        case createdBy
+        case dueDate
+        case completedAt
+        case completedBy
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        title: String,
+        teamCode: String,
+        groupName: String = "",
+        items: [ChecklistItem] = [],
+        createdBy: String? = nil,
+        dueDate: Date? = nil,
+        completedAt: Date? = nil,
+        completedBy: String? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.teamCode = teamCode
+        self.groupName = groupName
+        self.items = items
+        self.createdBy = createdBy
+        self.dueDate = dueDate
+        self.completedAt = completedAt
+        self.completedBy = completedBy
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        title = try container.decode(String.self, forKey: .title)
+        teamCode = try container.decode(String.self, forKey: .teamCode)
+        groupName = try container.decodeIfPresent(String.self, forKey: .groupName) ?? ""
+        items = try container.decodeIfPresent([ChecklistItem].self, forKey: .items) ?? []
+        createdBy = try container.decodeIfPresent(String.self, forKey: .createdBy)
+        dueDate = try container.decodeIfPresent(Date.self, forKey: .dueDate)
+        completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
+        completedBy = try container.decodeIfPresent(String.self, forKey: .completedBy)
+    }
 }
 
 struct IdeaCard: Identifiable, Codable {
@@ -404,6 +480,8 @@ struct SupportTicket: Identifiable, Codable, Equatable {
     var id: String = UUID().uuidString
     var title: String
     var detail: String = ""
+    var category: String = ""
+    var subcategory: String = ""
     var teamCode: String
     var campus: String = ""
     var room: String = ""
@@ -433,6 +511,8 @@ struct SupportTicket: Identifiable, Codable, Equatable {
         case id
         case title
         case detail
+        case category
+        case subcategory
         case teamCode
         case campus
         case room
@@ -463,6 +543,8 @@ struct SupportTicket: Identifiable, Codable, Equatable {
         id: String = UUID().uuidString,
         title: String,
         detail: String = "",
+        category: String = "",
+        subcategory: String = "",
         teamCode: String,
         campus: String = "",
         room: String = "",
@@ -491,6 +573,8 @@ struct SupportTicket: Identifiable, Codable, Equatable {
         self.id = id
         self.title = title
         self.detail = detail
+        self.category = category
+        self.subcategory = subcategory
         self.teamCode = teamCode
         self.campus = campus
         self.room = room
@@ -522,6 +606,8 @@ struct SupportTicket: Identifiable, Codable, Equatable {
         id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
         title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
         detail = try container.decodeIfPresent(String.self, forKey: .detail) ?? ""
+        category = try container.decodeIfPresent(String.self, forKey: .category) ?? ""
+        subcategory = try container.decodeIfPresent(String.self, forKey: .subcategory) ?? ""
         teamCode = try container.decodeIfPresent(String.self, forKey: .teamCode) ?? ""
         campus = try container.decodeIfPresent(String.self, forKey: .campus) ?? ""
         room = try container.decodeIfPresent(String.self, forKey: .room) ?? ""

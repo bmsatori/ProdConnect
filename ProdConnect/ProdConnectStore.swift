@@ -67,6 +67,31 @@ final class ProdConnectStore: ObservableObject {
         let item: ChecklistItem
     }
 
+    enum ReminderKind {
+        case dueSoon
+        case overdue
+
+        var title: String {
+            switch self {
+            case .dueSoon: return "Due Soon"
+            case .overdue: return "Overdue"
+            }
+        }
+    }
+
+    struct TicketReminderNotice: Identifiable {
+        let id: String
+        let ticket: SupportTicket
+        let kind: ReminderKind
+    }
+
+    struct ChecklistReminderNotice: Identifiable {
+        let id: String
+        let checklist: ChecklistTemplate
+        let kind: ReminderKind
+        let itemPreview: String?
+    }
+
     private func ensureTeamIntegrationDocumentsExist(for rawTeamCode: String) {
         let normalizedCode = rawTeamCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         guard !normalizedCode.isEmpty else { return }
@@ -211,6 +236,9 @@ final class ProdConnectStore: ObservableObject {
     private var patchsheetListener: ListenerRegistration?
     private var locationsListener: ListenerRegistration?
     private var roomsListener: ListenerRegistration?
+    private var checklistGroupsListener: ListenerRegistration?
+    private var ticketCategoriesListener: ListenerRegistration?
+    private var ticketSubcategoriesListener: ListenerRegistration?
     private var freshserviceIntegrationListener: ListenerRegistration?
     private var externalTicketFormListener: ListenerRegistration?
     private var authStateListener: AuthStateDidChangeListenerHandle?
@@ -237,11 +265,32 @@ final class ProdConnectStore: ObservableObject {
     @Published var organizationName: String = ""
     @Published var locations: [String] = []
     @Published var rooms: [String] = []
+    @Published var checklistGroups: [String] = []
+    @Published var ticketCategories: [String] = []
+    @Published var ticketSubcategories: [String] = []
     @Published var freshserviceIntegration = FreshserviceIntegrationSettings()
     @Published var externalTicketFormIntegration = ExternalTicketFormSettings()
     @Published private var seenChatMessageIDsByChannel: [String: String] = [:]
     @Published private var seenTicketUpdateTokens: [String: TimeInterval] = [:]
     @Published private var seenChecklistNotificationIDs: Set<String> = []
+    @Published private var seenReminderNoticeIDs: Set<String> = []
+    @Published private var deliveredReminderNoticeIDs: Set<String> = []
+    static let defaultGearCategories = ["Audio", "Video", "Lighting", "Network", "Misc"]
+    var availableChecklistGroups: [String] {
+        Array(Set(
+            checklistGroups
+                + checklists
+                    .map { $0.groupName.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+        ))
+        .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+    var availableTicketCategories: [String] {
+        ticketCategories.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+    var availableTicketSubcategories: [String] {
+        ticketSubcategories.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
     var canEditPatchsheet: Bool {
         guard let user else { return false }
         return user.isAdmin || user.isOwner || user.canEditPatchsheet
@@ -265,6 +314,14 @@ final class ProdConnectStore: ObservableObject {
     var canEditChecklists: Bool {
         guard let user else { return false }
         return user.isAdmin || user.isOwner || user.canEditChecklists
+    }
+    var teamHasChecklistTaskAssignmentFeatures: Bool {
+        if user?.hasChecklistTaskAssignmentFeatures == true { return true }
+        return teamMembers.contains { $0.hasChecklistTaskAssignmentFeatures }
+    }
+    var canAssignChecklistTasks: Bool {
+        guard teamHasChecklistTaskAssignmentFeatures, let user else { return false }
+        return user.isAdmin || user.isOwner
     }
     var teamHasTicketing: Bool {
         if user?.hasTicketingFeatures == true { return true }
@@ -361,7 +418,7 @@ final class ProdConnectStore: ObservableObject {
         return checklists
             .flatMap { checklist in
                 checklist.items.compactMap { item in
-                    guard item.completedAt == nil, checklistItemMentionsCurrentUser(item.text, user: currentUser) else {
+                    guard item.completedAt == nil, checklistItemTargetsUser(item, user: currentUser) else {
                         return nil
                     }
                     let noticeID = "\(checklist.id)-\(item.id)"
@@ -371,8 +428,67 @@ final class ProdConnectStore: ObservableObject {
             }
     }
 
+    var notificationTicketReminders: [TicketReminderNotice] {
+        guard let currentUser = user else { return [] }
+
+        let currentUserID = currentUser.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentName = currentUser.displayName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let now = Date()
+
+        return tickets.compactMap { ticket in
+            guard ticket.status != .resolved, let dueDate = ticket.dueDate else { return nil }
+            let assignedID = ticket.assignedAgentID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let assignedName = ticket.assignedAgentName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            let isAssigned = (!currentUserID.isEmpty && assignedID == currentUserID)
+                || (!currentName.isEmpty && assignedName == currentName)
+            guard isAssigned, let kind = reminderKind(for: dueDate, now: now) else { return nil }
+            let id = ticketReminderNoticeID(ticket: ticket, kind: kind, now: now)
+            guard !seenReminderNoticeIDs.contains(id) else { return nil }
+            return TicketReminderNotice(id: id, ticket: ticket, kind: kind)
+        }
+        .sorted { lhs, rhs in
+            let left = lhs.ticket.dueDate ?? .distantFuture
+            let right = rhs.ticket.dueDate ?? .distantFuture
+            return left < right
+        }
+    }
+
+    var checklistReminderNotices: [ChecklistReminderNotice] {
+        guard let currentUser = user else { return [] }
+        let now = Date()
+
+        return checklists.compactMap { checklist in
+            guard checklist.completedAt == nil, let dueDate = checklist.dueDate,
+                  let kind = reminderKind(for: dueDate, now: now) else { return nil }
+
+            let pendingAssignedItems = checklist.items.filter { item in
+                item.completedAt == nil && checklistItemTargetsUser(item, user: currentUser)
+            }
+            guard !pendingAssignedItems.isEmpty else { return nil }
+
+            let id = checklistReminderNoticeID(checklist: checklist, kind: kind, now: now)
+            guard !seenReminderNoticeIDs.contains(id) else { return nil }
+
+            return ChecklistReminderNotice(
+                id: id,
+                checklist: checklist,
+                kind: kind,
+                itemPreview: pendingAssignedItems.first?.text
+            )
+        }
+        .sorted { lhs, rhs in
+            let left = lhs.checklist.dueDate ?? .distantFuture
+            let right = rhs.checklist.dueDate ?? .distantFuture
+            return left < right
+        }
+    }
+
     var notificationBadgeCount: Int {
-        notificationIncomingChannels.count + notificationAssignedTickets.count + checklistNotificationNotices.count
+        notificationIncomingChannels.count
+            + notificationAssignedTickets.count
+            + checklistNotificationNotices.count
+            + notificationTicketReminders.count
+            + checklistReminderNotices.count
     }
     @Published var isAdmin = false
     @Published var teamCode: String?
@@ -610,6 +726,12 @@ final class ProdConnectStore: ObservableObject {
         seenChecklistNotificationIDs = Set(
             (userDefaults.array(forKey: notificationDefaultsKey("checklists", userID: userID)) as? [String]) ?? []
         )
+        seenReminderNoticeIDs = Set(
+            (userDefaults.array(forKey: notificationDefaultsKey("reminders", userID: userID)) as? [String]) ?? []
+        )
+        deliveredReminderNoticeIDs = Set(
+            (userDefaults.array(forKey: notificationDefaultsKey("remindersDelivered", userID: userID)) as? [String]) ?? []
+        )
     }
 
     private func persistNotificationState() {
@@ -617,12 +739,16 @@ final class ProdConnectStore: ObservableObject {
         userDefaults.set(seenChatMessageIDsByChannel, forKey: notificationDefaultsKey("chat", userID: userID))
         userDefaults.set(seenTicketUpdateTokens, forKey: notificationDefaultsKey("tickets", userID: userID))
         userDefaults.set(Array(seenChecklistNotificationIDs), forKey: notificationDefaultsKey("checklists", userID: userID))
+        userDefaults.set(Array(seenReminderNoticeIDs), forKey: notificationDefaultsKey("reminders", userID: userID))
+        userDefaults.set(Array(deliveredReminderNoticeIDs), forKey: notificationDefaultsKey("remindersDelivered", userID: userID))
     }
 
     private func resetNotificationState() {
         seenChatMessageIDsByChannel = [:]
         seenTicketUpdateTokens = [:]
         seenChecklistNotificationIDs = []
+        seenReminderNoticeIDs = []
+        deliveredReminderNoticeIDs = []
     }
 
     func markAllNotificationsSeen() {
@@ -641,6 +767,14 @@ final class ProdConnectStore: ObservableObject {
             seenChecklistNotificationIDs.insert(notice.id)
         }
 
+        for notice in notificationTicketReminders {
+            seenReminderNoticeIDs.insert(notice.id)
+        }
+
+        for notice in checklistReminderNotices {
+            seenReminderNoticeIDs.insert(notice.id)
+        }
+
         persistNotificationState()
         clearDeliveredNotifications()
     }
@@ -657,6 +791,22 @@ final class ProdConnectStore: ObservableObject {
     private func checklistItemMentionsCurrentUser(_ text: String, user: UserProfile) -> Bool {
         let tags = mentionTokens(in: text)
         return !mentionMatchTokens(for: user).isDisjoint(with: tags)
+    }
+
+    private func checklistItemTargetsUser(_ item: ChecklistItem, user: UserProfile) -> Bool {
+        let assignedID = item.assignedUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !assignedID.isEmpty,
+           assignedID == user.id.trimmingCharacters(in: .whitespacesAndNewlines) {
+            return true
+        }
+
+        let assignedEmail = item.assignedUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if !assignedEmail.isEmpty,
+           assignedEmail == user.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            return true
+        }
+
+        return checklistItemMentionsCurrentUser(item.text, user: user)
     }
 
     private func mentionTokens(in text: String) -> Set<String> {
@@ -890,6 +1040,9 @@ final class ProdConnectStore: ObservableObject {
         teamMembers = []
         locations = []
         rooms = []
+        checklistGroups = []
+        ticketCategories = []
+        ticketSubcategories = []
         freshserviceIntegration = FreshserviceIntegrationSettings()
         externalTicketFormIntegration = ExternalTicketFormSettings()
         teamCode = nil
@@ -915,6 +1068,9 @@ final class ProdConnectStore: ObservableObject {
         patchsheetListener?.remove()
         locationsListener?.remove()
         roomsListener?.remove()
+        checklistGroupsListener?.remove()
+        ticketCategoriesListener?.remove()
+        ticketSubcategoriesListener?.remove()
         freshserviceIntegrationListener?.remove()
         externalTicketFormListener?.remove()
         teamMembersListener = nil
@@ -927,6 +1083,9 @@ final class ProdConnectStore: ObservableObject {
         patchsheetListener = nil
         locationsListener = nil
         roomsListener = nil
+        checklistGroupsListener = nil
+        ticketCategoriesListener = nil
+        ticketSubcategoriesListener = nil
         freshserviceIntegrationListener = nil
         externalTicketFormListener = nil
     }
@@ -1100,6 +1259,9 @@ final class ProdConnectStore: ObservableObject {
             organizationName = ""
             locations = []
             rooms = []
+            checklistGroups = []
+            ticketCategories = []
+            ticketSubcategories = []
             freshserviceIntegration = FreshserviceIntegrationSettings()
             tickets = []
             hasPrimedTicketAssignmentState = false
@@ -1143,6 +1305,7 @@ final class ProdConnectStore: ObservableObject {
                     return self.decodeDocument(data, as: ChecklistTemplate.self)
                 }
                 DispatchQueue.main.async {
+                    self.processDueReminderNotifications(tickets: self.tickets, checklists: values)
                     self.checklists = values
                 }
             }
@@ -1177,6 +1340,7 @@ final class ProdConnectStore: ObservableObject {
                     let affectedGearIDs = self.affectedGearIDs(previousTickets: self.tickets, latestTickets: values)
                     self.processTicketSubmissionNotifications(with: values)
                     self.processTicketAssignmentNotifications(with: values)
+                    self.processDueReminderNotifications(tickets: values, checklists: self.checklists)
                     self.tickets = values
                     print("Ticket listener loaded \(values.count) tickets for team \(code). Visible tickets now: \(self.visibleTickets.count). Current user: \(self.user?.email ?? "unknown")")
                     self.refreshGearTicketState(for: affectedGearIDs)
@@ -1257,6 +1421,36 @@ final class ProdConnectStore: ObservableObject {
                 let values = (snapshot?.documents ?? []).map(\.documentID).sorted()
                 DispatchQueue.main.async {
                     self.rooms = values
+                }
+            }
+
+        checklistGroupsListener = db.collection("teams")
+            .document(code)
+            .collection("checklistGroups")
+            .addSnapshotListener { snapshot, _ in
+                let values = (snapshot?.documents ?? []).map(\.documentID).sorted()
+                DispatchQueue.main.async {
+                    self.checklistGroups = values
+                }
+            }
+
+        ticketCategoriesListener = db.collection("teams")
+            .document(code)
+            .collection("ticketCategories")
+            .addSnapshotListener { snapshot, _ in
+                let values = (snapshot?.documents ?? []).map(\.documentID).sorted()
+                DispatchQueue.main.async {
+                    self.ticketCategories = values
+                }
+            }
+
+        ticketSubcategoriesListener = db.collection("teams")
+            .document(code)
+            .collection("ticketSubcategories")
+            .addSnapshotListener { snapshot, _ in
+                let values = (snapshot?.documents ?? []).map(\.documentID).sorted()
+                DispatchQueue.main.async {
+                    self.ticketSubcategories = values
                 }
             }
 
@@ -1346,6 +1540,99 @@ final class ProdConnectStore: ObservableObject {
         }
     }
 
+    private func reminderKind(for dueDate: Date, now: Date) -> ReminderKind? {
+        if dueDate < now {
+            return .overdue
+        }
+        if dueDate.timeIntervalSince(now) <= 60 * 60 * 24 {
+            return .dueSoon
+        }
+        return nil
+    }
+
+    private func reminderDayStamp(for date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar.current
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
+
+    private func ticketReminderNoticeID(ticket: SupportTicket, kind: ReminderKind, now: Date) -> String {
+        let dueStamp = Int((ticket.dueDate ?? .distantPast).timeIntervalSince1970)
+        switch kind {
+        case .dueSoon:
+            return "ticket-due-\(ticket.id)-\(dueStamp)"
+        case .overdue:
+            return "ticket-overdue-\(ticket.id)-\(dueStamp)-\(reminderDayStamp(for: now))"
+        }
+    }
+
+    private func checklistReminderNoticeID(checklist: ChecklistTemplate, kind: ReminderKind, now: Date) -> String {
+        let dueStamp = Int((checklist.dueDate ?? .distantPast).timeIntervalSince1970)
+        switch kind {
+        case .dueSoon:
+            return "checklist-due-\(checklist.id)-\(dueStamp)"
+        case .overdue:
+            return "checklist-overdue-\(checklist.id)-\(dueStamp)-\(reminderDayStamp(for: now))"
+        }
+    }
+
+    private func processDueReminderNotifications(tickets: [SupportTicket], checklists: [ChecklistTemplate]) {
+        for notice in buildTicketReminderNotices(from: tickets) {
+            scheduleTicketReminderNotification(for: notice)
+        }
+
+        for notice in buildChecklistReminderNotices(from: checklists) {
+            scheduleChecklistReminderNotification(for: notice)
+        }
+    }
+
+    private func buildTicketReminderNotices(from tickets: [SupportTicket]) -> [TicketReminderNotice] {
+        guard let currentUser = user else { return [] }
+
+        let currentUserID = currentUser.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentName = currentUser.displayName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let now = Date()
+
+        return tickets.compactMap { ticket in
+            guard ticket.status != .resolved, let dueDate = ticket.dueDate else { return nil }
+            let assignedID = ticket.assignedAgentID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let assignedName = ticket.assignedAgentName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            let isAssigned = (!currentUserID.isEmpty && assignedID == currentUserID)
+                || (!currentName.isEmpty && assignedName == currentName)
+            guard isAssigned, let kind = reminderKind(for: dueDate, now: now) else { return nil }
+            let id = ticketReminderNoticeID(ticket: ticket, kind: kind, now: now)
+            guard !seenReminderNoticeIDs.contains(id) else { return nil }
+            return TicketReminderNotice(id: id, ticket: ticket, kind: kind)
+        }
+    }
+
+    private func buildChecklistReminderNotices(from checklists: [ChecklistTemplate]) -> [ChecklistReminderNotice] {
+        guard let currentUser = user else { return [] }
+        let now = Date()
+
+        return checklists.compactMap { checklist in
+            guard checklist.completedAt == nil, let dueDate = checklist.dueDate,
+                  let kind = reminderKind(for: dueDate, now: now) else { return nil }
+
+            let pendingAssignedItems = checklist.items.filter { item in
+                item.completedAt == nil && checklistItemTargetsUser(item, user: currentUser)
+            }
+            guard !pendingAssignedItems.isEmpty else { return nil }
+
+            let id = checklistReminderNoticeID(checklist: checklist, kind: kind, now: now)
+            guard !seenReminderNoticeIDs.contains(id) else { return nil }
+
+            return ChecklistReminderNotice(
+                id: id,
+                checklist: checklist,
+                kind: kind,
+                itemPreview: pendingAssignedItems.first?.text
+            )
+        }
+    }
+
     private func scheduleLocalChatNotification(for message: ChatMessage, channelName: String, channelID: String) {
         let content = UNMutableNotificationContent()
         content.title = channelName.isEmpty ? "Chat" : channelName
@@ -1363,6 +1650,54 @@ final class ProdConnectStore: ObservableObject {
             trigger: trigger
         )
         UNUserNotificationCenter.current().add(request)
+    }
+
+    private func scheduleTicketReminderNotification(for notice: TicketReminderNotice) {
+        guard !deliveredReminderNoticeIDs.contains(notice.id) else { return }
+        let content = UNMutableNotificationContent()
+        content.title = notice.kind == .overdue ? "Ticket Overdue" : "Ticket Due Soon"
+        let trimmedTitle = notice.ticket.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let dueText = notice.ticket.dueDate?.formatted(date: .abbreviated, time: .shortened) ?? "soon"
+        if notice.kind == .overdue {
+            content.body = trimmedTitle.isEmpty ? "An assigned ticket is overdue." : "\"\(trimmedTitle)\" is overdue."
+        } else {
+            content.body = trimmedTitle.isEmpty ? "An assigned ticket is due \(dueText)." : "\"\(trimmedTitle)\" is due \(dueText)."
+        }
+        content.sound = .default
+        content.userInfo = ["ticketId": notice.ticket.id, "notificationType": "ticketReminder"]
+
+        let request = UNNotificationRequest(
+            identifier: notice.id,
+            content: content,
+            trigger: UNTimeIntervalNotificationTrigger(timeInterval: 0.2, repeats: false)
+        )
+        UNUserNotificationCenter.current().add(request)
+        deliveredReminderNoticeIDs.insert(notice.id)
+        persistNotificationState()
+    }
+
+    private func scheduleChecklistReminderNotification(for notice: ChecklistReminderNotice) {
+        guard !deliveredReminderNoticeIDs.contains(notice.id) else { return }
+        let content = UNMutableNotificationContent()
+        content.title = notice.kind == .overdue ? "Checklist Overdue" : "Checklist Due Soon"
+        let trimmedTitle = notice.checklist.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let dueText = notice.checklist.dueDate?.formatted(date: .abbreviated, time: .shortened) ?? "soon"
+        if notice.kind == .overdue {
+            content.body = trimmedTitle.isEmpty ? "A checklist assigned to you is overdue." : "\"\(trimmedTitle)\" is overdue."
+        } else {
+            content.body = trimmedTitle.isEmpty ? "A checklist assigned to you is due \(dueText)." : "\"\(trimmedTitle)\" is due \(dueText)."
+        }
+        content.sound = .default
+        content.userInfo = ["checklistId": notice.checklist.id, "notificationType": "checklistReminder"]
+
+        let request = UNNotificationRequest(
+            identifier: notice.id,
+            content: content,
+            trigger: UNTimeIntervalNotificationTrigger(timeInterval: 0.2, repeats: false)
+        )
+        UNUserNotificationCenter.current().add(request)
+        deliveredReminderNoticeIDs.insert(notice.id)
+        persistNotificationState()
     }
 
     private func processTicketAssignmentNotifications(with tickets: [SupportTicket]) {
@@ -1598,6 +1933,8 @@ final class ProdConnectStore: ObservableObject {
         }
         ticket.campus = ticket.campus.trimmingCharacters(in: .whitespacesAndNewlines)
         ticket.room = ticket.room.trimmingCharacters(in: .whitespacesAndNewlines)
+        ticket.category = ticket.category.trimmingCharacters(in: .whitespacesAndNewlines)
+        ticket.subcategory = ticket.subcategory.trimmingCharacters(in: .whitespacesAndNewlines)
         ticket.externalRequesterName = ticket.externalRequesterName?.trimmingCharacters(in: .whitespacesAndNewlines)
         ticket.externalRequesterEmail = ticket.externalRequesterEmail?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1698,17 +2035,19 @@ final class ProdConnectStore: ObservableObject {
         let ticketToPersist = ticket
         let shouldPersistRoom = !ticket.room.isEmpty && existingTicket?.room != ticket.room
         let roomToPersist = ticket.room
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                let data = try Self.makeEncodedDictionary(for: ticketToPersist)
+        if !ticket.category.isEmpty { saveTicketCategory(ticket.category) }
+        if !ticket.subcategory.isEmpty { saveTicketSubcategory(ticket.subcategory) }
+        do {
+            let data = try encodedDictionary(for: ticketToPersist)
+            DispatchQueue.global(qos: .userInitiated).async {
                 ticketRef.setData(data, merge: true)
                 ticketRef.setData(assignmentPayload, merge: true)
                 if shouldPersistRoom {
                     roomsCollectionRef.document(roomToPersist).setData([:])
                 }
-            } catch {
-                print("Save error (tickets):", error)
             }
+        } catch {
+            print("Save error (tickets):", error)
         }
     }
 
@@ -1771,6 +2110,18 @@ final class ProdConnectStore: ObservableObject {
         db.collection("checklists").document(item.id).delete()
         checklists.removeAll { $0.id == item.id }
     }
+
+    func addChecklistGroup(_ name: String) {
+        guard let code = (teamCode ?? user?.teamCode)?.trimmingCharacters(in: .whitespacesAndNewlines), !code.isEmpty else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        db.collection("teams").document(code).collection("checklistGroups").document(trimmed).setData([:])
+        if !checklistGroups.contains(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
+            checklistGroups.append(trimmed)
+            checklistGroups.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        }
+    }
     func deleteIdea(_ item: IdeaCard) {
         db.collection("ideas").document(item.id).delete()
         ideas.removeAll { $0.id == item.id }
@@ -1828,6 +2179,26 @@ final class ProdConnectStore: ObservableObject {
         guard let code = teamCode, !code.isEmpty else { return }
         db.collection("teams").document(code).collection("rooms").document(room).setData([:])
         if !rooms.contains(room) { rooms.append(room) }
+    }
+
+    func saveTicketCategory(_ category: String) {
+        guard let code = teamCode, !code.isEmpty else { return }
+        let trimmed = category.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        db.collection("teams").document(code).collection("ticketCategories").document(trimmed).setData([:])
+        if !ticketCategories.contains(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
+            ticketCategories.append(trimmed)
+        }
+    }
+
+    func saveTicketSubcategory(_ subcategory: String) {
+        guard let code = teamCode, !code.isEmpty else { return }
+        let trimmed = subcategory.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        db.collection("teams").document(code).collection("ticketSubcategories").document(trimmed).setData([:])
+        if !ticketSubcategories.contains(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
+            ticketSubcategories.append(trimmed)
+        }
     }
 
     func saveOrganizationName(_ name: String, completion: ((Result<Void, Error>) -> Void)? = nil) {
@@ -2114,6 +2485,18 @@ final class ProdConnectStore: ObservableObject {
         guard let code = teamCode, !code.isEmpty else { return }
         db.collection("teams").document(code).collection("rooms").document(room).delete()
         rooms.removeAll { $0 == room }
+    }
+
+    func deleteTicketCategory(_ category: String) {
+        guard let code = teamCode, !code.isEmpty else { return }
+        db.collection("teams").document(code).collection("ticketCategories").document(category).delete()
+        ticketCategories.removeAll { $0 == category }
+    }
+
+    func deleteTicketSubcategory(_ subcategory: String) {
+        guard let code = teamCode, !code.isEmpty else { return }
+        db.collection("teams").document(code).collection("ticketSubcategories").document(subcategory).delete()
+        ticketSubcategories.removeAll { $0 == subcategory }
     }
 
     func deleteAllGear(completion: ((Result<Void, Error>) -> Void)? = nil) {

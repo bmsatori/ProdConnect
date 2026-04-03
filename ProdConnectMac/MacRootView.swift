@@ -8,6 +8,206 @@ import SwiftUI
 import UniformTypeIdentifiers
 import WebKit
 
+private enum MacFreshserviceAPI {
+    private static func normalizedBaseURL(from apiUrl: String) -> URL? {
+        let trimmed = apiUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let withScheme = trimmed.contains("://") ? trimmed : "https://\(trimmed)"
+        guard var components = URLComponents(string: withScheme),
+              let host = components.host,
+              !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        components.scheme = "https"
+        components.user = nil
+        components.password = nil
+        components.path = ""
+        components.query = nil
+        components.fragment = nil
+        return components.url
+    }
+
+    private static func extractItems(from jsonObject: Any, preferredKeys: [String]) -> [[String: Any]]? {
+        if let items = jsonObject as? [[String: Any]] {
+            return items
+        }
+        guard let json = jsonObject as? [String: Any] else { return nil }
+        for key in preferredKeys {
+            if let items = json[key] as? [[String: Any]] {
+                return items
+            }
+        }
+        for (_, value) in json {
+            if let items = value as? [[String: Any]] {
+                return items
+            }
+        }
+        return nil
+    }
+
+    private static func extractErrorMessage(from data: Data, response: HTTPURLResponse?) -> String {
+        let fallback = "Freshservice request failed with status \(response?.statusCode ?? 0)."
+        guard !data.isEmpty else { return fallback }
+        if let jsonObject = try? JSONSerialization.jsonObject(with: data),
+           let json = jsonObject as? [String: Any] {
+            if let description = json["description"] as? String, !description.isEmpty { return description }
+            if let message = json["message"] as? String, !message.isEmpty { return message }
+        }
+        if let body = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !body.isEmpty,
+           !body.hasPrefix("<") {
+            return body
+        }
+        return fallback
+    }
+
+    private static func performListRequest(
+        apiKey: String,
+        apiUrl: String,
+        endpoint: String,
+        queryItems: [URLQueryItem] = [],
+        completion: @escaping (Result<[[String: Any]], Error>) -> Void
+    ) {
+        guard let baseURL = normalizedBaseURL(from: apiUrl) else {
+            completion(.failure(NSError(
+                domain: "Freshservice",
+                code: 0,
+                userInfo: [NSLocalizedDescriptionKey: "Invalid Freshservice URL. Enter only the base URL, like https://yourcompany.freshservice.com."]
+            )))
+            return
+        }
+        let normalizedEndpoint = endpoint.hasPrefix("/") ? String(endpoint.dropFirst()) : endpoint
+        let urlString = baseURL.absoluteString.hasSuffix("/") ? "\(baseURL.absoluteString)\(normalizedEndpoint)" : "\(baseURL.absoluteString)/\(normalizedEndpoint)"
+        guard var components = URLComponents(string: urlString) else {
+            completion(.failure(NSError(domain: "Freshservice", code: 0, userInfo: [NSLocalizedDescriptionKey: "Invalid Freshservice URL."])))
+            return
+        }
+        if !queryItems.isEmpty {
+            components.queryItems = queryItems
+        }
+        guard let url = components.url else {
+            completion(.failure(NSError(domain: "Freshservice", code: 0, userInfo: [NSLocalizedDescriptionKey: "Invalid Freshservice URL."])))
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        let credentialData = "\(apiKey):X".data(using: .utf8) ?? Data()
+        request.setValue("Basic \(credentialData.base64EncodedString())", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+            guard let httpResponse = response as? HTTPURLResponse, let data else {
+                completion(.failure(NSError(
+                    domain: "Freshservice",
+                    code: 0,
+                    userInfo: [NSLocalizedDescriptionKey: "Freshservice returned an invalid response."]
+                )))
+                return
+            }
+            guard (200...299).contains(httpResponse.statusCode) else {
+                completion(.failure(NSError(
+                    domain: "Freshservice",
+                    code: httpResponse.statusCode,
+                    userInfo: [NSLocalizedDescriptionKey: extractErrorMessage(from: data, response: httpResponse)]
+                )))
+                return
+            }
+            if data.isEmpty {
+                completion(.success([]))
+                return
+            }
+            do {
+                let jsonObject = try JSONSerialization.jsonObject(with: data)
+                let preferredKeys = endpoint.contains("tickets")
+                    ? ["tickets", "results", "data"]
+                    : ["assets", "config_items", "cis", "results", "data"]
+                if let items = extractItems(from: jsonObject, preferredKeys: preferredKeys) {
+                    completion(.success(items))
+                } else {
+                    completion(.failure(NSError(
+                        domain: "Freshservice",
+                        code: httpResponse.statusCode,
+                        userInfo: [NSLocalizedDescriptionKey: "Freshservice returned a response in an unsupported format."]
+                    )))
+                }
+            } catch {
+                completion(.failure(NSError(
+                    domain: "Freshservice",
+                    code: httpResponse.statusCode,
+                    userInfo: [NSLocalizedDescriptionKey: "Freshservice returned non-JSON data."]
+                )))
+            }
+        }.resume()
+    }
+
+    static func fetchAllAssetsWithAPIKey(
+        apiKey: String,
+        apiUrl: String,
+        perPage: Int = 100,
+        maxPages: Int = 200,
+        completion: @escaping (Result<([[String: Any]], Bool), Error>) -> Void
+    ) {
+        func fetchPage(_ page: Int, collected: [[String: Any]]) {
+            let queryItems = [
+                URLQueryItem(name: "page", value: String(page)),
+                URLQueryItem(name: "per_page", value: String(perPage))
+            ]
+            performListRequest(apiKey: apiKey, apiUrl: apiUrl, endpoint: "api/v2/assets", queryItems: queryItems) { result in
+                switch result {
+                case .success(let items):
+                    let merged = collected + items
+                    let reachedCap = page >= maxPages && items.count >= perPage
+                    let shouldContinue = !items.isEmpty && items.count >= perPage && page < maxPages
+                    if shouldContinue {
+                        fetchPage(page + 1, collected: merged)
+                    } else {
+                        completion(.success((merged, reachedCap)))
+                    }
+                case .failure(let error):
+                    completion(.failure(error))
+                }
+            }
+        }
+        fetchPage(1, collected: [])
+    }
+
+    static func fetchAllTicketsWithAPIKey(
+        apiKey: String,
+        apiUrl: String,
+        perPage: Int = 100,
+        maxPages: Int = 200,
+        completion: @escaping (Result<([[String: Any]], Bool), Error>) -> Void
+    ) {
+        func fetchPage(_ page: Int, collected: [[String: Any]]) {
+            let queryItems = [
+                URLQueryItem(name: "page", value: String(page)),
+                URLQueryItem(name: "per_page", value: String(perPage))
+            ]
+            performListRequest(apiKey: apiKey, apiUrl: apiUrl, endpoint: "api/v2/tickets", queryItems: queryItems) { result in
+                switch result {
+                case .success(let items):
+                    let merged = collected + items
+                    let reachedCap = page >= maxPages && items.count >= perPage
+                    let shouldContinue = !items.isEmpty && items.count >= perPage && page < maxPages
+                    if shouldContinue {
+                        fetchPage(page + 1, collected: merged)
+                    } else {
+                        completion(.success((merged, reachedCap)))
+                    }
+                case .failure(let error):
+                    completion(.failure(error))
+                }
+            }
+        }
+        fetchPage(1, collected: [])
+    }
+}
+
 private enum MacRoute: String, CaseIterable, Identifiable {
     case chat
     case patchsheet
@@ -75,6 +275,23 @@ private func externalTicketFormSlug(from organizationName: String) -> String {
 
     slug = slug.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
     return slug.isEmpty ? "prodconnect" : slug
+}
+
+private func adaptiveTableColumnWidths(
+    availableWidth: CGFloat,
+    minimums: [CGFloat],
+    weights: [CGFloat],
+    horizontalPadding: CGFloat = 28
+) -> [CGFloat] {
+    guard minimums.count == weights.count, !minimums.isEmpty else { return minimums }
+    let totalMinimum = minimums.reduce(0, +)
+    let usableWidth = max(availableWidth - horizontalPadding, totalMinimum)
+    let extraWidth = max(usableWidth - totalMinimum, 0)
+    let totalWeight = max(weights.reduce(0, +), 1)
+
+    return zip(minimums, weights).map { minimum, weight in
+        minimum + (extraWidth * (weight / totalWeight))
+    }
 }
 
 struct MacRootView: View {
@@ -170,7 +387,7 @@ struct MacRootView: View {
                         self.selectedRoute = sidebarRoutes.first
                     }
                 }
-                .onChange(of: store.user?.id) { newValue in
+                .onChange(of: store.user?.id) { _, newValue in
                     showsWelcomeScreen = newValue != nil
                 }
                 .sheet(isPresented: $isShowingNotifications) {
@@ -358,7 +575,11 @@ private struct MacNotificationsView: View {
     var body: some View {
         NavigationStack {
             List {
-                if store.notificationIncomingChannels.isEmpty && store.notificationAssignedTickets.isEmpty && store.checklistNotificationNotices.isEmpty {
+                if store.notificationIncomingChannels.isEmpty
+                    && store.notificationAssignedTickets.isEmpty
+                    && store.notificationTicketReminders.isEmpty
+                    && store.checklistNotificationNotices.isEmpty
+                    && store.checklistReminderNotices.isEmpty {
                     Text("No notifications")
                         .foregroundStyle(.secondary)
                 }
@@ -396,6 +617,21 @@ private struct MacNotificationsView: View {
                     }
                 }
 
+                if !store.notificationTicketReminders.isEmpty {
+                    Section("Ticket Reminders") {
+                        ForEach(store.notificationTicketReminders) { notice in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(notice.ticket.title.isEmpty ? "Untitled Ticket" : notice.ticket.title)
+                                    .font(.headline)
+                                Text("\(notice.kind.title) • \(notice.ticket.dueDate?.formatted(date: .abbreviated, time: .shortened) ?? "")")
+                                    .font(.caption)
+                                    .foregroundStyle(notice.kind == .overdue ? .red : .secondary)
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                }
+
                 if !store.checklistNotificationNotices.isEmpty {
                     Section("Checklist Assignments") {
                         ForEach(store.checklistNotificationNotices) { notice in
@@ -411,21 +647,46 @@ private struct MacNotificationsView: View {
                         }
                     }
                 }
+
+                if !store.checklistReminderNotices.isEmpty {
+                    Section("Checklist Reminders") {
+                        ForEach(store.checklistReminderNotices) { notice in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(notice.checklist.title)
+                                    .font(.headline)
+                                Text("\(notice.kind.title) • \(notice.checklist.dueDate?.formatted(date: .abbreviated, time: .shortened) ?? "")")
+                                    .font(.caption)
+                                    .foregroundStyle(notice.kind == .overdue ? .red : .secondary)
+                                if let preview = notice.itemPreview, !preview.isEmpty {
+                                    Text(preview)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                }
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                }
             }
             .navigationTitle("Notifications")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") { dismiss() }
+                    Button("Close") {
+                        closeNotifications()
+                    }
                 }
             }
         }
         .frame(minWidth: 480, minHeight: 420)
-        .onAppear {
+        .onDisappear {
             store.markAllNotificationsSeen()
         }
-        .onChange(of: store.notificationBadgeCount) { _, _ in
-            store.markAllNotificationsSeen()
-        }
+    }
+
+    private func closeNotifications() {
+        store.markAllNotificationsSeen()
+        dismiss()
     }
 }
 
@@ -1714,9 +1975,34 @@ private struct MacGearView: View {
     @State private var showMergeResult = false
     @State private var duplicateGearGroupCount = 0
     @State private var saveErrorMessage: String?
+    @State private var gearSortColumn: GearSortColumn = .name
+    @State private var gearSortAscending = true
+
+    private enum GearSortColumn {
+        case name
+        case category
+        case campus
+        case status
+    }
+
+    private let gearMinimumColumnWidths: [CGFloat] = [240, 170, 170, 120]
+    private let gearColumnWeights: [CGFloat] = [0.34, 0.24, 0.24, 0.18]
 
     private var availableCategories: [String] {
         Array(Set(store.gear.map(\.category))).filter { !$0.isEmpty }.sorted()
+    }
+
+    private var categoryOptions: [String] {
+        let current = category.trimmingCharacters(in: .whitespacesAndNewlines)
+        var options = ProdConnectStore.defaultGearCategories
+        let existing = store.gear.map(\.category).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        for option in existing where !options.contains(where: { $0.caseInsensitiveCompare(option) == .orderedSame }) {
+            options.append(option)
+        }
+        if !current.isEmpty && !options.contains(where: { $0.caseInsensitiveCompare(current) == .orderedSame }) {
+            options.append(current)
+        }
+        return options.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
     }
 
     private var allGearLocations: [String] {
@@ -1741,7 +2027,46 @@ private struct MacGearView: View {
         if let selectedLocation {
             result = result.filter { $0.location == selectedLocation }
         }
-        return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        return result
+    }
+
+    private func gearColumns(for availableWidth: CGFloat) -> [GridItem] {
+        adaptiveTableColumnWidths(
+            availableWidth: availableWidth,
+            minimums: gearMinimumColumnWidths,
+            weights: gearColumnWeights
+        ).map { width in
+            GridItem(.fixed(width), spacing: 0, alignment: .leading)
+        }
+    }
+
+    private func gearTableWidth(for availableWidth: CGFloat) -> CGFloat {
+        adaptiveTableColumnWidths(
+            availableWidth: availableWidth,
+            minimums: gearMinimumColumnWidths,
+            weights: gearColumnWeights
+        ).reduce(28, +)
+    }
+
+    private var sortedFilteredGear: [GearItem] {
+        filteredGear.sorted { lhs, rhs in
+            let result: ComparisonResult
+            switch gearSortColumn {
+            case .name:
+                result = lhs.name.localizedCaseInsensitiveCompare(rhs.name)
+            case .category:
+                result = lhs.category.localizedCaseInsensitiveCompare(rhs.category)
+            case .campus:
+                result = gearCampusLabel(lhs).localizedCaseInsensitiveCompare(gearCampusLabel(rhs))
+            case .status:
+                result = lhs.status.rawValue.localizedCaseInsensitiveCompare(rhs.status.rawValue)
+            }
+
+            if result == .orderedSame {
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
+            return gearSortAscending ? (result == .orderedAscending) : (result == .orderedDescending)
+        }
     }
 
     var body: some View {
@@ -1906,42 +2231,38 @@ private struct MacGearView: View {
                 }
             }
 
-            List {
-                ForEach(filteredGear) { item in
-                    Button {
-                        selectedGearItem = item
-                    } label: {
-                        HStack {
-                            VStack(alignment: .leading) {
-                                Text(item.name).font(.headline)
-                                Text(item.category).font(.caption).foregroundStyle(.secondary)
-                                let placement = [item.campus, item.location]
-                                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                                    .filter { !$0.isEmpty }
-                                    .joined(separator: " • ")
-                                if !placement.isEmpty {
-                                    Text(placement).font(.caption2).foregroundStyle(.secondary)
+            GeometryReader { proxy in
+                let tableWidth = gearTableWidth(for: proxy.size.width)
+                let columns = gearColumns(for: proxy.size.width)
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        gearTableHeader(columns: columns)
+                            .frame(minWidth: tableWidth, alignment: .leading)
+
+                        ScrollView {
+                            LazyVStack(spacing: 0) {
+                                if sortedFilteredGear.isEmpty {
+                                    Text("No matching assets")
+                                        .foregroundStyle(.secondary)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 18)
+                                } else {
+                                    ForEach(sortedFilteredGear) { item in
+                                        gearRow(item, columns: columns)
+                                        Divider()
+                                    }
                                 }
                             }
-                            Spacer()
-                            Text(item.status.rawValue)
-                                .font(.caption2)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 5)
-                                .background(statusColor(for: item.status).opacity(0.2))
-                                .foregroundStyle(statusColor(for: item.status))
-                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                         }
-                    }
-                    .buttonStyle(.plain)
-                }
-                .onDelete { indexSet in
-                    for index in indexSet {
-                        store.deleteGear(items: [filteredGear[index]])
+                        .frame(minWidth: tableWidth, alignment: .leading)
+                        .background(Color(nsColor: .controlBackgroundColor).opacity(0.35))
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
-            .scrollContentBackground(.hidden)
 
             if showAddGearForm {
                 gearEditor(title: "Add Asset", buttonTitle: "Save Asset", fullScreen: false)
@@ -1991,6 +2312,112 @@ private struct MacGearView: View {
         .background(isActive ? Color.blue : Color.gray.opacity(0.3))
         .foregroundColor(.white)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func gearTableHeader(columns: [GridItem]) -> some View {
+        LazyVGrid(columns: columns, alignment: .leading, spacing: 0) {
+            gearHeaderButton("Name", column: .name)
+            gearHeaderButton("Category", column: .category)
+            gearHeaderButton("Campus", column: .campus)
+            gearHeaderButton("Status", column: .status)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.75))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private func gearHeaderButton(_ title: String, column: GearSortColumn) -> some View {
+        let iconName = gearSortColumn == column
+            ? (gearSortAscending ? "arrow.up" : "arrow.down")
+            : "arrow.up.arrow.down"
+
+        return Button {
+            if gearSortColumn == column {
+                gearSortAscending.toggle()
+            } else {
+                gearSortColumn = column
+                gearSortAscending = column != .status
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Text(title)
+                    .font(.headline)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .clipped()
+
+                Image(systemName: iconName)
+                    .font(.caption2)
+                    .foregroundStyle(gearSortColumn == column ? .blue : .secondary)
+                    .frame(width: 12, alignment: .center)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .clipped()
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func gearRow(_ item: GearItem, columns: [GridItem]) -> some View {
+        LazyVGrid(columns: columns, alignment: .leading, spacing: 0) {
+            gearOpenButtonCell(item.name.isEmpty ? "Untitled" : item.name, item: item, weight: .medium)
+            gearOpenButtonCell(item.category, item: item)
+            gearOpenButtonCell(gearCampusLabel(item), item: item)
+            Button {
+                selectedGearItem = item
+            } label: {
+                Text(item.status.rawValue)
+                    .font(.caption2)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(statusColor(for: item.status).opacity(0.2))
+                    .foregroundStyle(statusColor(for: item.status))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.vertical, 10)
+        .padding(.horizontal, 14)
+        .background(Color.white.opacity(0.015))
+        .contextMenu {
+            Button("Edit") {
+                beginEditing(item)
+            }
+            if store.canEditGear {
+                Button("Delete", role: .destructive) {
+                    store.deleteGear(items: [item])
+                }
+            }
+        }
+    }
+
+    private func gearOpenButtonCell(_ value: String, item: GearItem, weight: Font.Weight = .regular, color: Color = .primary) -> some View {
+        Button {
+            selectedGearItem = item
+        } label: {
+            Text(value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "—" : value)
+                .font(.system(size: 13, weight: weight))
+                .foregroundStyle(color)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .clipped()
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func gearCampusLabel(_ item: GearItem) -> String {
+        let campus = item.campus.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !campus.isEmpty {
+            return campus
+        }
+        let fallback = item.location.trimmingCharacters(in: .whitespacesAndNewlines)
+        return fallback.isEmpty ? "—" : fallback
     }
 
     private func statusColor(for status: GearItem.GearStatus) -> Color {
@@ -2187,7 +2614,7 @@ private struct MacGearView: View {
                             labeledTextField("Asset ID", text: $assetId)
                             fieldHeader("Category")
                             Picker("Category", selection: $category) {
-                                ForEach(["Audio", "Video", "Lighting", "Network", "Misc"], id: \.self) { option in
+                                ForEach(categoryOptions, id: \.self) { option in
                                     Text(option).tag(option)
                                 }
                             }
@@ -2447,6 +2874,8 @@ private struct MacTicketsView: View {
     @State private var isShowingAddTicket = false
     @State private var title = ""
     @State private var detail = ""
+    @State private var category = ""
+    @State private var subcategory = ""
     @State private var campus = ""
     @State private var room = ""
     @State private var hasDueDate = false
@@ -2459,6 +2888,13 @@ private struct MacTicketsView: View {
     @State private var locationFilter = ""
     @State private var statusFilter = ""
     @State private var agentFilter = ""
+    @State private var ticketSortColumn: TicketSortColumn = .createdDate
+    @State private var ticketSortAscending = false
+    @State private var isShowingExportSheet = false
+    @State private var isExportingTicketReport = false
+    @State private var exportStatusFilter = TicketReportStatusFilter.active.rawValue
+    @State private var exportCampusFilter = ""
+    @State private var exportAgentSelection = ""
     @State private var externalTicketFormEnabled = false
     @State private var externalTicketFormAccessKey = ""
     @State private var isSavingExternalTicketForm = false
@@ -2466,9 +2902,109 @@ private struct MacTicketsView: View {
 
     private let unassignedAgentFilter = "__UNASSIGNED__"
 
+    private enum TicketSortColumn {
+        case createdDate
+        case subject
+        case requester
+        case state
+        case status
+        case assignedTo
+    }
+
+    private let ticketMinimumColumnWidths: [CGFloat] = [170, 220, 170, 120, 110, 170]
+    private let ticketColumnWeights: [CGFloat] = [0.18, 0.24, 0.18, 0.12, 0.10, 0.18]
+
+    private enum TicketReportStatusFilter: String, CaseIterable {
+        case all = "all"
+        case active = "active"
+        case closed = "closed"
+        case new = "new"
+        case open = "open"
+        case inProgress = "in_progress"
+
+        var title: String {
+            switch self {
+            case .all: return "All Tickets"
+            case .active: return "Active Tickets"
+            case .closed: return "Closed Tickets"
+            case .new: return "New"
+            case .open: return "Open"
+            case .inProgress: return "In Progress"
+            }
+        }
+    }
+
+    private func ticketColumns(for availableWidth: CGFloat) -> [GridItem] {
+        adaptiveTableColumnWidths(
+            availableWidth: availableWidth,
+            minimums: ticketMinimumColumnWidths,
+            weights: ticketColumnWeights
+        ).map { width in
+            GridItem(.fixed(width), spacing: 0, alignment: .leading)
+        }
+    }
+
+    private func ticketTableWidth(for availableWidth: CGFloat) -> CGFloat {
+        adaptiveTableColumnWidths(
+            availableWidth: availableWidth,
+            minimums: ticketMinimumColumnWidths,
+            weights: ticketColumnWeights
+        ).reduce(28, +)
+    }
+
+    private var ticketCategoryOptions: [String] {
+        store.availableTicketCategories
+    }
+
+    private var ticketSubcategoryOptions: [String] {
+        store.availableTicketSubcategories
+    }
+
     private var canManageExternalTicketForm: Bool {
         (store.user?.isAdmin == true || store.user?.isOwner == true)
             && (store.user?.hasTicketingFeatures == true)
+    }
+
+    private var availableTicketReportCampuses: [String] {
+        let fromTickets = store.visibleTickets.map { $0.campus.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let values = Array(Set((store.locations + fromTickets).filter { !$0.isEmpty }))
+        return values.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    private var reportTickets: [SupportTicket] {
+        store.visibleTickets.filter { ticket in
+            let campusMatches = exportCampusFilter.isEmpty
+                || ticket.campus.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(exportCampusFilter) == .orderedSame
+
+            let agentMatches: Bool
+            if exportAgentSelection.isEmpty {
+                agentMatches = true
+            } else if exportAgentSelection == unassignedAgentFilter {
+                agentMatches = ticket.assignedAgentID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
+            } else {
+                agentMatches = ticket.assignedAgentID?.trimmingCharacters(in: .whitespacesAndNewlines) == exportAgentSelection
+            }
+
+            let statusFilter = TicketReportStatusFilter(rawValue: exportStatusFilter) ?? .active
+            let statusMatches: Bool
+            switch statusFilter {
+            case .all:
+                statusMatches = true
+            case .active:
+                statusMatches = ticket.status != .resolved
+            case .closed:
+                statusMatches = ticket.status == .resolved
+            case .new:
+                statusMatches = ticket.status == .new
+            case .open:
+                statusMatches = ticket.status == .open
+            case .inProgress:
+                statusMatches = ticket.status == .inProgress
+            }
+
+            return campusMatches && agentMatches && statusMatches
+        }
+        .sorted { $0.createdAt > $1.createdAt }
     }
 
     private var externalTicketFormURLString: String {
@@ -2595,6 +3131,13 @@ private struct MacTicketsView: View {
                     HStack {
                         Spacer()
                         Button {
+                            isShowingExportSheet = true
+                        } label: {
+                            Label("Export Report", systemImage: "square.and.arrow.up")
+                        }
+                        .buttonStyle(.bordered)
+
+                        Button {
                             resetNewTicketForm()
                             isShowingAddTicket = true
                         } label: {
@@ -2609,23 +3152,104 @@ private struct MacTicketsView: View {
                         ticketAgentMenu
                     }
 
-                    List {
-                        if filteredTickets.isEmpty {
-                            Text("No matching tickets")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ForEach(filteredTickets) { ticket in
-                                ticketRow(ticket)
+                    GeometryReader { proxy in
+                        let tableWidth = ticketTableWidth(for: proxy.size.width)
+                        let columns = ticketColumns(for: proxy.size.width)
+
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            VStack(alignment: .leading, spacing: 12) {
+                                ticketTableHeader(columns: columns)
+                                    .frame(minWidth: tableWidth, alignment: .leading)
+
+                                ScrollView {
+                                    LazyVStack(spacing: 0) {
+                                        if sortedTickets.isEmpty {
+                                            Text("No matching tickets")
+                                                .foregroundStyle(.secondary)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                .padding(.horizontal, 14)
+                                                .padding(.vertical, 18)
+                                        } else {
+                                            ForEach(sortedTickets) { ticket in
+                                                ticketRow(ticket, columns: columns)
+                                                Divider()
+                                            }
+                                        }
+                                    }
+                                }
+                                .frame(minWidth: tableWidth, alignment: .leading)
+                                .background(Color(nsColor: .controlBackgroundColor).opacity(0.35))
+                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                             }
                         }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                     }
-                    .scrollContentBackground(.hidden)
                 }
             }
         }
         .padding()
         .background(Color.clear)
         .navigationTitle("Tickets")
+        .sheet(isPresented: $isShowingExportSheet) {
+            ticketExportSheet
+        }
+    }
+
+    private var ticketExportSheet: some View {
+        NavigationStack {
+            Form {
+                Section("Report Filters") {
+                    Picker("Status", selection: $exportStatusFilter) {
+                        ForEach(TicketReportStatusFilter.allCases, id: \.rawValue) { option in
+                            Text(option.title).tag(option.rawValue)
+                        }
+                    }
+
+                    Picker("Campus", selection: $exportCampusFilter) {
+                        Text("All Campuses").tag("")
+                        ForEach(availableTicketReportCampuses, id: \.self) { campus in
+                            Text(campus).tag(campus)
+                        }
+                    }
+
+                    Picker("Agent", selection: $exportAgentSelection) {
+                        Text("All Agents").tag("")
+                        Text("Unassigned").tag(unassignedAgentFilter)
+                        ForEach(availableAgents) { member in
+                            Text(ticketMemberDisplayName(member)).tag(member.id)
+                        }
+                    }
+                }
+
+                Section("Preview") {
+                    LabeledContent("Matching Tickets", value: "\(reportTickets.count)")
+                    Text("Exports a CSV report you can open in Excel.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Export Tickets")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        isShowingExportSheet = false
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button {
+                        exportTicketReport()
+                    } label: {
+                        if isExportingTicketReport {
+                            ProgressView()
+                        } else {
+                            Text("Export")
+                        }
+                    }
+                    .disabled(isExportingTicketReport || reportTickets.isEmpty)
+                }
+            }
+        }
+        .frame(minWidth: 460, minHeight: 320)
     }
 
     private var addTicketSection: some View {
@@ -2664,6 +3288,44 @@ private struct MacTicketsView: View {
                         }
 
                         Color.clear
+                    }
+
+                    GridRow {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Category")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            if ticketCategoryOptions.isEmpty {
+                                TextField("Category", text: $category)
+                                    .textFieldStyle(.roundedBorder)
+                            } else {
+                                Picker("Category", selection: $category) {
+                                    Text("Select category").tag("")
+                                    ForEach(ticketCategoryOptions, id: \.self) { option in
+                                        Text(option).tag(option)
+                                    }
+                                }
+                                .labelsHidden()
+                            }
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Subcategory")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            if ticketSubcategoryOptions.isEmpty {
+                                TextField("Subcategory", text: $subcategory)
+                                    .textFieldStyle(.roundedBorder)
+                            } else {
+                                Picker("Subcategory", selection: $subcategory) {
+                                    Text("Select subcategory").tag("")
+                                    ForEach(ticketSubcategoryOptions, id: \.self) { option in
+                                        Text(option).tag(option)
+                                    }
+                                }
+                                .labelsHidden()
+                            }
+                        }
                     }
 
                     GridRow {
@@ -2744,6 +3406,8 @@ private struct MacTicketsView: View {
                         SupportTicket(
                             title: title.trimmingCharacters(in: .whitespacesAndNewlines),
                             detail: detail.trimmingCharacters(in: .whitespacesAndNewlines),
+                            category: category.trimmingCharacters(in: .whitespacesAndNewlines),
+                            subcategory: subcategory.trimmingCharacters(in: .whitespacesAndNewlines),
                             teamCode: activeTeamCode,
                             campus: campus.trimmingCharacters(in: .whitespacesAndNewlines),
                             room: room.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -2805,8 +3469,33 @@ private struct MacTicketsView: View {
         }
     }
 
+    private var sortedTickets: [SupportTicket] {
+        filteredTickets.sorted { lhs, rhs in
+            let result: ComparisonResult
+            switch ticketSortColumn {
+            case .createdDate:
+                result = compare(lhs.createdAt, rhs.createdAt)
+            case .subject:
+                result = compare(lhs.title, rhs.title)
+            case .requester:
+                result = compare(ticketRequesterName(lhs), ticketRequesterName(rhs))
+            case .state:
+                result = compare(ticketStateLabel(lhs), ticketStateLabel(rhs))
+            case .status:
+                result = compare(lhs.status.rawValue, rhs.status.rawValue)
+            case .assignedTo:
+                result = compare(ticketAssignedLabel(lhs), ticketAssignedLabel(rhs))
+            }
+
+            if result == .orderedSame {
+                return lhs.createdAt > rhs.createdAt
+            }
+            return ticketSortAscending ? (result == .orderedAscending) : (result == .orderedDescending)
+        }
+    }
+
     var body: some View {
-        if let selectedTicket {
+        if selectedTicket != nil {
             selectedTicketContent
         } else {
             ticketsListContent
@@ -2814,49 +3503,18 @@ private struct MacTicketsView: View {
     }
 
     @ViewBuilder
-    private func ticketRow(_ ticket: SupportTicket) -> some View {
-        Button {
-            startsEditingSelectedTicket = false
-            selectedTicket = ticket
-        } label: {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text(ticket.title)
-                        .font(.headline)
-                    Spacer()
-                    Text(ticket.status.rawValue)
-                        .font(.caption2)
-                        .foregroundStyle(ticket.status == .resolved ? .green : .orange)
-                }
-                let locationLine = [ticket.campus, ticket.room]
-                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .filter { !$0.isEmpty }
-                    .joined(separator: " • ")
-                if !locationLine.isEmpty {
-                    Text(locationLine)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                if let dueDate = ticket.dueDate {
-                    Text("Due \(dueDate.formatted(date: .abbreviated, time: .shortened))")
-                        .font(.caption2)
-                        .foregroundStyle(dueDate < Date() && ticket.status != .resolved ? .red : .secondary)
-                }
-                HStack {
-                    if let linkedGearName = ticket.linkedGearName?.trimmingCharacters(in: .whitespacesAndNewlines),
-                       !linkedGearName.isEmpty {
-                        Text(linkedGearName)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Text(ticket.updatedAt.formatted(date: .abbreviated, time: .shortened))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-            }
+    private func ticketRow(_ ticket: SupportTicket, columns: [GridItem]) -> some View {
+        LazyVGrid(columns: columns, alignment: .leading, spacing: 0) {
+            ticketOpenButtonCell(ticket.createdAt.formatted(date: .abbreviated, time: .shortened), ticket: ticket, weight: .medium)
+            ticketOpenButtonCell(ticket.title.isEmpty ? "Untitled" : ticket.title, ticket: ticket, weight: .medium)
+            ticketOpenButtonCell(ticketRequesterName(ticket), ticket: ticket)
+            ticketOpenButtonCell(ticketStateLabel(ticket), ticket: ticket, color: ticketStateColor(ticket))
+            ticketStatusMenuCell(ticket)
+            ticketAssignedMenuCell(ticket)
         }
-        .buttonStyle(.plain)
+        .padding(.vertical, 10)
+        .padding(.horizontal, 14)
+        .background(Color.white.opacity(0.015))
         .contextMenu {
             Button("Edit") {
                 startsEditingSelectedTicket = true
@@ -2865,9 +3523,275 @@ private struct MacTicketsView: View {
         }
     }
 
+    private func ticketTableHeader(columns: [GridItem]) -> some View {
+        LazyVGrid(columns: columns, alignment: .leading, spacing: 0) {
+            ticketHeaderButton("Created Date", column: .createdDate)
+            ticketHeaderButton("Subject", column: .subject)
+            ticketHeaderButton("Requester", column: .requester)
+            ticketHeaderButton("State", column: .state)
+            ticketHeaderButton("Status", column: .status)
+            ticketHeaderButton("Assigned to", column: .assignedTo)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.75))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private func ticketHeaderButton(_ title: String, column: TicketSortColumn) -> some View {
+        let iconName = ticketSortColumn == column
+            ? (ticketSortAscending ? "arrow.up" : "arrow.down")
+            : "arrow.up.arrow.down"
+
+        return Button {
+            if ticketSortColumn == column {
+                ticketSortAscending.toggle()
+            } else {
+                ticketSortColumn = column
+                ticketSortAscending = column == .subject || column == .requester || column == .state || column == .status || column == .assignedTo
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Text(title)
+                    .font(.headline)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .clipped()
+
+                Image(systemName: iconName)
+                    .font(.caption2)
+                    .foregroundStyle(ticketSortColumn == column ? .blue : .secondary)
+                    .frame(width: 12, alignment: .center)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .clipped()
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func ticketCell(_ value: String, weight: Font.Weight = .regular, color: Color = .primary) -> some View {
+        Text(value.isEmpty ? "—" : value)
+            .font(.system(size: 13, weight: weight))
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .clipped()
+    }
+
+    private func ticketOpenButtonCell(_ value: String, ticket: SupportTicket, weight: Font.Weight = .regular, color: Color = .primary) -> some View {
+        Button {
+            startsEditingSelectedTicket = false
+            selectedTicket = ticket
+        } label: {
+            ticketCell(value, weight: weight, color: color)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func ticketStatusMenuCell(_ ticket: SupportTicket) -> some View {
+        Picker(
+            "",
+            selection: Binding(
+                get: { ticket.status },
+                set: { newValue in
+                    updateTicketStatus(ticket, status: newValue)
+                }
+            )
+        ) {
+            ForEach(TicketStatus.allCases, id: \.self) { status in
+                Text(status.rawValue).tag(status)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .tint(ticket.status == .resolved ? .green : .orange)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func ticketAssignedMenuCell(_ ticket: SupportTicket) -> some View {
+        if store.canSeeAllTickets {
+            Picker(
+                "",
+                selection: Binding(
+                    get: { ticket.assignedAgentID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" },
+                    set: { newValue in
+                        updateTicketAssignee(ticket, agentID: newValue.isEmpty ? nil : newValue)
+                    }
+                )
+            ) {
+                Text("Unassigned").tag("")
+                ForEach(availableAgents) { member in
+                    Text(ticketMemberDisplayName(member)).tag(member.id)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            ticketCell(ticketAssignedLabel(ticket))
+        }
+    }
+
+    private func ticketRequesterName(_ ticket: SupportTicket) -> String {
+        let candidates = [
+            ticket.externalRequesterName,
+            ticket.createdBy?.components(separatedBy: "@").first
+        ]
+        return candidates
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first(where: { !$0.isEmpty }) ?? "Unknown"
+    }
+
+    private func ticketAssignedLabel(_ ticket: SupportTicket) -> String {
+        let assigned = ticket.assignedAgentName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return assigned.isEmpty ? "Unassigned" : assigned
+    }
+
+    private func ticketMemberDisplayName(_ member: UserProfile) -> String {
+        let displayName = member.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !displayName.isEmpty { return displayName }
+        return member.email.components(separatedBy: "@").first ?? member.email
+    }
+
+    private func updateTicketStatus(_ ticket: SupportTicket, status: TicketStatus) {
+        guard let index = store.tickets.firstIndex(where: { $0.id == ticket.id }) else { return }
+        var updated = store.tickets[index]
+        updated.status = status
+        updated.lastUpdatedBy = currentUserLabel
+        store.saveTicket(updated)
+    }
+
+    private func updateTicketAssignee(_ ticket: SupportTicket, agentID: String?) {
+        guard let index = store.tickets.firstIndex(where: { $0.id == ticket.id }) else { return }
+        var updated = store.tickets[index]
+        let trimmedID = agentID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if trimmedID.isEmpty {
+            updated.assignedAgentID = nil
+            updated.assignedAgentName = nil
+        } else if let member = availableAgents.first(where: { $0.id == trimmedID }) {
+            updated.assignedAgentID = member.id
+            updated.assignedAgentName = ticketMemberDisplayName(member)
+        }
+        updated.lastUpdatedBy = currentUserLabel
+        store.saveTicket(updated)
+    }
+
+    private func ticketStateLabel(_ ticket: SupportTicket) -> String {
+        if ticket.status == .resolved {
+            return "Resolved"
+        }
+        guard let dueDate = ticket.dueDate else {
+            return "Open"
+        }
+        let now = Date()
+        if dueDate < now {
+            return "Overdue"
+        }
+        if dueDate <= Calendar.current.date(byAdding: .day, value: 1, to: now) ?? dueDate {
+            return "Due Soon"
+        }
+        return "Scheduled"
+    }
+
+    private func ticketStateColor(_ ticket: SupportTicket) -> Color {
+        switch ticketStateLabel(ticket) {
+        case "Resolved":
+            return .green
+        case "Overdue":
+            return .red
+        case "Due Soon":
+            return .orange
+        default:
+            return .secondary
+        }
+    }
+
+    private func compare(_ lhs: String, _ rhs: String) -> ComparisonResult {
+        lhs.localizedCaseInsensitiveCompare(rhs)
+    }
+
+    private func compare(_ lhs: Date, _ rhs: Date) -> ComparisonResult {
+        if lhs == rhs { return .orderedSame }
+        return lhs < rhs ? .orderedAscending : .orderedDescending
+    }
+
+    private func csvEscaped(_ value: String) -> String {
+        "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
+    }
+
+    private func exportTicketReport() {
+        guard !reportTickets.isEmpty else { return }
+        isExportingTicketReport = true
+
+        let header = [
+            "Created Date",
+            "Updated Date",
+            "Subject",
+            "Requester",
+            "Requester Email",
+            "State",
+            "Status",
+            "Assigned To",
+            "Campus",
+            "Room",
+            "Category",
+            "Subcategory",
+            "Due Date",
+            "Resolved At",
+            "Linked Asset",
+            "Created By",
+            "Description"
+        ].map(csvEscaped).joined(separator: ",")
+
+        let rows = reportTickets.map { ticket in
+            [
+                ticket.createdAt.formatted(date: .abbreviated, time: .shortened),
+                ticket.updatedAt.formatted(date: .abbreviated, time: .shortened),
+                ticket.title,
+                ticketRequesterName(ticket),
+                ticket.externalRequesterEmail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+                ticketStateLabel(ticket),
+                ticket.status.rawValue,
+                ticketAssignedLabel(ticket),
+                ticket.campus,
+                ticket.room,
+                ticket.category,
+                ticket.subcategory,
+                ticket.dueDate?.formatted(date: .abbreviated, time: .shortened) ?? "",
+                ticket.resolvedAt?.formatted(date: .abbreviated, time: .shortened) ?? "",
+                ticket.linkedGearName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+                ticket.createdBy ?? "",
+                ticket.detail
+            ].map(csvEscaped).joined(separator: ",")
+        }
+
+        let csv = ([header] + rows).joined(separator: "\n")
+        let savePanel = NSSavePanel()
+        savePanel.title = "Export Tickets Report"
+        savePanel.nameFieldStringValue = "TicketsReport.csv"
+        savePanel.allowedContentTypes = [.commaSeparatedText]
+        savePanel.canCreateDirectories = true
+
+        defer { isExportingTicketReport = false }
+        guard savePanel.runModal() == .OK, let url = savePanel.url else { return }
+
+        do {
+            try csv.write(to: url, atomically: true, encoding: .utf8)
+            isShowingExportSheet = false
+        } catch {
+            print("Ticket export failed:", error.localizedDescription)
+        }
+    }
+
     private func resetNewTicketForm() {
         title = ""
         detail = ""
+        category = ""
+        subcategory = ""
         campus = store.user?.assignedCampus.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         room = ""
         hasDueDate = false
@@ -3126,6 +4050,24 @@ private struct MacTicketDetailView: View {
         store.gear.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
+    private var ticketCategoryOptions: [String] {
+        let current = ticket.category.trimmingCharacters(in: .whitespacesAndNewlines)
+        var options = store.availableTicketCategories
+        if !current.isEmpty && !options.contains(where: { $0.caseInsensitiveCompare(current) == .orderedSame }) {
+            options.append(current)
+        }
+        return options.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    private var ticketSubcategoryOptions: [String] {
+        let current = ticket.subcategory.trimmingCharacters(in: .whitespacesAndNewlines)
+        var options = store.availableTicketSubcategories
+        if !current.isEmpty && !options.contains(where: { $0.caseInsensitiveCompare(current) == .orderedSame }) {
+            options.append(current)
+        }
+        return options.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
     private func scheduleStatusSave() {
         scheduledStatusSaveWorkItem?.cancel()
         var ticketToSave = ticket
@@ -3213,6 +4155,39 @@ private struct MacTicketDetailView: View {
                     } else {
                         Text("Not set")
                             .foregroundStyle(.secondary)
+                    }
+                }
+
+                Section("Category") {
+                    if isEditing {
+                        if ticketCategoryOptions.isEmpty {
+                            TextField("Category", text: $ticket.category)
+                            TextField("Subcategory", text: $ticket.subcategory)
+                        } else {
+                            Picker("Category", selection: $ticket.category) {
+                                Text("Select category").tag("")
+                                ForEach(ticketCategoryOptions, id: \.self) { option in
+                                    Text(option).tag(option)
+                                }
+                            }
+                            if ticketSubcategoryOptions.isEmpty {
+                                TextField("Subcategory", text: $ticket.subcategory)
+                            } else {
+                                Picker("Subcategory", selection: $ticket.subcategory) {
+                                    Text("Select subcategory").tag("")
+                                    ForEach(ticketSubcategoryOptions, id: \.self) { option in
+                                        Text(option).tag(option)
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let categoryLine = [ticket.category, ticket.subcategory]
+                            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                            .filter { !$0.isEmpty }
+                            .joined(separator: " • ")
+                        Text(categoryLine.isEmpty ? "Not set" : categoryLine)
+                            .foregroundStyle(categoryLine.isEmpty ? .secondary : .primary)
                     }
                 }
 
@@ -3792,28 +4767,74 @@ private struct MacChecklistView: View {
     @State private var selectedChecklist: ChecklistTemplate?
     @State private var startsEditingSelectedChecklist = false
     @State private var isShowingAddChecklist = false
+    @State private var isShowingAddGroup = false
     @State private var title = ""
+    @State private var groupName = ""
+    @State private var newGroupName = ""
     @State private var newChecklistItems = Array(repeating: "", count: 3)
     @State private var hasDueDate = false
     @State private var dueDate = Date()
+    @State private var collapsedGroups: Set<String> = []
+    private var canManageChecklistDueDate: Bool { store.user?.isAdmin == true || store.user?.isOwner == true }
+    @State private var checklistSortColumn: ChecklistSortColumn = .name
+    @State private var checklistSortAscending = true
 
-    private var activeChecklists: [ChecklistTemplate] {
-        store.checklists
-            .filter { !isChecklistCompleted($0) }
-            .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+    private enum ChecklistSortColumn {
+        case name
+        case assignee
+        case dueDate
     }
 
-    private var completedChecklists: [ChecklistTemplate] {
-        store.checklists
-            .filter { isChecklistCompleted($0) }
-            .sorted { lhs, rhs in
-                let lhsDate = lhs.completedAt ?? .distantPast
-                let rhsDate = rhs.completedAt ?? .distantPast
-                if lhsDate == rhsDate {
-                    return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
-                }
-                return lhsDate > rhsDate
+    private let checklistMinimumColumnWidths: [CGFloat] = [320, 180, 150]
+    private let checklistColumnWeights: [CGFloat] = [0.58, 0.24, 0.18]
+
+    private func checklistColumns(for availableWidth: CGFloat) -> [GridItem] {
+        adaptiveTableColumnWidths(
+            availableWidth: availableWidth,
+            minimums: checklistMinimumColumnWidths,
+            weights: checklistColumnWeights
+        ).map { width in
+            GridItem(.fixed(width), spacing: 0, alignment: .leading)
+        }
+    }
+
+    private func checklistTableWidth(for availableWidth: CGFloat) -> CGFloat {
+        adaptiveTableColumnWidths(
+            availableWidth: availableWidth,
+            minimums: checklistMinimumColumnWidths,
+            weights: checklistColumnWeights
+        ).reduce(28, +)
+    }
+
+    private var sortedChecklists: [ChecklistTemplate] {
+        store.checklists.sorted { lhs, rhs in
+            let result: ComparisonResult
+            switch checklistSortColumn {
+            case .name:
+                result = lhs.title.localizedCaseInsensitiveCompare(rhs.title)
+            case .assignee:
+                result = checklistAssigneeLabel(lhs).localizedCaseInsensitiveCompare(checklistAssigneeLabel(rhs))
+            case .dueDate:
+                result = compareChecklistDates(lhs.dueDate, rhs.dueDate)
             }
+
+            if result == .orderedSame {
+                return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+            }
+            return checklistSortAscending ? (result == .orderedAscending) : (result == .orderedDescending)
+        }
+    }
+
+    private var groupedSortedChecklists: [(group: String, items: [ChecklistTemplate])] {
+        let grouped = Dictionary(grouping: sortedChecklists) { checklistGroupTitle(for: $0) }
+        let allGroups = Set(grouped.keys).union(store.availableChecklistGroups.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+        return allGroups.sorted { lhs, rhs in
+            if lhs == "Ungrouped" { return false }
+            if rhs == "Ungrouped" { return true }
+            return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
+        }.map { key in
+            (group: key, items: grouped[key] ?? [])
+        }
     }
 
     var body: some View {
@@ -3839,52 +4860,136 @@ private struct MacChecklistView: View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
                 Spacer()
-                if isShowingAddChecklist {
+                if isShowingAddChecklist || isShowingAddGroup {
                     Button("Cancel") {
                         isShowingAddChecklist = false
+                        isShowingAddGroup = false
                         resetNewChecklistForm()
                     }
                     .buttonStyle(.bordered)
                 }
-                Button {
-                    if isShowingAddChecklist {
+                Menu {
+                    Button("Add Group") {
                         isShowingAddChecklist = false
+                        isShowingAddGroup = true
+                        newGroupName = ""
+                    }
+                    Button("Add Checklist") {
                         resetNewChecklistForm()
-                    } else {
-                        resetNewChecklistForm()
+                        isShowingAddGroup = false
                         isShowingAddChecklist = true
                     }
                 } label: {
                     Label("Add", systemImage: "plus")
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Color(nsColor: .controlAccentColor))
+                        .foregroundColor(.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.plain)
             }
 
-            List {
-                if !activeChecklists.isEmpty {
-                    Section("Not Completed") {
-                        ForEach(activeChecklists) { checklist in
-                            checklistRow(checklist)
+            GeometryReader { proxy in
+                let tableWidth = checklistTableWidth(for: proxy.size.width)
+                let columns = checklistColumns(for: proxy.size.width)
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        checklistTableHeader(columns: columns)
+                            .frame(minWidth: tableWidth, alignment: .leading)
+
+                        ScrollView {
+                            LazyVStack(spacing: 0) {
+                                if sortedChecklists.isEmpty {
+                                    Text("No checklists")
+                                        .foregroundStyle(.secondary)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 18)
+                                } else {
+                                    ForEach(groupedSortedChecklists, id: \.group) { section in
+                                        Button {
+                                            toggleGroup(section.group)
+                                        } label: {
+                                            HStack(spacing: 8) {
+                                                Image(systemName: collapsedGroups.contains(section.group) ? "chevron.right" : "chevron.down")
+                                                    .font(.caption.weight(.semibold))
+                                                Text(section.group)
+                                                    .font(.title3.weight(.semibold))
+                                                Spacer()
+                                            }
+                                            .foregroundStyle(.secondary)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .padding(.horizontal, 14)
+                                            .padding(.top, 12)
+                                            .padding(.bottom, 6)
+                                        }
+                                        .buttonStyle(.plain)
+                                        if !collapsedGroups.contains(section.group) {
+                                            ForEach(section.items) { checklist in
+                                                checklistRow(checklist, columns: columns)
+                                                Divider()
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
+                        .frame(minWidth: tableWidth, alignment: .leading)
+                        .background(Color(nsColor: .controlBackgroundColor).opacity(0.35))
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
                 }
-                if !completedChecklists.isEmpty {
-                    Section("Completed") {
-                        ForEach(completedChecklists) { checklist in
-                            checklistRow(checklist)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
+
+            if isShowingAddGroup {
+                GroupBox("Add Group") {
+                    VStack(spacing: 10) {
+                        TextField("Group", text: $newGroupName)
+                        HStack {
+                            Spacer()
+                            Button("Save Group") {
+                                store.addChecklistGroup(newGroupName)
+                                newGroupName = ""
+                                isShowingAddGroup = false
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(newGroupName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
                     }
                 }
             }
-            .scrollContentBackground(.hidden)
 
             if isShowingAddChecklist {
                 GroupBox("Add Checklist") {
                     VStack(spacing: 10) {
                         TextField("Title", text: $title)
-                        Toggle("Set due date", isOn: $hasDueDate)
-                        if hasDueDate {
-                            DatePicker("Due", selection: $dueDate, displayedComponents: [.date, .hourAndMinute])
+                        TextField("Group", text: $groupName)
+                        if !store.availableChecklistGroups.isEmpty {
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 8) {
+                                    ForEach(store.availableChecklistGroups, id: \.self) { group in
+                                        Button(group) {
+                                            groupName = group
+                                        }
+                                        .buttonStyle(.bordered)
+                                    }
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        if canManageChecklistDueDate {
+                            Toggle("Set due date", isOn: $hasDueDate)
+                            if hasDueDate {
+                                DatePicker("Due", selection: $dueDate, displayedComponents: [.date, .hourAndMinute])
+                            }
+                        } else {
+                            Text("Only owners and admins can set the overall checklist due date.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         Text("Items")
                             .font(.caption)
@@ -3908,6 +5013,7 @@ private struct MacChecklistView: View {
                             var checklist = ChecklistTemplate(
                                 title: title.trimmingCharacters(in: .whitespacesAndNewlines),
                                 teamCode: store.teamCode ?? "",
+                                groupName: groupName.trimmingCharacters(in: .whitespacesAndNewlines),
                                 items: items,
                                 createdBy: store.user?.email
                             )
@@ -3929,39 +5035,46 @@ private struct MacChecklistView: View {
     }
 
     @ViewBuilder
-    private func checklistRow(_ checklist: ChecklistTemplate) -> some View {
+    private func checklistRow(_ checklist: ChecklistTemplate, columns: [GridItem]) -> some View {
         Button {
             isShowingAddChecklist = false
             startsEditingSelectedChecklist = false
             selectedChecklist = checklist
         } label: {
-            VStack(alignment: .leading, spacing: 6) {
-                Text(checklist.title).font(.headline)
-                Text("\(checklist.items.count) items")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if isChecklistCompleted(checklist) {
-                    if let completedAt = checklist.completedAt {
-                        let completedBy = checklist.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if let completedBy, !completedBy.isEmpty {
-                            Text("Completed by \(completedBy) on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        } else {
-                            Text("Completed on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                    } else {
-                        Text("Completed")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
+            LazyVGrid(columns: columns, alignment: .leading, spacing: 0) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(checklist.title)
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Text(checklistSubtitle(checklist))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                Text(checklistAssigneeLabel(checklist))
+                    .foregroundStyle(checklistAssigneeLabel(checklist) == "Unassigned" ? .secondary : .primary)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                Text(checklistDueDateLabel(checklist))
+                    .foregroundStyle(checklistDueDateColor(checklist))
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .buttonStyle(.plain)
+        .padding(.vertical, 10)
+        .padding(.horizontal, 14)
+        .background(Color.white.opacity(0.015))
         .contextMenu {
+            Button("Edit") {
+                isShowingAddChecklist = false
+                startsEditingSelectedChecklist = true
+                selectedChecklist = checklist
+            }
             Button("Duplicate") {
                 duplicateChecklist(checklist)
             }
@@ -3972,6 +5085,50 @@ private struct MacChecklistView: View {
                 Text("Delete")
             }
         }
+    }
+
+    private func checklistTableHeader(columns: [GridItem]) -> some View {
+        LazyVGrid(columns: columns, alignment: .leading, spacing: 0) {
+            checklistHeaderButton("Name", column: .name)
+            checklistHeaderButton("Assignee", column: .assignee)
+            checklistHeaderButton("Due date", column: .dueDate)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.75))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private func checklistHeaderButton(_ title: String, column: ChecklistSortColumn) -> some View {
+        let iconName = checklistSortColumn == column
+            ? (checklistSortAscending ? "arrow.up" : "arrow.down")
+            : "arrow.up.arrow.down"
+
+        return Button {
+            if checklistSortColumn == column {
+                checklistSortAscending.toggle()
+            } else {
+                checklistSortColumn = column
+                checklistSortAscending = column != .dueDate
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Text(title)
+                    .font(.headline)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .clipped()
+
+                Image(systemName: iconName)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 14, alignment: .trailing)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private func isChecklistCompleted(_ checklist: ChecklistTemplate) -> Bool {
@@ -3999,9 +5156,82 @@ private struct MacChecklistView: View {
 
     private func resetNewChecklistForm() {
         title = ""
+        groupName = ""
+        newGroupName = ""
         newChecklistItems = Array(repeating: "", count: 3)
         hasDueDate = false
         dueDate = Date()
+    }
+
+    private func checklistSubtitle(_ checklist: ChecklistTemplate) -> String {
+        if isChecklistCompleted(checklist) {
+            if let completedAt = checklist.completedAt {
+                let completedBy = checklist.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let completedBy, !completedBy.isEmpty {
+                    return "Completed by \(completedBy) on \(completedAt.formatted(date: .abbreviated, time: .shortened))"
+                }
+                return "Completed on \(completedAt.formatted(date: .abbreviated, time: .shortened))"
+            }
+            return "Completed"
+        }
+        return "\(checklist.items.count) tasks"
+    }
+
+    private func checklistGroupTitle(for checklist: ChecklistTemplate) -> String {
+        let trimmed = checklist.groupName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Ungrouped" : trimmed
+    }
+
+    private func toggleGroup(_ group: String) {
+        if collapsedGroups.contains(group) {
+            collapsedGroups.remove(group)
+        } else {
+            collapsedGroups.insert(group)
+        }
+    }
+
+    private func checklistAssigneeLabel(_ checklist: ChecklistTemplate) -> String {
+        let names = checklist.items.compactMap { item in
+            let storedName = item.assignedUserName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !storedName.isEmpty { return storedName }
+            let storedEmail = item.assignedUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !storedEmail.isEmpty {
+                return storedEmail.components(separatedBy: "@").first ?? storedEmail
+            }
+            return nil
+        }
+
+        let uniqueNames = Array(NSOrderedSet(array: names)) as? [String] ?? []
+        if uniqueNames.isEmpty { return "Unassigned" }
+        if uniqueNames.count == 1 { return uniqueNames[0] }
+        return "\(uniqueNames[0]) +\(uniqueNames.count - 1)"
+    }
+
+    private func checklistDueDateLabel(_ checklist: ChecklistTemplate) -> String {
+        guard let dueDate = checklist.dueDate else { return "No due date" }
+        return dueDate.formatted(date: .abbreviated, time: .shortened)
+    }
+
+    private func checklistDueDateColor(_ checklist: ChecklistTemplate) -> Color {
+        guard let dueDate = checklist.dueDate else { return .secondary }
+        if !isChecklistCompleted(checklist) && dueDate < Date() {
+            return .red
+        }
+        return .primary
+    }
+
+    private func compareChecklistDates(_ lhs: Date?, _ rhs: Date?) -> ComparisonResult {
+        switch (lhs, rhs) {
+        case let (left?, right?):
+            if left == right { return .orderedSame }
+            return left < right ? .orderedAscending : .orderedDescending
+        case (nil, nil):
+            return .orderedSame
+        case (nil, _):
+            return .orderedDescending
+        case (_, nil):
+            return .orderedAscending
+        }
     }
 }
 
@@ -4012,12 +5242,26 @@ private struct MacChecklistDetailView: View {
     @State private var originalChecklist: ChecklistTemplate?
     @State private var newItemText = ""
     @State private var newItemNotes = ""
+    @State private var newItemAssignedUserID = ""
+    @State private var newItemHasDueDate = false
+    @State private var newItemDueDate = Date()
 
     init(checklist: ChecklistTemplate, startEditing: Bool = false) {
         _checklist = State(initialValue: checklist)
         _isEditing = State(initialValue: startEditing)
         _originalChecklist = State(initialValue: startEditing ? checklist : nil)
     }
+
+    private var canAssignTasks: Bool { store.canAssignChecklistTasks }
+    private var canManageChecklistDueDate: Bool { store.user?.isAdmin == true || store.user?.isOwner == true }
+    private var assignableMembers: [UserProfile] {
+        store.teamMembers.sorted {
+            displayName(for: $0).localizedCaseInsensitiveCompare(displayName(for: $1)) == .orderedAscending
+        }
+    }
+    private var showsAssignmentFeatures: Bool { store.teamHasChecklistTaskAssignmentFeatures }
+    private var todoItemIndices: [Int] { checklist.items.indices.filter { !checklist.items[$0].isDone } }
+    private var completedItemIndices: [Int] { checklist.items.indices.filter { checklist.items[$0].isDone } }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -4032,6 +5276,9 @@ private struct MacChecklistDetailView: View {
                         isEditing = false
                         newItemText = ""
                         newItemNotes = ""
+                        newItemAssignedUserID = ""
+                        newItemHasDueDate = false
+                        newItemDueDate = Date()
                     }
                     .buttonStyle(.bordered)
 
@@ -4058,34 +5305,57 @@ private struct MacChecklistDetailView: View {
                                 .foregroundStyle(.secondary)
                             TextField("Title", text: $checklist.title)
                         }
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Group")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            TextField("Group", text: $checklist.groupName)
+                        }
                         LabeledContent("Created By", value: textValue(checklist.createdBy))
-                        LabeledContent("Due Date", value: dateValue(checklist.dueDate))
+                        if canManageChecklistDueDate {
+                            Toggle("Set overall due date", isOn: checklistHasDueDateBinding)
+                            if checklist.dueDate != nil {
+                                DatePicker("Due Date", selection: checklistDueDateBinding, displayedComponents: [.date, .hourAndMinute])
+                            }
+                        } else {
+                            LabeledContent("Due Date", value: dateValue(checklist.dueDate))
+                        }
                     }
 
-                    Section("Items") {
-                        if checklist.items.isEmpty {
-                            Text("No checklist items")
+                    Section("To Do") {
+                        if todoItemIndices.isEmpty {
+                            Text("No open tasks")
                                 .foregroundStyle(.secondary)
                         } else {
-                            ForEach(Array(checklist.items.indices), id: \.self) { index in
-                                VStack(alignment: .leading, spacing: 8) {
-                                    HStack(spacing: 10) {
-                                        TextField("Item", text: $checklist.items[index].text)
-                                        Button(role: .destructive) {
-                                            checklist.items.remove(at: index)
-                                        } label: {
-                                            Image(systemName: "trash")
-                                        }
-                                        .buttonStyle(.borderless)
-                                    }
-                                    TextField("Notes (optional)", text: $checklist.items[index].notes, axis: .vertical)
-                                        .lineLimit(2...4)
-                                }
+                            ForEach(todoItemIndices, id: \.self) { index in
+                                editableTaskCard(index: index)
                             }
                         }
+                    }
+                    if !completedItemIndices.isEmpty {
+                        Section("Completed") {
+                            ForEach(completedItemIndices, id: \.self) { index in
+                                editableTaskCard(index: index)
+                            }
+                        }
+                    }
 
+                    Section("Add Task") {
                         VStack(alignment: .leading, spacing: 10) {
                             TextField("New Item", text: $newItemText)
+                            if canAssignTasks {
+                                Picker("Assigned To", selection: $newItemAssignedUserID) {
+                                    Text("Unassigned").tag("")
+                                    ForEach(assignableMembers) { member in
+                                        Text(displayName(for: member)).tag(member.id)
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                            }
+                            Toggle("Set task due date", isOn: $newItemHasDueDate)
+                            if newItemHasDueDate {
+                                DatePicker("Task Due", selection: $newItemDueDate, displayedComponents: [.date, .hourAndMinute])
+                            }
                             TextField("Notes (optional)", text: $newItemNotes, axis: .vertical)
                                 .lineLimit(2...4)
                             HStack {
@@ -4094,9 +5364,19 @@ private struct MacChecklistDetailView: View {
                                     let trimmed = newItemText.trimmingCharacters(in: .whitespacesAndNewlines)
                                     guard !trimmed.isEmpty else { return }
                                     let trimmedNotes = newItemNotes.trimmingCharacters(in: .whitespacesAndNewlines)
-                                    checklist.items.append(ChecklistItem(text: trimmed, notes: trimmedNotes))
+                                    checklist.items.append(
+                                        makeChecklistItem(
+                                            text: trimmed,
+                                            notes: trimmedNotes,
+                                            assignedUserID: newItemAssignedUserID,
+                                            dueDate: newItemHasDueDate ? newItemDueDate : nil
+                                        )
+                                    )
                                     newItemText = ""
                                     newItemNotes = ""
+                                    newItemAssignedUserID = ""
+                                    newItemHasDueDate = false
+                                    newItemDueDate = Date()
                                 }
                                 .buttonStyle(.borderedProminent)
                                 .disabled(newItemText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -4106,6 +5386,7 @@ private struct MacChecklistDetailView: View {
                 } else {
                     Section("Overview") {
                         LabeledContent("Title", value: checklist.title)
+                        LabeledContent("Group", value: textValue(checklist.groupName))
                         LabeledContent("Items", value: "\(checklist.items.count)")
                         LabeledContent("Created By", value: textValue(checklist.createdBy))
                         LabeledContent("Due Date", value: dateValue(checklist.dueDate))
@@ -4113,44 +5394,20 @@ private struct MacChecklistDetailView: View {
                         LabeledContent("Completed By", value: textValue(checklist.completedBy))
                     }
 
-                    Section("Items") {
-                        if checklist.items.isEmpty {
-                            Text("No checklist items")
+                    Section("To Do") {
+                        if todoItemIndices.isEmpty {
+                            Text("No open tasks")
                                 .foregroundStyle(.secondary)
                         } else {
-                            ForEach(checklist.items) { item in
-                                Button {
-                                    toggleItem(itemID: item.id)
-                                } label: {
-                                    HStack(alignment: .top, spacing: 10) {
-                                        Image(systemName: item.isDone ? "checkmark.circle.fill" : "circle")
-                                            .foregroundStyle(item.isDone ? Color.green : Color.secondary)
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            Text(item.text)
-                                                .foregroundStyle(.primary)
-                                            let trimmedNotes = item.notes.trimmingCharacters(in: .whitespacesAndNewlines)
-                                            if !trimmedNotes.isEmpty {
-                                                Text(trimmedNotes)
-                                                    .font(.caption)
-                                                    .foregroundStyle(.secondary)
-                                            }
-                                            if item.isDone, let completedAt = item.completedAt {
-                                                if let completedBy = item.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines),
-                                                   !completedBy.isEmpty {
-                                                    Text("Checked by \(completedBy) on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
-                                                        .font(.caption)
-                                                        .foregroundStyle(.secondary)
-                                                } else {
-                                                    Text("Checked on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
-                                                        .font(.caption)
-                                                        .foregroundStyle(.secondary)
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                .buttonStyle(.plain)
-                                .padding(.vertical, 4)
+                            ForEach(todoItemIndices, id: \.self) { index in
+                                readOnlyTaskCard(item: checklist.items[index])
+                            }
+                        }
+                    }
+                    if !completedItemIndices.isEmpty {
+                        Section("Completed") {
+                            ForEach(completedItemIndices, id: \.self) { index in
+                                readOnlyTaskCard(item: checklist.items[index])
                             }
                         }
                     }
@@ -4161,11 +5418,275 @@ private struct MacChecklistDetailView: View {
             .background(Color.clear)
         }
         .navigationTitle(checklist.title)
+        .onAppear {
+            store.listenToTeamMembers()
+        }
+    }
+
+    @ViewBuilder
+    private func editableTaskCard(index: Int) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                TextField("Item", text: $checklist.items[index].text)
+                Button(role: .destructive) {
+                    checklist.items.remove(at: index)
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+            }
+
+            if canAssignTasks {
+                Picker("Assigned To", selection: assignmentSelection(for: index)) {
+                    Text("Unassigned").tag("")
+                    ForEach(assignableMembers) { member in
+                        Text(displayName(for: member)).tag(member.id)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+
+            Toggle("Set task due date", isOn: itemHasDueDateBinding(for: index))
+            if checklist.items[index].dueDate != nil {
+                DatePicker("Task Due", selection: itemDueDateBinding(for: index), displayedComponents: [.date, .hourAndMinute])
+            }
+            if showsAssignmentFeatures {
+                taskMetadataRow(for: checklist.items[index])
+            }
+
+            TextField("Notes (optional)", text: $checklist.items[index].notes, axis: .vertical)
+                .lineLimit(2...4)
+        }
+        .padding(12)
+        .background(taskCardBackground(for: checklist.items[index]))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    private func readOnlyTaskCard(item: ChecklistItem) -> some View {
+        Button {
+            toggleItem(itemID: item.id)
+        } label: {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: item.isDone ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(item.isDone ? Color.green : Color.secondary)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(item.text)
+                        .foregroundStyle(.primary)
+                        .font(.body.weight(.medium))
+                    let trimmedNotes = item.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmedNotes.isEmpty {
+                        Text(trimmedNotes)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if showsAssignmentFeatures {
+                        taskMetadataRow(for: item)
+                    }
+                    if item.isDone, let completedAt = item.completedAt {
+                        if let completedBy = item.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines),
+                           !completedBy.isEmpty {
+                            Text("Checked by \(completedBy) on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("Checked on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            .padding(12)
+            .background(taskCardBackground(for: item))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(Color.white.opacity(0.06), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     private func textValue(_ value: String?) -> String {
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? "Not set" : trimmed
+    }
+
+    private func displayName(for member: UserProfile) -> String {
+        let trimmed = member.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        return member.email.components(separatedBy: "@").first ?? member.email
+    }
+
+    private func assignmentSelection(for index: Int) -> Binding<String> {
+        Binding(
+            get: {
+                guard checklist.items.indices.contains(index) else { return "" }
+                return checklist.items[index].assignedUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            },
+            set: { newValue in
+                guard checklist.items.indices.contains(index) else { return }
+                applyAssignment(selectedUserID: newValue, to: index)
+            }
+        )
+    }
+
+    private var checklistHasDueDateBinding: Binding<Bool> {
+        Binding(
+            get: { checklist.dueDate != nil },
+            set: { shouldSetDueDate in
+                checklist.dueDate = shouldSetDueDate ? (checklist.dueDate ?? Date()) : nil
+            }
+        )
+    }
+
+    private var checklistDueDateBinding: Binding<Date> {
+        Binding(
+            get: { checklist.dueDate ?? Date() },
+            set: { newValue in
+                checklist.dueDate = newValue
+            }
+        )
+    }
+
+    private func itemHasDueDateBinding(for index: Int) -> Binding<Bool> {
+        Binding(
+            get: {
+                guard checklist.items.indices.contains(index) else { return false }
+                return checklist.items[index].dueDate != nil
+            },
+            set: { shouldSetDueDate in
+                guard checklist.items.indices.contains(index) else { return }
+                checklist.items[index].dueDate = shouldSetDueDate ? (checklist.items[index].dueDate ?? checklist.dueDate ?? Date()) : nil
+            }
+        )
+    }
+
+    private func itemDueDateBinding(for index: Int) -> Binding<Date> {
+        Binding(
+            get: {
+                guard checklist.items.indices.contains(index) else { return checklist.dueDate ?? Date() }
+                return checklist.items[index].dueDate ?? checklist.dueDate ?? Date()
+            },
+            set: { newValue in
+                guard checklist.items.indices.contains(index) else { return }
+                checklist.items[index].dueDate = newValue
+            }
+        )
+    }
+
+    private func makeChecklistItem(text: String, notes: String, assignedUserID: String, dueDate: Date?) -> ChecklistItem {
+        var item = ChecklistItem(text: text, notes: notes, dueDate: dueDate)
+        applyAssignment(selectedUserID: assignedUserID, to: &item)
+        return item
+    }
+
+    private func applyAssignment(selectedUserID: String, to index: Int) {
+        guard checklist.items.indices.contains(index) else { return }
+        applyAssignment(selectedUserID: selectedUserID, to: &checklist.items[index])
+    }
+
+    private func applyAssignment(selectedUserID: String, to item: inout ChecklistItem) {
+        let trimmedID = selectedUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedID.isEmpty,
+              let member = assignableMembers.first(where: { $0.id == trimmedID }) else {
+            item.assignedUserID = nil
+            item.assignedUserName = nil
+            item.assignedUserEmail = nil
+            return
+        }
+        item.assignedUserID = member.id
+        item.assignedUserName = displayName(for: member)
+        item.assignedUserEmail = member.email.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func assignmentLabel(for item: ChecklistItem) -> String? {
+        if let member = assignedMember(for: item) {
+            return displayName(for: member)
+        }
+
+        let storedName = item.assignedUserName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !storedName.isEmpty { return storedName }
+
+        let storedEmail = item.assignedUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !storedEmail.isEmpty {
+            return storedEmail.components(separatedBy: "@").first ?? storedEmail
+        }
+
+        return nil
+    }
+
+    @ViewBuilder
+    private func taskMetadataRow(for item: ChecklistItem) -> some View {
+        HStack(spacing: 8) {
+            if let assignmentText = assignmentLabel(for: item) {
+                Label(assignmentText, systemImage: "person.crop.circle")
+                    .font(.caption.weight(.medium))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.blue.opacity(0.14))
+                    .clipShape(Capsule())
+            }
+            if let dueDate = item.dueDate {
+                Label(dueDateLabel(for: dueDate), systemImage: dueDate < Date() && !item.isDone ? "exclamationmark.circle" : "calendar")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(dueDate < Date() && !item.isDone ? Color.red : Color.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background((dueDate < Date() && !item.isDone ? Color.red : Color.gray).opacity(0.12))
+                    .clipShape(Capsule())
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func dueDateLabel(for dueDate: Date) -> String {
+        if Calendar.current.isDateInToday(dueDate) { return "Today" }
+        if Calendar.current.isDateInTomorrow(dueDate) { return "Tomorrow" }
+        return dueDate.formatted(date: .abbreviated, time: .shortened)
+    }
+
+    private func taskCardBackground(for item: ChecklistItem) -> Color {
+        if item.isDone { return Color.green.opacity(0.08) }
+        if showsAssignmentFeatures && isAssignedToCurrentUser(item) { return Color.yellow.opacity(0.16) }
+        return Color.white.opacity(0.04)
+    }
+
+    private func isAssignedToCurrentUser(_ item: ChecklistItem) -> Bool {
+        guard let current = store.user else { return false }
+        let assignedID = item.assignedUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !assignedID.isEmpty,
+           assignedID == current.id.trimmingCharacters(in: .whitespacesAndNewlines) {
+            return true
+        }
+        let assignedEmail = item.assignedUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if !assignedEmail.isEmpty,
+           assignedEmail == current.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            return true
+        }
+        return false
+    }
+
+    private func assignedMember(for item: ChecklistItem) -> UserProfile? {
+        let assignedID = item.assignedUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !assignedID.isEmpty,
+           let member = assignableMembers.first(where: { $0.id == assignedID }) {
+            return member
+        }
+
+        let assignedEmail = item.assignedUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if !assignedEmail.isEmpty {
+            return assignableMembers.first {
+                $0.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == assignedEmail
+            }
+        }
+
+        return nil
     }
 
     private func dateValue(_ value: Date?) -> String {
@@ -4209,6 +5730,7 @@ private struct MacChecklistDetailView: View {
 
     private func saveChecklistChanges() {
         checklist.title = checklist.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        checklist.groupName = checklist.groupName.trimmingCharacters(in: .whitespacesAndNewlines)
         checklist.items = checklist.items.compactMap { item in
             let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return nil }
@@ -4222,6 +5744,9 @@ private struct MacChecklistDetailView: View {
         originalChecklist = nil
         newItemText = ""
         newItemNotes = ""
+        newItemAssignedUserID = ""
+        newItemHasDueDate = false
+        newItemDueDate = Date()
         isEditing = false
     }
 
@@ -4237,12 +5762,33 @@ private struct MacChecklistDetailView: View {
 private struct MacIdeasView: View {
     @EnvironmentObject private var store: ProdConnectStore
     @State private var isShowingAddIdea = false
+    @State private var editingIdea: IdeaCard?
     @State private var title = ""
     @State private var detail = ""
     @State private var tags = ""
     
     private var canSaveIdea: Bool {
         !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var currentUserID: String {
+        store.user?.id.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private var canEditIdeas: Bool {
+        store.canEditIdeas
+    }
+
+    private var activeIdeas: [IdeaCard] {
+        store.ideas
+            .filter { !$0.implemented }
+            .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+    }
+
+    private var completedIdeas: [IdeaCard] {
+        store.ideas
+            .filter(\.implemented)
+            .sorted { ($0.completedAt ?? .distantPast) > ($1.completedAt ?? .distantPast) }
     }
 
     var body: some View {
@@ -4271,37 +5817,36 @@ private struct MacIdeasView: View {
             }
 
             List {
-                ForEach(store.ideas.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }) { idea in
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Text(idea.title).font(.headline)
-                            if idea.implemented {
-                                Text("Implemented")
-                                    .font(.caption2)
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 4)
-                                    .background(Color.green.opacity(0.25), in: Capsule())
-                            }
+                if !activeIdeas.isEmpty {
+                    Section("Not Completed") {
+                        ForEach(activeIdeas) { idea in
+                            ideaRow(idea)
                         }
-                        if !idea.detail.isEmpty {
-                            Text(idea.detail)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
+                        .onDelete { indexSet in
+                            for index in indexSet {
+                                store.deleteIdea(activeIdeas[index])
+                            }
                         }
                     }
                 }
-                .onDelete { indexSet in
-                    let list = store.ideas.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
-                    for index in indexSet {
-                        store.deleteIdea(list[index])
+
+                if !completedIdeas.isEmpty {
+                    Section("Completed") {
+                        ForEach(completedIdeas) { idea in
+                            ideaRow(idea)
+                        }
+                        .onDelete { indexSet in
+                            for index in indexSet {
+                                store.deleteIdea(completedIdeas[index])
+                            }
+                        }
                     }
                 }
             }
             .scrollContentBackground(.hidden)
 
             if isShowingAddIdea {
-                GroupBox("Add Idea") {
+                GroupBox(editingIdea == nil ? "Add Idea" : "Edit Idea") {
                     VStack(alignment: .leading, spacing: 10) {
                         TextField("Title", text: $title)
                         TextEditor(text: $detail)
@@ -4326,20 +5871,141 @@ private struct MacIdeasView: View {
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+        let existingIdea = editingIdea
         store.saveIdea(
             IdeaCard(
+                id: existingIdea?.id ?? UUID().uuidString,
                 title: title.trimmingCharacters(in: .whitespacesAndNewlines),
                 detail: detail.trimmingCharacters(in: .whitespacesAndNewlines),
                 tags: parsedTags,
                 teamCode: store.teamCode ?? "",
-                createdBy: store.user?.email
+                createdBy: existingIdea?.createdBy ?? store.user?.email,
+                implemented: existingIdea?.implemented ?? false,
+                completedAt: existingIdea?.completedAt,
+                likedBy: existingIdea?.likedBy ?? []
             )
         )
         resetIdeaForm()
         isShowingAddIdea = false
     }
 
+    private func beginEditing(_ idea: IdeaCard) {
+        editingIdea = idea
+        title = idea.title
+        detail = idea.detail
+        tags = idea.tags.joined(separator: ", ")
+        isShowingAddIdea = true
+    }
+
+    private func isIdeaLiked(_ idea: IdeaCard) -> Bool {
+        let userID = currentUserID
+        return !userID.isEmpty && idea.likedBy.contains(userID)
+    }
+
+    private func toggleLike(for idea: IdeaCard) {
+        let userID = currentUserID
+        guard !userID.isEmpty else { return }
+
+        var updatedIdea = idea
+        if updatedIdea.likedBy.contains(userID) {
+            updatedIdea.likedBy.removeAll { $0 == userID }
+        } else {
+            updatedIdea.likedBy.append(userID)
+        }
+        store.saveIdea(updatedIdea)
+    }
+
+    private func toggleImplemented(_ idea: IdeaCard) {
+        guard canEditIdeas else { return }
+        var updatedIdea = idea
+        if updatedIdea.implemented {
+            updatedIdea.implemented = false
+            updatedIdea.completedAt = nil
+        } else {
+            updatedIdea.implemented = true
+            updatedIdea.completedAt = Date()
+        }
+        store.saveIdea(updatedIdea)
+    }
+
+    @ViewBuilder
+    private func ideaRow(_ idea: IdeaCard) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text(idea.title).font(.headline)
+                    if idea.implemented {
+                        Text("Implemented")
+                            .font(.caption2)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color.green.opacity(0.25), in: Capsule())
+                    }
+                }
+                if !idea.detail.isEmpty {
+                    Text(idea.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                if !idea.tags.isEmpty {
+                    Text(idea.tags.joined(separator: ", "))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                if let completedAt = idea.completedAt {
+                    Text("Completed: \(completedAt.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                beginEditing(idea)
+            }
+
+            if canEditIdeas {
+                Button {
+                    toggleImplemented(idea)
+                } label: {
+                    Image(systemName: idea.implemented ? "checkmark.circle.fill" : "checkmark.circle")
+                        .foregroundStyle(idea.implemented ? Color.green : Color.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help(idea.implemented ? "Mark Not Implemented" : "Mark Implemented")
+            }
+
+            Button {
+                toggleLike(for: idea)
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: isIdeaLiked(idea) ? "heart.fill" : "heart")
+                    Text("\(idea.likedBy.count)")
+                }
+                .foregroundStyle(isIdeaLiked(idea) ? Color.red : Color.blue)
+            }
+            .buttonStyle(.borderless)
+            .help(isIdeaLiked(idea) ? "Unlike" : "Like")
+        }
+        .contextMenu {
+            Button("Edit") {
+                beginEditing(idea)
+            }
+            if canEditIdeas {
+                Button(idea.implemented ? "Mark Not Implemented" : "Mark Implemented") {
+                    toggleImplemented(idea)
+                }
+            }
+            Button("Delete", role: .destructive) {
+                store.deleteIdea(idea)
+            }
+        }
+    }
+
     private func resetIdeaForm() {
+        editingIdea = nil
         title = ""
         detail = ""
         tags = ""
@@ -4347,9 +6013,39 @@ private struct MacIdeasView: View {
 }
 
 private struct MacCustomizeView: View {
+    private enum FreshserviceImportKind: String, CaseIterable, Identifiable {
+        case assets
+        case tickets
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .assets: return "Assets"
+            case .tickets: return "Tickets"
+            }
+        }
+    }
+
+    private enum FreshserviceDestination: String, CaseIterable, Identifiable {
+        case assetsTab
+        case ticketsTab
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .assetsTab: return "Assets Tab"
+            case .ticketsTab: return "Tickets Tab"
+            }
+        }
+    }
+
     @EnvironmentObject private var store: ProdConnectStore
     @State private var newLocation = ""
     @State private var newRoom = ""
+    @State private var newTicketCategory = ""
+    @State private var newTicketSubcategory = ""
     @State private var gearSheetLink = ""
     @State private var audioPatchSheetLink = ""
     @State private var videoPatchSheetLink = ""
@@ -4360,9 +6056,15 @@ private struct MacCustomizeView: View {
     @State private var freshserviceAPIURL = ""
     @State private var freshserviceAPIKey = ""
     @State private var freshserviceEnabled = false
+    @State private var managedByGroupFilter = ""
+    @State private var managedByGroupOptions: [String] = []
     @State private var freshserviceSyncMode: ProdConnectStore.FreshserviceSyncMode = .pull
+    @State private var selectedImportKind: FreshserviceImportKind = .assets
+    @State private var selectedDestination: FreshserviceDestination = .assetsTab
     @State private var isSavingFreshserviceIntegration = false
     @State private var isTestingFreshserviceIntegration = false
+    @State private var isImportingFreshserviceData = false
+    @State private var isLoadingManagedByGroups = false
     @State private var freshserviceStatusMessage = ""
     @State private var externalTicketFormEnabled = false
     @State private var externalTicketFormAccessKey = ""
@@ -4405,6 +6107,24 @@ private struct MacCustomizeView: View {
     private var canManageExternalTicketForm: Bool {
         (store.user?.isAdmin == true || store.user?.isOwner == true)
             && (store.user?.hasTicketingFeatures == true)
+    }
+
+    private var canImportTickets: Bool {
+        store.user?.hasTicketingFeatures == true
+    }
+
+    private var availableImportKinds: [FreshserviceImportKind] {
+        canImportTickets ? FreshserviceImportKind.allCases : [.assets]
+    }
+
+    private var availableDestinations: [FreshserviceDestination] {
+        canImportTickets ? FreshserviceDestination.allCases : [.assetsTab]
+    }
+
+    private var availableManagedByGroupOptions: [String] {
+        let trimmedFilter = managedByGroupFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+        let merged = trimmedFilter.isEmpty ? managedByGroupOptions : managedByGroupOptions + [trimmedFilter]
+        return Array(Set(merged)).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
     }
 
     private var externalTicketFormURLString: String {
@@ -4487,6 +6207,68 @@ private struct MacCustomizeView: View {
                     }
                 }
 
+                HStack(alignment: .top, spacing: 20) {
+                    GroupBox("Ticket Categories") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                TextField("Add category", text: $newTicketCategory)
+                                Button("Save") {
+                                    let trimmed = newTicketCategory.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !trimmed.isEmpty else { return }
+                                    store.saveTicketCategory(trimmed)
+                                    newTicketCategory = ""
+                                }
+                            }
+                            List {
+                                ForEach(store.ticketCategories.sorted(), id: \.self) { category in
+                                    HStack {
+                                        Text(category)
+                                        Spacer()
+                                        Button(role: .destructive) {
+                                            store.deleteTicketCategory(category)
+                                        } label: {
+                                            Image(systemName: "trash")
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                            }
+                            .frame(minHeight: 220)
+                            .scrollContentBackground(.hidden)
+                        }
+                    }
+
+                    GroupBox("Ticket Subcategories") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                TextField("Add subcategory", text: $newTicketSubcategory)
+                                Button("Save") {
+                                    let trimmed = newTicketSubcategory.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !trimmed.isEmpty else { return }
+                                    store.saveTicketSubcategory(trimmed)
+                                    newTicketSubcategory = ""
+                                }
+                            }
+                            List {
+                                ForEach(store.ticketSubcategories.sorted(), id: \.self) { subcategory in
+                                    HStack {
+                                        Text(subcategory)
+                                        Spacer()
+                                        Button(role: .destructive) {
+                                            store.deleteTicketSubcategory(subcategory)
+                                        } label: {
+                                            Image(systemName: "trash")
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                            }
+                            .frame(minHeight: 220)
+                            .scrollContentBackground(.hidden)
+                        }
+                    }
+                }
+
                 GroupBox("Import from Google Sheets") {
                     VStack(alignment: .leading, spacing: 12) {
                         Text("Paste your Google Sheet share link and click Import.")
@@ -4517,6 +6299,18 @@ private struct MacCustomizeView: View {
 
                             Toggle("Enable Freshservice", isOn: $freshserviceEnabled)
 
+                            Picker("Import Data", selection: $selectedImportKind) {
+                                ForEach(availableImportKinds) { kind in
+                                    Text(kind.title).tag(kind)
+                                }
+                            }
+
+                            Picker("Destination", selection: $selectedDestination) {
+                                ForEach(availableDestinations) { destination in
+                                    Text(destination.title).tag(destination)
+                                }
+                            }
+
                             Picker("Sync Mode", selection: $freshserviceSyncMode) {
                                 ForEach(ProdConnectStore.FreshserviceSyncMode.allCases, id: \.self) { mode in
                                     Text(mode.title).tag(mode)
@@ -4529,6 +6323,34 @@ private struct MacCustomizeView: View {
                             SecureField("Freshservice API Key", text: $freshserviceAPIKey)
                                 .textFieldStyle(.roundedBorder)
 
+                            if selectedImportKind == .assets {
+                                Picker("Managed By Group", selection: $managedByGroupFilter) {
+                                    Text("All Groups").tag("")
+                                    ForEach(availableManagedByGroupOptions, id: \.self) { option in
+                                        Text(option).tag(option)
+                                    }
+                                }
+
+                                Button {
+                                    refreshManagedByGroupOptions()
+                                } label: {
+                                    if isLoadingManagedByGroups {
+                                        ProgressView()
+                                    } else {
+                                        Text("Refresh Groups")
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(
+                                    isSavingFreshserviceIntegration
+                                    || isTestingFreshserviceIntegration
+                                    || isImportingFreshserviceData
+                                    || isLoadingManagedByGroups
+                                    || freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                    || freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                )
+                            }
+
                             HStack(spacing: 12) {
                                 Button {
                                     saveFreshserviceIntegration()
@@ -4540,7 +6362,7 @@ private struct MacCustomizeView: View {
                                     }
                                 }
                                 .buttonStyle(.borderedProminent)
-                                .disabled(isSavingFreshserviceIntegration || isTestingFreshserviceIntegration)
+                                .disabled(isSavingFreshserviceIntegration || isTestingFreshserviceIntegration || isImportingFreshserviceData)
 
                                 Button {
                                     testFreshserviceConnection()
@@ -4555,6 +6377,25 @@ private struct MacCustomizeView: View {
                                 .disabled(
                                     isSavingFreshserviceIntegration
                                     || isTestingFreshserviceIntegration
+                                    || isImportingFreshserviceData
+                                    || freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                    || freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                )
+
+                                Button {
+                                    importFreshserviceData()
+                                } label: {
+                                    if isImportingFreshserviceData {
+                                        ProgressView()
+                                    } else {
+                                        Text("Import")
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(
+                                    isSavingFreshserviceIntegration
+                                    || isTestingFreshserviceIntegration
+                                    || isImportingFreshserviceData
                                     || freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                                     || freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                                 )
@@ -4850,7 +6691,15 @@ private struct MacCustomizeView: View {
         freshserviceAPIURL = settings.apiURL
         freshserviceAPIKey = settings.apiKey
         freshserviceEnabled = settings.isEnabled
+        managedByGroupFilter = settings.managedByGroup
+        managedByGroupOptions = settings.managedByGroupOptions
         freshserviceSyncMode = settings.syncMode
+        if !canImportTickets, selectedImportKind == .tickets {
+            selectedImportKind = .assets
+        }
+        if !availableDestinations.contains(selectedDestination) {
+            selectedDestination = availableDestinations.first ?? .assetsTab
+        }
         loadExternalTicketFormCustomizeState()
     }
 
@@ -4890,8 +6739,8 @@ private struct MacCustomizeView: View {
         store.saveFreshserviceIntegration(
             apiURL: freshserviceAPIURL,
             apiKey: freshserviceAPIKey,
-            managedByGroup: "",
-            managedByGroupOptions: store.freshserviceIntegration.managedByGroupOptions,
+            managedByGroup: managedByGroupFilter,
+            managedByGroupOptions: managedByGroupOptions,
             syncMode: freshserviceSyncMode,
             isEnabled: freshserviceEnabled
         ) { result in
@@ -4915,73 +6764,468 @@ private struct MacCustomizeView: View {
 
         isTestingFreshserviceIntegration = true
         freshserviceStatusMessage = ""
-        let normalizedURL: URL? = {
-            let withScheme = trimmedURL.contains("://") ? trimmedURL : "https://\(trimmedURL)"
-            guard var components = URLComponents(string: withScheme) else { return nil }
-            components.scheme = "https"
-            components.user = nil
-            components.password = nil
-            components.path = "/api/v2/assets"
-            components.query = nil
-            components.fragment = nil
-            return components.url
-        }()
+        let assetCompletion: (Result<([[String: Any]], Bool), Error>) -> Void = { result in
+            DispatchQueue.main.async {
+                isTestingFreshserviceIntegration = false
+                switch result {
+                case .success(let payload):
+                    let (items, reachedCap) = payload
+                    let filteredItems = filteredFreshserviceItems(items)
+                    if reachedCap {
+                        freshserviceStatusMessage = "Connected to Freshservice. Found at least \(filteredItems.count) assets (20,000 asset cap reached)."
+                    } else {
+                        freshserviceStatusMessage = "Connected to Freshservice. Found \(filteredItems.count) assets."
+                    }
+                case .failure(let error):
+                    freshserviceStatusMessage = "Connection failed: \(error.localizedDescription)"
+                }
+            }
+        }
+        let ticketCompletion: (Result<([[String: Any]], Bool), Error>) -> Void = { result in
+            DispatchQueue.main.async {
+                isTestingFreshserviceIntegration = false
+                switch result {
+                case .success(let payload):
+                    let (items, reachedCap) = payload
+                    if reachedCap {
+                        freshserviceStatusMessage = "Connected to Freshservice. Found at least \(items.count) tickets (20,000 ticket cap reached)."
+                    } else {
+                        freshserviceStatusMessage = "Connected to Freshservice. Found \(items.count) tickets."
+                    }
+                case .failure(let error):
+                    freshserviceStatusMessage = "Connection failed: \(error.localizedDescription)"
+                }
+            }
+        }
 
-        guard let url = normalizedURL else {
-            isTestingFreshserviceIntegration = false
-            freshserviceStatusMessage = "Connection failed: Invalid Freshservice URL."
+        switch selectedImportKind {
+        case .assets:
+            MacFreshserviceAPI.fetchAllAssetsWithAPIKey(apiKey: trimmedKey, apiUrl: trimmedURL, maxPages: 20, completion: assetCompletion)
+        case .tickets:
+            MacFreshserviceAPI.fetchAllTicketsWithAPIKey(apiKey: trimmedKey, apiUrl: trimmedURL, completion: ticketCompletion)
+        }
+    }
+
+    private func importFreshserviceData() {
+        let trimmedURL = freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedKey = freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedURL.isEmpty, !trimmedKey.isEmpty else {
+            freshserviceStatusMessage = "Enter both the Freshservice URL and API key."
             return
         }
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        let credentialData = "\(trimmedKey):X".data(using: .utf8) ?? Data()
-        request.setValue("Basic \(credentialData.base64EncodedString())", forHTTPHeaderField: "Authorization")
+        isImportingFreshserviceData = true
+        freshserviceStatusMessage = ""
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        let assetCompletion: (Result<([[String: Any]], Bool), Error>) -> Void = { result in
             DispatchQueue.main.async {
-                isTestingFreshserviceIntegration = false
-                if let error {
-                    freshserviceStatusMessage = "Connection failed: \(error.localizedDescription)"
-                    return
-                }
-
-                guard let httpResponse = response as? HTTPURLResponse, let data else {
-                    freshserviceStatusMessage = "Connection failed: Freshservice returned an invalid response."
-                    return
-                }
-
-                if !(200...299).contains(httpResponse.statusCode) {
-                    if
-                        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                        let message = (json["description"] as? String) ?? (json["message"] as? String),
-                        !message.isEmpty
-                    {
-                        freshserviceStatusMessage = "Connection failed: \(message)"
-                    } else {
-                        freshserviceStatusMessage = "Connection failed: Freshservice request failed with status \(httpResponse.statusCode)."
+                switch result {
+                case .success(let payload):
+                    let (items, reachedCap) = payload
+                    let filteredItems = filteredFreshserviceItems(items)
+                    switch selectedDestination {
+                    case .assetsTab:
+                        let imported = filteredItems.compactMap { mapFreshserviceAsset($0) }
+                        store.upsertGear(imported) { saveResult in
+                            isImportingFreshserviceData = false
+                            switch saveResult {
+                            case .success:
+                                freshserviceStatusMessage = reachedCap
+                                    ? "Imported \(imported.count) Freshservice \(selectedImportKind.rawValue) into Assets and Firebase. 20,000 asset cap reached."
+                                    : "Imported \(imported.count) Freshservice \(selectedImportKind.rawValue) into Assets and Firebase."
+                            case .failure(let error):
+                                freshserviceStatusMessage = "Import failed while saving assets: \(error.localizedDescription)"
+                            }
+                        }
+                    case .ticketsTab:
+                        let imported = filteredItems.compactMap { mapFreshserviceTicket($0) }
+                        store.upsertTickets(imported) { saveResult in
+                            isImportingFreshserviceData = false
+                            switch saveResult {
+                            case .success:
+                                freshserviceStatusMessage = reachedCap
+                                    ? "Imported \(imported.count) Freshservice \(selectedImportKind.rawValue) into Tickets and Firebase. 20,000 asset cap reached."
+                                    : "Imported \(imported.count) Freshservice \(selectedImportKind.rawValue) into Tickets and Firebase."
+                            case .failure(let error):
+                                freshserviceStatusMessage = "Import failed while saving tickets: \(error.localizedDescription)"
+                            }
+                        }
                     }
-                    return
+                case .failure(let error):
+                    isImportingFreshserviceData = false
+                    freshserviceStatusMessage = "Import failed: \(error.localizedDescription)"
                 }
-
-                let jsonObject = try? JSONSerialization.jsonObject(with: data)
-                let assets = (jsonObject as? [String: Any]).flatMap { json in
-                    (json["assets"] as? [[String: Any]])
-                    ?? (json["config_items"] as? [[String: Any]])
-                    ?? (json["cis"] as? [[String: Any]])
-                    ?? (json["results"] as? [[String: Any]])
-                    ?? (json["data"] as? [[String: Any]])
-                } ?? (jsonObject as? [[String: Any]])
-
-                guard let assets else {
-                    freshserviceStatusMessage = "Connection failed: Freshservice returned a response in an unsupported format."
-                    return
-                }
-
-                freshserviceStatusMessage = "Connected to Freshservice. Found \(assets.count) assets."
             }
-        }.resume()
+        }
+
+        let ticketCompletion: (Result<([[String: Any]], Bool), Error>) -> Void = { result in
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let payload):
+                    let (items, reachedCap) = payload
+                    switch selectedDestination {
+                    case .assetsTab:
+                        let imported = items.compactMap { mapFreshserviceAsset($0) }
+                        store.upsertGear(imported) { saveResult in
+                            isImportingFreshserviceData = false
+                            switch saveResult {
+                            case .success:
+                                freshserviceStatusMessage = reachedCap
+                                    ? "Imported \(imported.count) Freshservice tickets into Assets and Firebase. 20,000 ticket cap reached."
+                                    : "Imported \(imported.count) Freshservice tickets into Assets and Firebase."
+                            case .failure(let error):
+                                freshserviceStatusMessage = "Import failed while saving assets: \(error.localizedDescription)"
+                            }
+                        }
+                    case .ticketsTab:
+                        let imported = items.compactMap { mapFreshserviceTicket($0) }
+                        store.upsertTickets(imported) { saveResult in
+                            isImportingFreshserviceData = false
+                            switch saveResult {
+                            case .success:
+                                freshserviceStatusMessage = reachedCap
+                                    ? "Imported \(imported.count) Freshservice tickets into Tickets and Firebase. 20,000 ticket cap reached."
+                                    : "Imported \(imported.count) Freshservice tickets into Tickets and Firebase."
+                            case .failure(let error):
+                                freshserviceStatusMessage = "Import failed while saving tickets: \(error.localizedDescription)"
+                            }
+                        }
+                    }
+                case .failure(let error):
+                    isImportingFreshserviceData = false
+                    freshserviceStatusMessage = "Import failed: \(error.localizedDescription)"
+                }
+            }
+        }
+
+        switch selectedImportKind {
+        case .assets:
+            MacFreshserviceAPI.fetchAllAssetsWithAPIKey(apiKey: trimmedKey, apiUrl: trimmedURL, completion: assetCompletion)
+        case .tickets:
+            MacFreshserviceAPI.fetchAllTicketsWithAPIKey(apiKey: trimmedKey, apiUrl: trimmedURL, completion: ticketCompletion)
+        }
+    }
+
+    private func filteredFreshserviceItems(_ items: [[String: Any]]) -> [[String: Any]] {
+        switch selectedImportKind {
+        case .assets:
+            let filter = managedByGroupFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !filter.isEmpty else { return items }
+            return items.filter { matchesManagedByGroup($0, filter: filter) }
+        case .tickets:
+            return items.filter { shouldIncludeFreshserviceTicket($0) }
+        }
+    }
+
+    private func refreshManagedByGroupOptions() {
+        let trimmedURL = freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedKey = freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedURL.isEmpty, !trimmedKey.isEmpty else {
+            freshserviceStatusMessage = "Enter both the Freshservice URL and API key."
+            return
+        }
+
+        isLoadingManagedByGroups = true
+        MacFreshserviceAPI.fetchAllAssetsWithAPIKey(apiKey: trimmedKey, apiUrl: trimmedURL) { result in
+            DispatchQueue.main.async {
+                isLoadingManagedByGroups = false
+                switch result {
+                case .success(let payload):
+                    let (assets, reachedCap) = payload
+                    managedByGroupOptions = extractManagedByGroupOptions(from: assets)
+                    store.saveFreshserviceIntegration(
+                        apiURL: freshserviceAPIURL,
+                        apiKey: freshserviceAPIKey,
+                        managedByGroup: managedByGroupFilter,
+                        managedByGroupOptions: managedByGroupOptions,
+                        syncMode: freshserviceSyncMode,
+                        isEnabled: freshserviceEnabled
+                    )
+                    if managedByGroupOptions.isEmpty {
+                        freshserviceStatusMessage = "Connected to Freshservice. No managed-by groups were found."
+                    } else if reachedCap {
+                        freshserviceStatusMessage = "Loaded \(managedByGroupOptions.count) managed-by groups from the first 20,000 assets."
+                    } else {
+                        freshserviceStatusMessage = "Loaded \(managedByGroupOptions.count) managed-by groups from Freshservice."
+                    }
+                case .failure(let error):
+                    freshserviceStatusMessage = "Failed to load managed-by groups: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func extractManagedByGroupOptions(from assets: [[String: Any]]) -> [String] {
+        let values = assets.compactMap { asset in
+            managedByGroupName(from: asset)
+        }
+        return Array(Set(values)).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    private func managedByGroupName(from asset: [String: Any]) -> String? {
+        let candidates: [String?] = [
+            nestedStringValue(asset["managed_by_group"], key: "name"),
+            nestedStringValue(asset["managed_by"], key: "name"),
+            nestedStringValue(asset["group"], key: "name"),
+            stringValue(asset["managed_by_group"]),
+            stringValue(asset["managed_by"]),
+            stringValue(asset["group_name"])
+        ]
+
+        return candidates
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first(where: { !$0.isEmpty })
+    }
+
+    private func mapFreshserviceAsset(_ asset: [String: Any]) -> GearItem? {
+        let freshserviceID = stringValue(asset["id"]) ?? stringValue(asset["display_id"]) ?? stringValue(asset["asset_tag"])
+        let name = stringValue(asset["name"])
+            ?? stringValue(asset["display_name"])
+            ?? nestedStringValue(asset["product"], key: "name")
+            ?? "Freshservice Asset"
+
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        var item = GearItem(
+            id: freshserviceID.map { "freshservice-\($0)" } ?? UUID().uuidString,
+            name: name,
+            category: nestedStringValue(asset["asset_type"], key: "name")
+                ?? nestedStringValue(asset["product"], key: "name")
+                ?? stringValue(asset["asset_type_name"])
+                ?? "Freshservice",
+            status: mappedStatus(from: asset),
+            teamCode: store.teamCode ?? "",
+            location: nestedStringValue(asset["location"], key: "name")
+                ?? nestedStringValue(asset["department"], key: "name")
+                ?? "",
+            serialNumber: stringValue(asset["serial_number"]) ?? "",
+            campus: nestedStringValue(asset["department"], key: "name") ?? "",
+            assetId: stringValue(asset["asset_tag"]) ?? stringValue(asset["display_id"]) ?? "",
+            maintenanceNotes: stringValue(asset["description"]) ?? "",
+            createdBy: "Freshservice Import"
+        )
+
+        item.purchasedFrom = nestedStringValue(asset["vendor"], key: "name") ?? ""
+        item.purchaseDate = parsedDate(from: asset["purchase_date"]) ?? parsedDate(from: asset["created_at"])
+        item.installDate = parsedDate(from: asset["created_at"])
+        item.cost = doubleValue(asset["cost"]) ?? doubleValue(asset["salvage_price"])
+        return item
+    }
+
+    private func mapFreshserviceTicket(_ ticket: [String: Any]) -> SupportTicket? {
+        let ticketID = stringValue(ticket["id"]) ?? stringValue(ticket["display_id"])
+        let title = stringValue(ticket["subject"]) ?? stringValue(ticket["name"]) ?? "Freshservice Ticket"
+        guard !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        let requesterName = nestedStringValue(ticket["requester"], key: "name")
+            ?? nestedStringValue(ticket["requester"], key: "email")
+            ?? stringValue(ticket["requester_name"])
+            ?? stringValue(ticket["email"])
+
+        let campusValue =
+            nestedStringValue(ticket["department"], key: "name")
+            ?? nestedStringValue(ticket["group"], key: "name")
+            ?? nestedStringValue(ticket["custom_fields"], key: "department")
+            ?? nestedStringValue(ticket["custom_fields"], key: "campus")
+            ?? stringValue(ticket["department_name"])
+            ?? stringValue(ticket["group_name"])
+            ?? stringValue(ticket["campus"])
+
+        let roomValue =
+            nestedStringValue(ticket["location"], key: "name")
+            ?? nestedStringValue(ticket["custom_fields"], key: "location")
+            ?? nestedStringValue(ticket["custom_fields"], key: "room")
+            ?? stringValue(ticket["location_name"])
+            ?? stringValue(ticket["room"])
+
+        let assignedAgentIDCandidates = [
+            stringValue(ticket["assigned_agent_id"]),
+            stringValue(ticket["responder_id"]),
+            stringValue(ticket["agent_id"]),
+            nestedStringValue(ticket["responder"], key: "id"),
+            nestedStringValue(ticket["agent"], key: "id"),
+            nestedStringValue(ticket["assigned_to"], key: "id")
+        ]
+        let assignedAgentID = assignedAgentIDCandidates.compactMap { $0 }.first
+
+        let assignedAgentNameCandidates = [
+            nestedStringValue(ticket["responder"], key: "name"),
+            nestedStringValue(ticket["responder"], key: "email"),
+            nestedStringValue(ticket["agent"], key: "name"),
+            nestedStringValue(ticket["agent"], key: "email"),
+            nestedStringValue(ticket["assigned_to"], key: "name"),
+            nestedStringValue(ticket["assigned_to"], key: "email"),
+            stringValue(ticket["responder_email"]),
+            stringValue(ticket["agent_email"]),
+            stringValue(ticket["responder_name"]),
+            stringValue(ticket["agent_name"]),
+            stringValue(ticket["assigned_agent_name"])
+        ]
+        let assignedAgentName = assignedAgentNameCandidates.compactMap { $0 }.first ?? assignedAgentID.map { "Agent \($0)" }
+
+        var item = SupportTicket(
+            id: ticketID.map { "freshservice-ticket-\($0)" } ?? UUID().uuidString,
+            title: title,
+            detail: stringValue(ticket["description_text"]) ?? stringValue(ticket["description"]) ?? "",
+            teamCode: store.teamCode ?? "",
+            campus: campusValue ?? "",
+            room: roomValue ?? "",
+            status: mappedTicketStatus(from: ticket),
+            createdBy: requesterName
+        )
+        item.createdAt = parsedDate(from: ticket["created_at"]) ?? Date()
+        item.updatedAt = parsedDate(from: ticket["updated_at"]) ?? item.createdAt
+        item.assignedAgentID = assignedAgentID
+        item.assignedAgentName = assignedAgentName
+        item.lastUpdatedBy = assignedAgentName
+        if let attachment = firstFreshserviceAttachment(from: ticket) {
+            item.attachmentURL = attachment.url
+            item.attachmentName = attachment.name
+            item.attachmentKind = attachment.kind
+        }
+        return item
+    }
+
+    private func mappedStatus(from asset: [String: Any]) -> GearItem.GearStatus {
+        let raw = (
+            nestedStringValue(asset["state"], key: "name")
+            ?? nestedStringValue(asset["ci_status"], key: "name")
+            ?? stringValue(asset["usage_type"])
+            ?? stringValue(asset["status"])
+            ?? ""
+        ).lowercased()
+
+        if raw.contains("repair") || raw.contains("maint") { return .needsRepair }
+        if raw.contains("retired") { return .retired }
+        if raw.contains("missing") || raw.contains("lost") { return .missing }
+        if raw.contains("use") || raw.contains("deployed") || raw.contains("assigned") || raw.contains("checkout") { return .inUse }
+        return .available
+    }
+
+    private func mappedTicketStatus(from ticket: [String: Any]) -> TicketStatus {
+        let statusCode = stringValue(ticket["status"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let raw = (
+            nestedStringValue(ticket["status"], key: "name")
+            ?? stringValue(ticket["status_name"])
+            ?? ""
+        ).lowercased()
+
+        if ["4", "5"].contains(statusCode) { return .resolved }
+        if ["3", "6", "7"].contains(statusCode) { return .inProgress }
+        if statusCode == "2" { return .open }
+        if statusCode == "1" { return .new }
+        if raw.contains("resolve") || raw.contains("closed") { return .resolved }
+        if raw.contains("progress") || raw.contains("pending") || raw.contains("awaiting") || raw.contains("waiting") { return .inProgress }
+        if raw.contains("open") { return .open }
+        return .new
+    }
+
+    private func firstFreshserviceAttachment(from ticket: [String: Any]) -> (url: String, name: String?, kind: TicketAttachmentKind?)? {
+        guard let attachments = ticket["attachments"] as? [[String: Any]], let first = attachments.first else {
+            return nil
+        }
+
+        guard
+            let url = stringValue(first["attachment_url"])
+                ?? stringValue(first["url"])
+                ?? stringValue(first["content_url"])
+        else {
+            return nil
+        }
+
+        let name = stringValue(first["name"]) ?? stringValue(first["file_name"])
+        let contentType = (stringValue(first["content_type"]) ?? "").lowercased()
+        let kind: TicketAttachmentKind?
+        if contentType.hasPrefix("image/") {
+            kind = .image
+        } else if contentType.hasPrefix("video/") {
+            kind = .video
+        } else {
+            kind = nil
+        }
+
+        return (url, name, kind)
+    }
+
+    private func shouldIncludeFreshserviceTicket(_ ticket: [String: Any]) -> Bool {
+        let rawStatusName = (
+            nestedStringValue(ticket["status"], key: "name")
+            ?? stringValue(ticket["status_name"])
+            ?? ""
+        ).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        let rawStatusCode = stringValue(ticket["status"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        if ["1", "2", "3", "6"].contains(rawStatusCode) { return true }
+        if rawStatusName.contains("new") { return true }
+        if rawStatusName.contains("open") { return true }
+        if rawStatusName.contains("pending") { return true }
+        if rawStatusName.contains("awaiting response") || rawStatusName.contains("waiting on customer") || rawStatusName.contains("waiting for customer") { return true }
+
+        return false
+    }
+
+    private func matchesManagedByGroup(_ asset: [String: Any], filter: String) -> Bool {
+        let normalizedFilter = filter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalizedFilter.isEmpty else { return true }
+
+        let candidates: [String?] = [
+            nestedStringValue(asset["managed_by_group"], key: "name"),
+            nestedStringValue(asset["managed_by"], key: "name"),
+            nestedStringValue(asset["group"], key: "name"),
+            stringValue(asset["managed_by_group"]),
+            stringValue(asset["managed_by"]),
+            stringValue(asset["group_name"])
+        ]
+
+        return candidates
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .contains { $0 == normalizedFilter }
+    }
+
+    private func stringValue(_ value: Any?) -> String? {
+        if let string = value as? String {
+            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        if let number = value as? NSNumber {
+            return number.stringValue
+        }
+        return nil
+    }
+
+    private func nestedStringValue(_ value: Any?, key: String) -> String? {
+        guard let dictionary = value as? [String: Any] else { return nil }
+        return stringValue(dictionary[key])
+    }
+
+    private func doubleValue(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber { return number.doubleValue }
+        if let string = value as? String {
+            return Double(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return nil
+    }
+
+    private func parsedDate(from value: Any?) -> Date? {
+        guard let raw = stringValue(value) else { return nil }
+        let isoFormatter = ISO8601DateFormatter()
+        if let date = isoFormatter.date(from: raw) {
+            return date
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        for format in ["yyyy-MM-dd", "yyyy-MM-dd HH:mm:ss", "MM/dd/yyyy"] {
+            formatter.dateFormat = format
+            if let date = formatter.date(from: raw) {
+                return date
+            }
+        }
+        return nil
     }
 
     private func convertGoogleSheetLinkToCSV(_ link: String) -> URL {
@@ -5342,7 +7586,7 @@ private struct MacUserDetailView: View {
             "isOwner": false
         ], forDocument: currentOwnerRef, merge: true)
 
-        var newOwnerUpdates: [String: Any] = [
+        let newOwnerUpdates: [String: Any] = [
             "isOwner": true,
             "isAdmin": true
         ]
@@ -6279,19 +8523,15 @@ private struct MacEditAccountView: View {
                 completion(nil)
                 return
             }
-            currentUser.updateEmail(to: trimmedEmail) { error in
+            currentUser.sendEmailVerification(beforeUpdatingEmail: trimmedEmail) { error in
                 if let error {
                     completion(error)
                     return
                 }
-                self.store.db.collection("users").document(currentUser.uid).updateData(["email": trimmedEmail]) { updateError in
-                    if updateError == nil {
-                        DispatchQueue.main.async {
-                            self.store.user?.email = trimmedEmail
-                        }
-                    }
-                    completion(updateError)
+                DispatchQueue.main.async {
+                    self.successMessage = "Check \(trimmedEmail) to verify the email change."
                 }
+                completion(nil)
             }
         }
 
