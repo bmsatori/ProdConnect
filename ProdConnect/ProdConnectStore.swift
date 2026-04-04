@@ -252,6 +252,9 @@ final class ProdConnectStore: ObservableObject {
     private let userDefaults = UserDefaults.standard
     private let cachedUserProfileKey = "prodconnect_cached_user_profile"
     private let cachedUserProfileIDKey = "prodconnect_cached_user_profile_id"
+    private let localChecklistGroupsKeyPrefix = "prodconnect.localChecklistGroups"
+    private let localTicketCategoriesKeyPrefix = "prodconnect.localTicketCategories"
+    private let localTicketSubcategoriesKeyPrefix = "prodconnect.localTicketSubcategories"
 
     @Published var gear: [GearItem] = []
     @Published var patchsheet: [PatchRow] = []
@@ -266,6 +269,8 @@ final class ProdConnectStore: ObservableObject {
     @Published var locations: [String] = []
     @Published var rooms: [String] = []
     @Published var checklistGroups: [String] = []
+    @Published var checklistGroupPositions: [String: Int] = [:]
+    @Published var canPersistChecklistGroupOrder = true
     @Published var ticketCategories: [String] = []
     @Published var ticketSubcategories: [String] = []
     @Published var freshserviceIntegration = FreshserviceIntegrationSettings()
@@ -277,13 +282,110 @@ final class ProdConnectStore: ObservableObject {
     @Published private var deliveredReminderNoticeIDs: Set<String> = []
     static let defaultGearCategories = ["Audio", "Video", "Lighting", "Network", "Misc"]
     var availableChecklistGroups: [String] {
-        Array(Set(
-            checklistGroups
-                + checklists
-                    .map { $0.groupName.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .filter { !$0.isEmpty }
-        ))
-        .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        var seenKeys: Set<String> = []
+        let explicit = checklistGroups.filter { name in
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return false }
+            let key = trimmed.lowercased()
+            guard !seenKeys.contains(key) else { return false }
+            seenKeys.insert(key)
+            return true
+        }
+        let inferred = checklists
+            .map { $0.groupName.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { group in
+                guard !group.isEmpty else { return false }
+                let key = group.lowercased()
+                guard !seenKeys.contains(key) else { return false }
+                seenKeys.insert(key)
+                return true
+            }
+            .sorted { lhs, rhs in
+                let left = checklists.first(where: {
+                    $0.groupName.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(lhs) == .orderedSame
+                })?.position ?? Int.max
+                let right = checklists.first(where: {
+                    $0.groupName.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(rhs) == .orderedSame
+                })?.position ?? Int.max
+                if left != right { return left < right }
+                return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
+            }
+        return explicit + inferred
+    }
+
+    private func normalizedUniqueChecklistGroups(_ groups: [String]) -> [String] {
+        var seenKeys: Set<String> = []
+        return groups.compactMap { name in
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            let key = trimmed.lowercased()
+            guard !seenKeys.contains(key) else { return nil }
+            seenKeys.insert(key)
+            return trimmed
+        }
+    }
+
+    private func checklistGroupsDefaultsKey(for rawTeamCode: String) -> String {
+        let normalized = Self.normalizedTeamCode(rawTeamCode) ?? rawTeamCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        return "\(localChecklistGroupsKeyPrefix).\(normalized)"
+    }
+
+    private func loadLocalChecklistGroups(for rawTeamCode: String) -> [String] {
+        let saved = userDefaults.stringArray(forKey: checklistGroupsDefaultsKey(for: rawTeamCode)) ?? []
+        return normalizedUniqueChecklistGroups(saved)
+    }
+
+    private func persistLocalChecklistGroups(_ groups: [String], for rawTeamCode: String) {
+        let normalized = normalizedUniqueChecklistGroups(groups)
+        userDefaults.set(normalized, forKey: checklistGroupsDefaultsKey(for: rawTeamCode))
+    }
+
+    private func localValuesDefaultsKey(prefix: String, for rawTeamCode: String) -> String {
+        let normalized = Self.normalizedTeamCode(rawTeamCode) ?? rawTeamCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        return "\(prefix).\(normalized)"
+    }
+
+    private func normalizedUniqueNames(_ names: [String]) -> [String] {
+        var seenKeys: Set<String> = []
+        return names.compactMap { name in
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            let key = trimmed.lowercased()
+            guard !seenKeys.contains(key) else { return nil }
+            seenKeys.insert(key)
+            return trimmed
+        }
+    }
+
+    private func loadLocalTicketCategories(for rawTeamCode: String) -> [String] {
+        let saved = userDefaults.stringArray(
+            forKey: localValuesDefaultsKey(prefix: localTicketCategoriesKeyPrefix, for: rawTeamCode)
+        ) ?? []
+        return normalizedUniqueNames(saved)
+    }
+
+    private func persistLocalTicketCategories(_ values: [String], for rawTeamCode: String) {
+        userDefaults.set(
+            normalizedUniqueNames(values),
+            forKey: localValuesDefaultsKey(prefix: localTicketCategoriesKeyPrefix, for: rawTeamCode)
+        )
+    }
+
+    private func loadLocalTicketSubcategories(for rawTeamCode: String) -> [String] {
+        let saved = userDefaults.stringArray(
+            forKey: localValuesDefaultsKey(prefix: localTicketSubcategoriesKeyPrefix, for: rawTeamCode)
+        ) ?? []
+        return normalizedUniqueNames(saved)
+    }
+
+    private func persistLocalTicketSubcategories(_ values: [String], for rawTeamCode: String) {
+        userDefaults.set(
+            normalizedUniqueNames(values),
+            forKey: localValuesDefaultsKey(prefix: localTicketSubcategoriesKeyPrefix, for: rawTeamCode)
+        )
+    }
+    func checklistGroupPosition(_ name: String) -> Int {
+        checklistGroupPositions[name] ?? Int.max
     }
     var availableTicketCategories: [String] {
         ticketCategories.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
@@ -1260,6 +1362,8 @@ final class ProdConnectStore: ObservableObject {
             locations = []
             rooms = []
             checklistGroups = []
+            checklistGroupPositions = [:]
+            canPersistChecklistGroupOrder = true
             ticketCategories = []
             ticketSubcategories = []
             freshserviceIntegration = FreshserviceIntegrationSettings()
@@ -1272,6 +1376,12 @@ final class ProdConnectStore: ObservableObject {
         }
 
         ensureTeamIntegrationDocumentsExist(for: code)
+        let localChecklistGroups = loadLocalChecklistGroups(for: code)
+        checklistGroups = localChecklistGroups
+        checklistGroupPositions = Dictionary(uniqueKeysWithValues: localChecklistGroups.enumerated().map { ($0.element, $0.offset) })
+        canPersistChecklistGroupOrder = true
+        ticketCategories = loadLocalTicketCategories(for: code)
+        ticketSubcategories = loadLocalTicketSubcategories(for: code)
 
         teamDocumentListener = db.collection("teams")
             .document(code)
@@ -1307,6 +1417,11 @@ final class ProdConnectStore: ObservableObject {
                 DispatchQueue.main.async {
                     self.processDueReminderNotifications(tickets: self.tickets, checklists: values)
                     self.checklists = values
+                        .filter { $0.archivedAt == nil }
+                        .sorted { lhs, rhs in
+                        if lhs.position != rhs.position { return lhs.position < rhs.position }
+                        return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+                    }
                 }
             }
 
@@ -1421,36 +1536,6 @@ final class ProdConnectStore: ObservableObject {
                 let values = (snapshot?.documents ?? []).map(\.documentID).sorted()
                 DispatchQueue.main.async {
                     self.rooms = values
-                }
-            }
-
-        checklistGroupsListener = db.collection("teams")
-            .document(code)
-            .collection("checklistGroups")
-            .addSnapshotListener { snapshot, _ in
-                let values = (snapshot?.documents ?? []).map(\.documentID).sorted()
-                DispatchQueue.main.async {
-                    self.checklistGroups = values
-                }
-            }
-
-        ticketCategoriesListener = db.collection("teams")
-            .document(code)
-            .collection("ticketCategories")
-            .addSnapshotListener { snapshot, _ in
-                let values = (snapshot?.documents ?? []).map(\.documentID).sorted()
-                DispatchQueue.main.async {
-                    self.ticketCategories = values
-                }
-            }
-
-        ticketSubcategoriesListener = db.collection("teams")
-            .document(code)
-            .collection("ticketSubcategories")
-            .addSnapshotListener { snapshot, _ in
-                let values = (snapshot?.documents ?? []).map(\.documentID).sorted()
-                DispatchQueue.main.async {
-                    self.ticketSubcategories = values
                 }
             }
 
@@ -1700,6 +1785,14 @@ final class ProdConnectStore: ObservableObject {
         persistNotificationState()
     }
 
+    private func checklistCompletionUserLabel() -> String {
+        let displayName = user?.displayName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !displayName.isEmpty { return displayName }
+        let email = user?.email.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !email.isEmpty { return email }
+        return Auth.auth().currentUser?.email ?? "Unknown User"
+    }
+
     private func processTicketAssignmentNotifications(with tickets: [SupportTicket]) {
         guard let currentUser = user else { return }
 
@@ -1908,7 +2001,46 @@ final class ProdConnectStore: ObservableObject {
         db.collection("lessons").document(item.id).delete()
         lessons.removeAll { $0.id == item.id }
     }
-    func saveChecklist(_ item: ChecklistTemplate) { save(item, collection: "checklists", id: item.id) }
+    func saveChecklist(_ item: ChecklistTemplate) {
+        var checklist = item
+        let completionLabel = checklistCompletionUserLabel()
+        let isCompleted = !checklist.items.isEmpty && checklist.items.allSatisfy(\.isDone)
+        if isCompleted {
+            if checklist.completedAt == nil {
+                checklist.completedAt = Date()
+            }
+            if (checklist.completedBy ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                checklist.completedBy = completionLabel
+            }
+            if checklist.archivedAt == nil {
+                checklist.archivedAt = Date()
+            }
+            if (checklist.archivedBy ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                checklist.archivedBy = completionLabel
+            }
+        } else {
+            checklist.archivedAt = nil
+            checklist.archivedBy = nil
+        }
+        if !checklists.contains(where: { $0.id == checklist.id }) {
+            let positions = checklists.map(\.position)
+            checklist.position = max(positions.max() ?? -1, checklist.position - 1) + 1
+        }
+        save(checklist, collection: "checklists", id: checklist.id)
+        if checklist.archivedAt != nil {
+            checklists.removeAll { $0.id == checklist.id }
+        } else {
+            if let index = checklists.firstIndex(where: { $0.id == checklist.id }) {
+                checklists[index] = checklist
+            } else {
+                checklists.append(checklist)
+            }
+        }
+        checklists.sort {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+        }
+    }
     func saveIdea(_ item: IdeaCard) { save(item, collection: "ideas", id: item.id) }
     func saveTicket(_ item: SupportTicket) {
         var ticket = item
@@ -2116,10 +2248,40 @@ final class ProdConnectStore: ObservableObject {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        db.collection("teams").document(code).collection("checklistGroups").document(trimmed).setData([:])
         if !checklistGroups.contains(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
+            let position = checklistGroups.count
             checklistGroups.append(trimmed)
-            checklistGroups.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+            checklistGroupPositions[trimmed] = position
+            persistLocalChecklistGroups(checklistGroups, for: code)
+        }
+    }
+
+    func reorderChecklistGroups(_ ordered: [String]) {
+        guard let code = (teamCode ?? user?.teamCode)?.trimmingCharacters(in: .whitespacesAndNewlines), !code.isEmpty else { return }
+        let uniqueOrdered = normalizedUniqueChecklistGroups(ordered)
+        checklistGroups = uniqueOrdered
+        checklistGroupPositions = Dictionary(uniqueKeysWithValues: uniqueOrdered.enumerated().map { ($0.element, $0.offset) })
+        persistLocalChecklistGroups(uniqueOrdered, for: code)
+    }
+
+    func reorderChecklists(_ ordered: [ChecklistTemplate]) {
+        let positionsByID = Dictionary(uniqueKeysWithValues: ordered.enumerated().map { ($0.element.id, $0.offset) })
+        checklists = checklists.map { checklist in
+            var updated = checklist
+            if let position = positionsByID[checklist.id] {
+                updated.position = position
+            }
+            return updated
+        }
+        checklists.sort {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+        }
+        for checklist in checklists {
+            db.collection("checklists").document(checklist.id).setData([
+                "position": checklist.position,
+                "groupName": checklist.groupName
+            ], merge: true)
         }
     }
     func deleteIdea(_ item: IdeaCard) {
@@ -2185,9 +2347,9 @@ final class ProdConnectStore: ObservableObject {
         guard let code = teamCode, !code.isEmpty else { return }
         let trimmed = category.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        db.collection("teams").document(code).collection("ticketCategories").document(trimmed).setData([:])
         if !ticketCategories.contains(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
             ticketCategories.append(trimmed)
+            persistLocalTicketCategories(ticketCategories, for: code)
         }
     }
 
@@ -2195,9 +2357,9 @@ final class ProdConnectStore: ObservableObject {
         guard let code = teamCode, !code.isEmpty else { return }
         let trimmed = subcategory.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        db.collection("teams").document(code).collection("ticketSubcategories").document(trimmed).setData([:])
         if !ticketSubcategories.contains(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
             ticketSubcategories.append(trimmed)
+            persistLocalTicketSubcategories(ticketSubcategories, for: code)
         }
     }
 
@@ -2489,14 +2651,14 @@ final class ProdConnectStore: ObservableObject {
 
     func deleteTicketCategory(_ category: String) {
         guard let code = teamCode, !code.isEmpty else { return }
-        db.collection("teams").document(code).collection("ticketCategories").document(category).delete()
         ticketCategories.removeAll { $0 == category }
+        persistLocalTicketCategories(ticketCategories, for: code)
     }
 
     func deleteTicketSubcategory(_ subcategory: String) {
         guard let code = teamCode, !code.isEmpty else { return }
-        db.collection("teams").document(code).collection("ticketSubcategories").document(subcategory).delete()
         ticketSubcategories.removeAll { $0 == subcategory }
+        persistLocalTicketSubcategories(ticketSubcategories, for: code)
     }
 
     func deleteAllGear(completion: ((Result<Void, Error>) -> Void)? = nil) {

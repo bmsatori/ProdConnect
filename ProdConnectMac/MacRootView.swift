@@ -1,3 +1,4 @@
+import AVFoundation
 import AVKit
 import AppKit
 import FirebaseAuth
@@ -1728,16 +1729,72 @@ private struct MacEditPatchView: View {
 }
 
 private struct MacTrainingView: View {
+    private enum TrainingViewMode: String, CaseIterable, Identifiable {
+        case list
+        case grid
+
+        var id: String { rawValue }
+    }
+
     @EnvironmentObject private var store: ProdConnectStore
+    @AppStorage("prodconnect.mac.trainingViewMode") private var trainingViewModeRawValue = TrainingViewMode.list.rawValue
     @State private var selectedLesson: TrainingLesson?
     @State private var showAddTrainingSheet = false
+    @State private var editingLesson: TrainingLesson?
     @State private var title = ""
     @State private var category = "Audio"
+    @State private var groupName = ""
+    @State private var selectedAssignedUserID = ""
+    @State private var videoSource = "upload"
     @State private var urlString = ""
+    @State private var selectedVideoURL: URL?
+    @State private var isUploadingVideo = false
+    @State private var uploadProgress: Double = 0
+    @State private var uploadError: String?
 
     private let categories = ["Audio", "Video", "Lighting", "Misc"]
+    private let trainingColumns: [GridItem] = [
+        GridItem(.flexible(minimum: 280, maximum: .infinity), spacing: 0, alignment: .leading),
+        GridItem(.fixed(140), spacing: 0, alignment: .leading),
+        GridItem(.fixed(170), spacing: 0, alignment: .leading),
+        GridItem(.fixed(140), spacing: 0, alignment: .leading)
+    ]
+    private var canEdit: Bool { store.user?.isAdmin == true || store.user?.canEditTraining == true }
+    private var assignableMembers: [UserProfile] {
+        store.teamMembers.sorted {
+            memberDisplayName($0).localizedCaseInsensitiveCompare(memberDisplayName($1)) == .orderedAscending
+        }
+    }
+    private var sortedLessons: [TrainingLesson] {
+        store.lessons.sorted { lhs, rhs in
+            lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+        }
+    }
+    private var groupedLessons: [(group: String, items: [TrainingLesson])] {
+        let grouped = Dictionary(grouping: sortedLessons) { trainingGroupTitle(for: $0) }
+        return grouped.keys.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }.map { key in
+            (group: key, items: grouped[key] ?? [])
+        }
+    }
     private var canSaveNewLesson: Bool {
-        !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedTitle.isEmpty || isUploadingVideo { return false }
+        if videoSource == "upload" {
+            if selectedVideoURL != nil { return true }
+            let existingURL = editingLesson?.urlString?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return !existingURL.isEmpty && !isYouTubeURLString(existingURL)
+        }
+        return !urlString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+    private var trainingViewMode: TrainingViewMode {
+        get { TrainingViewMode(rawValue: trainingViewModeRawValue) ?? .list }
+        nonmutating set { trainingViewModeRawValue = newValue.rawValue }
+    }
+    private var trainingViewModeBinding: Binding<TrainingViewMode> {
+        Binding(
+            get: { trainingViewMode },
+            set: { trainingViewMode = $0 }
+        )
     }
 
     var body: some View {
@@ -1758,75 +1815,412 @@ private struct MacTrainingView: View {
                 .navigationTitle(selectedLesson.title)
             } else {
                 VStack(alignment: .leading, spacing: 16) {
-                    HStack {
-                        Spacer()
-                        Button {
-                            showAddTrainingSheet = true
-                        } label: {
-                            Label("Add", systemImage: "plus")
+                    HStack(alignment: .center) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Training")
+                                .font(.system(size: 24, weight: .semibold))
+                            Text("\(sortedLessons.count) lessons")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
                         }
-                        .buttonStyle(.borderedProminent)
+                        Spacer()
+                        Picker("View", selection: trainingViewModeBinding) {
+                            Label("List", systemImage: "list.bullet").tag(TrainingViewMode.list)
+                            Label("Grid", systemImage: "square.grid.2x2").tag(TrainingViewMode.grid)
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 180)
+
+                        if canEdit {
+                            Button {
+                                editingLesson = nil
+                                resetNewLessonForm()
+                                showAddTrainingSheet = true
+                            } label: {
+                                Label("Add", systemImage: "plus")
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
                     }
 
-                    List {
-                        ForEach(store.lessons.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }) { lesson in
-                            Button {
-                                selectedLesson = lesson
-                            } label: {
-                                HStack {
-                                    VStack(alignment: .leading) {
-                                        Text(lesson.title).font(.headline)
-                                        Text(lesson.category).font(.caption).foregroundStyle(.secondary)
-                                    }
-                                    Spacer()
-                                    if hasPlayableURL(lesson) {
-                                        Image(systemName: "play.circle.fill")
-                                            .foregroundStyle(.blue)
+                    if trainingViewMode == .list {
+                        trainingHeaderRow
+
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 0) {
+                                ForEach(groupedLessons, id: \.group) { section in
+                                    trainingGroupHeader(section.group)
+                                    ForEach(section.items) { lesson in
+                                        trainingRow(lesson)
                                     }
                                 }
                             }
-                            .buttonStyle(.plain)
+                            .padding(.bottom, 8)
                         }
-                        .onDelete { indexSet in
-                            let lessons = store.lessons.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
-                            for index in indexSet {
-                                store.deleteLesson(lessons[index])
+                        .background(Color.white.opacity(0.02))
+                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+                        )
+                    } else {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 20) {
+                                ForEach(groupedLessons, id: \.group) { section in
+                                    trainingGroupHeader(section.group)
+                                        .padding(.horizontal, 18)
+
+                                    LazyVGrid(
+                                        columns: [GridItem(.adaptive(minimum: 280, maximum: 360), spacing: 18, alignment: .top)],
+                                        spacing: 18
+                                    ) {
+                                        ForEach(section.items) { lesson in
+                                            trainingGridCard(lesson)
+                                        }
+                                    }
+                                }
                             }
+                            .padding(18)
                         }
+                        .background(Color.white.opacity(0.02))
+                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+                        )
                     }
-                    .scrollContentBackground(.hidden)
                 }
                 .padding()
                 .background(Color.clear)
                 .navigationTitle("Training")
             }
         }
+        .onAppear {
+            store.listenToTeamMembers()
+        }
         .sheet(isPresented: $showAddTrainingSheet) {
-            NavigationStack {
-                Form {
+            trainingEditorSheet(title: "Add Training")
+        }
+        .sheet(item: $editingLesson) { lesson in
+            trainingEditorSheet(title: "Edit Training", editing: lesson)
+                .onAppear {
+                    populateLessonForm(from: lesson)
+                }
+        }
+    }
+
+    private func trainingEditorSheet(title: String, editing lesson: TrainingLesson? = nil) -> some View {
+        NavigationStack {
+            Form {
+                Section("Details") {
                     TextField("Title", text: $title)
                     Picker("Category", selection: $category) {
                         ForEach(categories, id: \.self) { Text($0).tag($0) }
                     }
-                    TextField("Video URL (optional)", text: $urlString)
-                }
-                .navigationTitle("Add Training")
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Cancel") {
-                            resetNewLessonForm()
-                            showAddTrainingSheet = false
+                    TextField("Group", text: $groupName)
+                    if canEdit {
+                        Picker("Assign To", selection: $selectedAssignedUserID) {
+                            Text("Unassigned").tag("")
+                            ForEach(assignableMembers) { member in
+                                Text(memberDisplayName(member)).tag(member.id)
+                            }
                         }
                     }
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("Save") {
-                            saveNewLesson()
+                }
+
+                Section("Video Source") {
+                    Picker("Source", selection: $videoSource) {
+                        Text("Upload File").tag("upload")
+                        Text("Video URL").tag("url")
+                    }
+                    .pickerStyle(.segmented)
+
+                    if videoSource == "upload" {
+                        Button(selectedVideoURL == nil ? "Choose Video" : "Change Video") {
+                            pickTrainingVideo()
                         }
-                        .disabled(!canSaveNewLesson)
+                        if let selectedVideoURL {
+                            Text(selectedVideoURL.lastPathComponent)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else if let existingURL = lesson?.urlString?.trimmingCharacters(in: .whitespacesAndNewlines),
+                                  !existingURL.isEmpty,
+                                  !isYouTubeURLString(existingURL) {
+                            Text("Using current uploaded video")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else {
+                        TextField("Video URL", text: $urlString)
+                    }
+                }
+
+                if isUploadingVideo {
+                    Section {
+                        ProgressView(value: uploadProgress) {
+                            Text("Uploading video…")
+                        }
+                    }
+                }
+
+                if let uploadError, !uploadError.isEmpty {
+                    Section {
+                        Text(uploadError)
+                            .foregroundStyle(.red)
                     }
                 }
             }
-            .frame(minWidth: 420, minHeight: 240)
+            .navigationTitle(title)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        resetNewLessonForm()
+                        editingLesson = nil
+                        showAddTrainingSheet = false
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        saveLesson(editing: lesson)
+                    }
+                    .disabled(!canSaveNewLesson)
+                }
+            }
+        }
+        .frame(minWidth: 420, minHeight: 260)
+    }
+
+    private var trainingHeaderRow: some View {
+        LazyVGrid(columns: trainingColumns, alignment: .leading, spacing: 0) {
+            trainingHeaderCell("Name")
+                .overlay(alignment: .trailing) {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.06))
+                        .frame(width: 1)
+                }
+            trainingHeaderCell("Category")
+                .overlay(alignment: .trailing) {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.06))
+                        .frame(width: 1)
+                }
+            trainingHeaderCell("Assignee")
+                .overlay(alignment: .trailing) {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.06))
+                        .frame(width: 1)
+                }
+            trainingHeaderCell("Source")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .background(Color.white.opacity(0.045))
+    }
+
+    private func trainingHeaderCell(_ title: String) -> some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .textCase(.uppercase)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .clipped()
+
+            Image(systemName: "arrow.up.arrow.down")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 14, alignment: .trailing)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+
+    private func trainingGroupHeader(_ title: String) -> some View {
+        HStack {
+            Text(title)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.primary)
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color.white.opacity(0.025))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color.white.opacity(0.05))
+                .frame(height: 1)
+        }
+    }
+
+    private func trainingRow(_ lesson: TrainingLesson) -> some View {
+        Button {
+            selectedLesson = lesson
+        } label: {
+            LazyVGrid(columns: trainingColumns, alignment: .leading, spacing: 0) {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(alignment: .center, spacing: 10) {
+                        MacTrainingThumbnailView(lesson: lesson, width: 72, height: 44)
+
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack(spacing: 8) {
+                                Text(lesson.title)
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                if hasPlayableURL(lesson) {
+                                    Image(systemName: "play.circle.fill")
+                                        .foregroundStyle(.blue)
+                                        .font(.system(size: 13))
+                                }
+                            }
+                            if lesson.isCompleted {
+                                Text("Completed")
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundStyle(.green)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.green.opacity(0.12))
+                                    .clipShape(Capsule())
+                            }
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .overlay(alignment: .trailing) {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.06))
+                        .frame(width: 1)
+                }
+
+                Text(lesson.category)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .overlay(alignment: .trailing) {
+                        Rectangle()
+                            .fill(Color.white.opacity(0.06))
+                            .frame(width: 1)
+                    }
+
+                Text(trainingAssigneeLabel(for: lesson))
+                    .font(.system(size: 12))
+                    .foregroundStyle(trainingAssigneeLabel(for: lesson) == "Unassigned" ? .secondary : .primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .overlay(alignment: .trailing) {
+                        Rectangle()
+                            .fill(Color.white.opacity(0.06))
+                            .frame(width: 1)
+                    }
+
+                Text(trainingSourceLabel(for: lesson))
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11)
+            .background(Color.white.opacity(0.01))
+            .overlay(alignment: .bottom) {
+                Rectangle()
+                    .fill(Color.white.opacity(0.045))
+                    .frame(height: 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            if canEdit {
+                Button("Edit") {
+                    populateLessonForm(from: lesson)
+                    editingLesson = lesson
+                }
+                Button(role: .destructive) {
+                    if selectedLesson?.id == lesson.id {
+                        selectedLesson = nil
+                    }
+                    store.deleteLesson(lesson)
+                } label: {
+                    Text("Delete")
+                }
+            }
+        }
+    }
+
+    private func trainingGridCard(_ lesson: TrainingLesson) -> some View {
+        Button {
+            selectedLesson = lesson
+        } label: {
+            VStack(alignment: .leading, spacing: 12) {
+                MacTrainingThumbnailView(lesson: lesson, width: nil, height: 180)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Text(lesson.title)
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(2)
+                        Spacer(minLength: 0)
+                        if hasPlayableURL(lesson) {
+                            Image(systemName: "play.circle.fill")
+                                .foregroundStyle(.blue)
+                                .font(.system(size: 14))
+                        }
+                    }
+
+                    Text(lesson.category)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+
+                    HStack(spacing: 8) {
+                        Text(trainingAssigneeLabel(for: lesson))
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Text("•")
+                            .foregroundStyle(.tertiary)
+                        Text(trainingSourceLabel(for: lesson))
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+
+                    if lesson.isCompleted {
+                        Text("Completed")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.green)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.green.opacity(0.12))
+                            .clipShape(Capsule())
+                    }
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.white.opacity(0.03))
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(Color.white.opacity(0.06), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            if canEdit {
+                Button("Edit") {
+                    populateLessonForm(from: lesson)
+                    editingLesson = lesson
+                }
+                Button(role: .destructive) {
+                    if selectedLesson?.id == lesson.id {
+                        selectedLesson = nil
+                    }
+                    store.deleteLesson(lesson)
+                } label: {
+                    Text("Delete")
+                }
+            }
         }
     }
 
@@ -1835,23 +2229,201 @@ private struct MacTrainingView: View {
         return !raw.isEmpty && URL(string: raw) != nil
     }
 
-    private func saveNewLesson() {
-        store.saveLesson(
-            TrainingLesson(
-                title: title,
-                category: category,
-                teamCode: store.teamCode ?? "",
-                urlString: urlString.isEmpty ? nil : urlString
-            )
-        )
-        resetNewLessonForm()
-        showAddTrainingSheet = false
+    private func saveLesson(editing existingLesson: TrainingLesson? = nil) {
+        uploadError = nil
+        if videoSource == "upload" {
+            if let selectedVideoURL {
+                isUploadingVideo = true
+                uploadTrainingVideo(from: selectedVideoURL) { result in
+                    DispatchQueue.main.async {
+                        self.isUploadingVideo = false
+                        switch result {
+                        case .success(let uploadedURL):
+                            persistLesson(urlString: uploadedURL, existingLesson: existingLesson)
+                        case .failure(let error):
+                            self.uploadError = "Video upload failed: \(error.localizedDescription)"
+                        }
+                    }
+                }
+            } else {
+                let existingURL = existingLesson?.urlString?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                persistLesson(urlString: existingURL, existingLesson: existingLesson)
+            }
+        } else {
+            persistLesson(urlString: urlString.trimmingCharacters(in: .whitespacesAndNewlines), existingLesson: existingLesson)
+        }
     }
 
     private func resetNewLessonForm() {
         title = ""
         category = categories.first ?? "Audio"
+        groupName = ""
+        selectedAssignedUserID = ""
+        videoSource = "upload"
         urlString = ""
+        selectedVideoURL = nil
+        isUploadingVideo = false
+        uploadProgress = 0
+        uploadError = nil
+    }
+
+    private func persistLesson(urlString: String, existingLesson: TrainingLesson? = nil) {
+        let trimmedURL = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        let assignedID = selectedAssignedUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let assignedMember = assignableMembers.first(where: { $0.id == assignedID })
+
+        store.saveLesson(
+            TrainingLesson(
+                id: existingLesson?.id ?? UUID().uuidString,
+                title: title.trimmingCharacters(in: .whitespacesAndNewlines),
+                category: category,
+                groupName: normalizedTrainingGroupName(groupName),
+                teamCode: store.teamCode ?? "",
+                durationSeconds: existingLesson?.durationSeconds ?? 0,
+                urlString: trimmedURL.isEmpty ? nil : trimmedURL,
+                isCompleted: existingLesson?.isCompleted ?? false,
+                assignedToUserID: assignedMember?.id,
+                assignedToUserEmail: assignedMember?.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            )
+        )
+        resetNewLessonForm()
+        editingLesson = nil
+        showAddTrainingSheet = false
+    }
+
+    private func populateLessonForm(from lesson: TrainingLesson) {
+        title = lesson.title
+        category = lesson.category
+        groupName = lesson.groupName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let assignedID = lesson.assignedToUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        selectedAssignedUserID = assignedID
+        let existingURL = lesson.urlString?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if isYouTubeURLString(existingURL) {
+            videoSource = "url"
+            urlString = existingURL
+        } else {
+            videoSource = "upload"
+            urlString = ""
+        }
+        selectedVideoURL = nil
+        uploadError = nil
+        uploadProgress = 0
+        isUploadingVideo = false
+    }
+
+    private func isYouTubeURLString(_ value: String) -> Bool {
+        let lowered = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return lowered.contains("youtube.com") || lowered.contains("youtu.be")
+    }
+
+    private func normalizedTrainingGroupName(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func trainingGroupTitle(for lesson: TrainingLesson) -> String {
+        let trimmed = lesson.groupName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "Ungrouped" : trimmed
+    }
+
+    @MainActor
+    private func pickTrainingVideo() {
+        uploadError = nil
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie]
+
+        let handleSelection: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else { return }
+            selectedVideoURL = url
+            urlString = ""
+        }
+
+        if let keyWindow = NSApp.keyWindow {
+            panel.beginSheetModal(for: keyWindow, completionHandler: handleSelection)
+        } else {
+            handleSelection(panel.runModal())
+        }
+    }
+
+    private func uploadTrainingVideo(from localURL: URL, completion: @escaping (Result<String, Error>) -> Void) {
+        let safeName = localURL.lastPathComponent.replacingOccurrences(of: " ", with: "_")
+        let path = "trainingVideos/\(UUID().uuidString)-\(safeName)"
+        let storageRef = Storage.storage().reference().child(path)
+        let metadata = StorageMetadata()
+        metadata.contentType = trainingVideoContentType(for: localURL)
+        let didAccess = localURL.startAccessingSecurityScopedResource()
+
+        let uploadTask = storageRef.putFile(from: localURL, metadata: metadata)
+        uploadTask.observe(.progress) { snapshot in
+            DispatchQueue.main.async {
+                uploadProgress = snapshot.progress?.fractionCompleted ?? 0
+            }
+        }
+        uploadTask.observe(.failure) { snapshot in
+            if didAccess {
+                localURL.stopAccessingSecurityScopedResource()
+            }
+            completion(.failure(snapshot.error ?? NSError(
+                domain: "ProdConnectMacTraining",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Upload failed."]
+            )))
+        }
+        uploadTask.observe(.success) { _ in
+            if didAccess {
+                localURL.stopAccessingSecurityScopedResource()
+            }
+            storageRef.downloadURL { url, error in
+                if let error {
+                    completion(.failure(error))
+                } else if let absoluteString = url?.absoluteString {
+                    completion(.success(absoluteString))
+                } else {
+                    completion(.failure(NSError(
+                        domain: "ProdConnectMacTraining",
+                        code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "Missing download URL."]
+                    )))
+                }
+            }
+        }
+    }
+
+    private func trainingVideoContentType(for localURL: URL) -> String {
+        if let type = UTType(filenameExtension: localURL.pathExtension),
+           let mimeType = type.preferredMIMEType {
+            return mimeType
+        }
+        return "video/quicktime"
+    }
+
+    private func trainingAssigneeLabel(for lesson: TrainingLesson) -> String {
+        let assignedID = lesson.assignedToUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !assignedID.isEmpty,
+           let member = assignableMembers.first(where: { $0.id == assignedID }) {
+            return memberDisplayName(member)
+        }
+        let assignedEmail = lesson.assignedToUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !assignedEmail.isEmpty {
+            return assignedEmail.components(separatedBy: "@").first ?? assignedEmail
+        }
+        return "Unassigned"
+    }
+
+    private func trainingSourceLabel(for lesson: TrainingLesson) -> String {
+        let raw = lesson.urlString?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if raw.isEmpty { return "No video" }
+        if raw.contains("youtube.com") || raw.contains("youtu.be") { return "Video URL" }
+        return "Uploaded File"
+    }
+
+    private func memberDisplayName(_ member: UserProfile) -> String {
+        let trimmed = member.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        return member.email.components(separatedBy: "@").first ?? member.email
     }
 }
 
@@ -1918,6 +2490,133 @@ private struct MacTrainingLessonPlayerView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+}
+
+private struct MacTrainingThumbnailView: View {
+    let lesson: TrainingLesson
+    let width: CGFloat?
+    let height: CGFloat
+
+    @State private var generatedThumbnail: NSImage?
+
+    private var lessonURL: URL? {
+        let raw = lesson.urlString?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !raw.isEmpty else { return nil }
+        return URL(string: raw)
+    }
+
+    private var youTubeThumbnailURL: URL? {
+        guard let url = lessonURL else { return nil }
+        guard let host = url.host?.lowercased() else { return nil }
+
+        let videoID: String?
+        if host.contains("youtu.be") {
+            videoID = url.pathComponents.dropFirst().first
+        } else if host.contains("youtube.com"),
+                  let components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            if url.path.lowercased() == "/watch" {
+                videoID = components.queryItems?.first(where: { $0.name == "v" })?.value
+            } else if url.path.lowercased().contains("/embed/") {
+                videoID = url.pathComponents.last
+            } else {
+                videoID = nil
+            }
+        } else {
+            videoID = nil
+        }
+
+        guard let videoID, !videoID.isEmpty else { return nil }
+        return URL(string: "https://img.youtube.com/vi/\(videoID)/hqdefault.jpg")
+    }
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.white.opacity(0.05))
+
+            if let youTubeThumbnailURL {
+                AsyncImage(url: youTubeThumbnailURL) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image
+                            .resizable()
+                            .scaledToFill()
+                    case .failure:
+                        thumbnailPlaceholder
+                    default:
+                        ProgressView()
+                    }
+                }
+            } else if let generatedThumbnail {
+                Image(nsImage: generatedThumbnail)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                thumbnailPlaceholder
+            }
+
+            LinearGradient(
+                colors: [Color.clear, Color.black.opacity(0.38)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+
+            Image(systemName: "play.circle.fill")
+                .font(.system(size: min(height * 0.32, 40), weight: .semibold))
+                .foregroundStyle(.white)
+                .shadow(color: .black.opacity(0.35), radius: 8, y: 2)
+        }
+        .frame(maxWidth: width == nil ? .infinity : nil)
+        .frame(width: width, height: height)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+        .task(id: lesson.urlString) {
+            await loadGeneratedThumbnailIfNeeded()
+        }
+    }
+
+    private var thumbnailPlaceholder: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "video")
+                .font(.system(size: min(height * 0.22, 26), weight: .medium))
+                .foregroundStyle(.secondary)
+            Text(lesson.category)
+                .font(.system(size: 10, weight: .semibold))
+                .textCase(.uppercase)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func loadGeneratedThumbnailIfNeeded() async {
+        guard youTubeThumbnailURL == nil, generatedThumbnail == nil, let url = lessonURL else { return }
+
+        let image = await Task.detached(priority: .utility) { () -> NSImage? in
+            let asset = AVURLAsset(url: url)
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            generator.maximumSize = CGSize(width: 1280, height: 720)
+
+            let preferredTimes = [
+                CMTime(seconds: 1, preferredTimescale: 600),
+                .zero
+            ]
+
+            for time in preferredTimes {
+                if let cgImage = try? generator.copyCGImage(at: time, actualTime: nil) {
+                    return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                }
+            }
+            return nil
+        }.value
+
+        guard let image else { return }
+        await MainActor.run {
+            generatedThumbnail = image
+        }
     }
 }
 
@@ -4778,6 +5477,7 @@ private struct MacChecklistView: View {
     private var canManageChecklistDueDate: Bool { store.user?.isAdmin == true || store.user?.isOwner == true }
     @State private var checklistSortColumn: ChecklistSortColumn = .name
     @State private var checklistSortAscending = true
+    @State private var dueDateEditorChecklistID: String?
 
     private enum ChecklistSortColumn {
         case name
@@ -4787,6 +5487,12 @@ private struct MacChecklistView: View {
 
     private let checklistMinimumColumnWidths: [CGFloat] = [320, 180, 150]
     private let checklistColumnWeights: [CGFloat] = [0.58, 0.24, 0.18]
+    private let checklistTableCornerRadius: CGFloat = 14
+    private var assignableMembers: [UserProfile] {
+        store.teamMembers.sorted {
+            checklistMemberDisplayName(for: $0).localizedCaseInsensitiveCompare(checklistMemberDisplayName(for: $1)) == .orderedAscending
+        }
+    }
 
     private func checklistColumns(for availableWidth: CGFloat) -> [GridItem] {
         adaptiveTableColumnWidths(
@@ -4806,11 +5512,18 @@ private struct MacChecklistView: View {
         ).reduce(28, +)
     }
 
+    private var orderedGroupNames: [String] {
+        store.availableChecklistGroups
+    }
+
     private var sortedChecklists: [ChecklistTemplate] {
         store.checklists.sorted { lhs, rhs in
             let result: ComparisonResult
             switch checklistSortColumn {
             case .name:
+                if lhs.position != rhs.position {
+                    return lhs.position < rhs.position
+                }
                 result = lhs.title.localizedCaseInsensitiveCompare(rhs.title)
             case .assignee:
                 result = checklistAssigneeLabel(lhs).localizedCaseInsensitiveCompare(checklistAssigneeLabel(rhs))
@@ -4827,12 +5540,7 @@ private struct MacChecklistView: View {
 
     private var groupedSortedChecklists: [(group: String, items: [ChecklistTemplate])] {
         let grouped = Dictionary(grouping: sortedChecklists) { checklistGroupTitle(for: $0) }
-        let allGroups = Set(grouped.keys).union(store.availableChecklistGroups.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })
-        return allGroups.sorted { lhs, rhs in
-            if lhs == "Ungrouped" { return false }
-            if rhs == "Ungrouped" { return true }
-            return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
-        }.map { key in
+        return orderedGroupNames.map { key in
             (group: key, items: grouped[key] ?? [])
         }
     }
@@ -4857,8 +5565,15 @@ private struct MacChecklistView: View {
             .background(Color.clear)
             .navigationTitle(selectedChecklist.title)
         } else {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Checklists")
+                        .font(.system(size: 24, weight: .semibold))
+                    Text("\(store.checklists.count) total")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 if isShowingAddChecklist || isShowingAddGroup {
                     Button("Cancel") {
@@ -4895,7 +5610,7 @@ private struct MacChecklistView: View {
                 let columns = checklistColumns(for: proxy.size.width)
 
                 ScrollView(.horizontal, showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 0) {
                         checklistTableHeader(columns: columns)
                             .frame(minWidth: tableWidth, alignment: .leading)
 
@@ -4916,20 +5631,26 @@ private struct MacChecklistView: View {
                                                 Image(systemName: collapsedGroups.contains(section.group) ? "chevron.right" : "chevron.down")
                                                     .font(.caption.weight(.semibold))
                                                 Text(section.group)
-                                                    .font(.title3.weight(.semibold))
+                                                    .font(.system(size: 13, weight: .semibold))
+                                                Text("\(section.items.count)")
+                                                    .font(.system(size: 11, weight: .semibold))
+                                                    .foregroundStyle(.tertiary)
                                                 Spacer()
                                             }
                                             .foregroundStyle(.secondary)
                                             .frame(maxWidth: .infinity, alignment: .leading)
                                             .padding(.horizontal, 14)
-                                            .padding(.top, 12)
-                                            .padding(.bottom, 6)
+                                            .padding(.top, 14)
+                                            .padding(.bottom, 8)
                                         }
                                         .buttonStyle(.plain)
+                                        .draggable(store.canPersistChecklistGroupOrder ? dragTokenForGroup(section.group) : "")
+                                        .dropDestination(for: String.self) { items, _ in
+                                            handleDroppedGroupToken(items.first, before: section.group)
+                                        }
                                         if !collapsedGroups.contains(section.group) {
                                             ForEach(section.items) { checklist in
                                                 checklistRow(checklist, columns: columns)
-                                                Divider()
                                             }
                                         }
                                     }
@@ -4937,9 +5658,17 @@ private struct MacChecklistView: View {
                             }
                         }
                         .frame(minWidth: tableWidth, alignment: .leading)
-                        .background(Color(nsColor: .controlBackgroundColor).opacity(0.35))
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .background(Color(nsColor: .controlBackgroundColor).opacity(0.22))
                     }
+                    .background(
+                        RoundedRectangle(cornerRadius: checklistTableCornerRadius, style: .continuous)
+                            .fill(Color(nsColor: .controlBackgroundColor).opacity(0.6))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: checklistTableCornerRadius, style: .continuous)
+                            .stroke(Color.white.opacity(0.05), lineWidth: 1)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: checklistTableCornerRadius, style: .continuous))
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
@@ -4948,12 +5677,13 @@ private struct MacChecklistView: View {
                 GroupBox("Add Group") {
                     VStack(spacing: 10) {
                         TextField("Group", text: $newGroupName)
+                            .onSubmit {
+                                saveNewChecklistGroup()
+                            }
                         HStack {
                             Spacer()
                             Button("Save Group") {
-                                store.addChecklistGroup(newGroupName)
-                                newGroupName = ""
-                                isShowingAddGroup = false
+                                saveNewChecklistGroup()
                             }
                             .buttonStyle(.borderedProminent)
                             .disabled(newGroupName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -5030,45 +5760,84 @@ private struct MacChecklistView: View {
         }
         .padding()
         .background(Color.clear)
-        .navigationTitle("Checklist")
+        .navigationTitle("Checklists")
+        .onAppear {
+            store.listenToTeamMembers()
+        }
         }
     }
 
     @ViewBuilder
     private func checklistRow(_ checklist: ChecklistTemplate, columns: [GridItem]) -> some View {
-        Button {
-            isShowingAddChecklist = false
-            startsEditingSelectedChecklist = false
-            selectedChecklist = checklist
-        } label: {
-            LazyVGrid(columns: columns, alignment: .leading, spacing: 0) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(checklist.title)
-                        .font(.headline)
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                    Text(checklistSubtitle(checklist))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+        LazyVGrid(columns: columns, alignment: .leading, spacing: 0) {
+            HStack(alignment: .top, spacing: 10) {
+                Button {
+                    toggleChecklistCompletion(checklist)
+                } label: {
+                    Image(systemName: isChecklistCompleted(checklist) ? "checkmark.circle.fill" : "checkmark.circle")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(isChecklistCompleted(checklist) ? Color.green : Color.secondary)
+                        .padding(.top, 2)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .buttonStyle(.plain)
 
-                Text(checklistAssigneeLabel(checklist))
-                    .foregroundStyle(checklistAssigneeLabel(checklist) == "Unassigned" ? .secondary : .primary)
-                    .lineLimit(1)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                Button {
+                    isShowingAddChecklist = false
+                    startsEditingSelectedChecklist = false
+                    selectedChecklist = checklist
+                } label: {
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(spacing: 8) {
+                            Text(checklist.title)
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                            checklistStatusBadge(for: checklist)
+                        }
 
-                Text(checklistDueDateLabel(checklist))
-                    .foregroundStyle(checklistDueDateColor(checklist))
-                    .lineLimit(1)
+                        HStack(spacing: 8) {
+                            Text(checklistProgressLabel(for: checklist))
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(isChecklistCompleted(checklist) ? Color.green : Color.accentColor)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background((isChecklistCompleted(checklist) ? Color.green : Color.accentColor).opacity(0.12))
+                                .clipShape(Capsule())
+                            Text(checklistSubtitle(checklist))
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
                     .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .overlay(alignment: .trailing) {
+                Rectangle()
+                    .fill(Color.white.opacity(0.06))
+                    .frame(width: 1)
+            }
+
+            checklistAssigneeCell(for: checklist)
+                .overlay(alignment: .trailing) {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.06))
+                        .frame(width: 1)
+                }
+
+            checklistDueDateCell(for: checklist)
         }
         .buttonStyle(.plain)
-        .padding(.vertical, 10)
+        .padding(.vertical, 9)
         .padding(.horizontal, 14)
-        .background(Color.white.opacity(0.015))
+        .background(checklistRowBackground(for: checklist))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color.white.opacity(0.045))
+                .frame(height: 1)
+        }
         .contextMenu {
             Button("Edit") {
                 isShowingAddChecklist = false
@@ -5085,18 +5854,31 @@ private struct MacChecklistView: View {
                 Text("Delete")
             }
         }
+        .draggable(dragTokenForChecklist(checklist))
+        .dropDestination(for: String.self) { items, _ in
+            handleDroppedChecklistToken(items.first, before: checklist)
+        }
     }
 
     private func checklistTableHeader(columns: [GridItem]) -> some View {
         LazyVGrid(columns: columns, alignment: .leading, spacing: 0) {
             checklistHeaderButton("Name", column: .name)
+                .overlay(alignment: .trailing) {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.06))
+                        .frame(width: 1)
+                }
             checklistHeaderButton("Assignee", column: .assignee)
+                .overlay(alignment: .trailing) {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.06))
+                        .frame(width: 1)
+                }
             checklistHeaderButton("Due date", column: .dueDate)
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.75))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(.vertical, 11)
+        .background(Color.white.opacity(0.045))
     }
 
     private func checklistHeaderButton(_ title: String, column: ChecklistSortColumn) -> some View {
@@ -5114,7 +5896,9 @@ private struct MacChecklistView: View {
         } label: {
             HStack(spacing: 8) {
                 Text(title)
-                    .font(.headline)
+                    .font(.system(size: 11, weight: .semibold))
+                    .textCase(.uppercase)
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -5129,6 +5913,122 @@ private struct MacChecklistView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func checklistAssigneeCell(for checklist: ChecklistTemplate) -> some View {
+        if store.canAssignChecklistTasks {
+            Menu {
+                Button("Unassigned") {
+                    updateChecklistAssignee(checklist, userID: "")
+                }
+                Divider()
+                ForEach(assignableMembers) { member in
+                    Button(checklistMemberDisplayName(for: member)) {
+                        updateChecklistAssignee(checklist, userID: member.id)
+                    }
+                }
+            } label: {
+                checklistAssigneeCellLabel(for: checklist)
+            }
+            .menuStyle(.borderlessButton)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            checklistAssigneeCellLabel(for: checklist)
+        }
+    }
+
+    @ViewBuilder
+    private func checklistDueDateCell(for checklist: ChecklistTemplate) -> some View {
+        if canManageChecklistDueDate {
+            Button {
+                dueDateEditorChecklistID = checklist.id
+            } label: {
+                checklistDueDateCellLabel(for: checklist)
+            }
+            .buttonStyle(.plain)
+            .popover(isPresented: Binding(
+                get: { dueDateEditorChecklistID == checklist.id },
+                set: { newValue in
+                    if !newValue, dueDateEditorChecklistID == checklist.id {
+                        dueDateEditorChecklistID = nil
+                    }
+                }
+            ), arrowEdge: .trailing) {
+                checklistDueDateEditor(for: checklist)
+                    .padding(14)
+                    .frame(width: 260)
+            }
+        } else {
+            checklistDueDateCellLabel(for: checklist)
+        }
+    }
+
+    @ViewBuilder
+    private func checklistAssigneeCellLabel(for checklist: ChecklistTemplate) -> some View {
+        if checklistHasExplicitAssignee(checklist) {
+            Text(checklistAssigneeLabel(checklist))
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+        } else {
+            Image(systemName: "person.crop.circle.dashed")
+                .font(.system(size: 17, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+    }
+
+    @ViewBuilder
+    private func checklistDueDateCellLabel(for checklist: ChecklistTemplate) -> some View {
+        if checklist.dueDate == nil {
+            Image(systemName: "calendar.badge.plus")
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+        } else {
+            Text(checklistDueDateLabel(checklist))
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(checklistDueDateColor(checklist))
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+    }
+
+    private func checklistDueDateEditor(for checklist: ChecklistTemplate) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Due Date")
+                .font(.headline)
+            DatePicker(
+                "Due",
+                selection: Binding(
+                    get: { checklist.dueDate ?? Date() },
+                    set: { newValue in
+                        updateChecklistDueDate(checklist, dueDate: newValue)
+                    }
+                ),
+                displayedComponents: [.date, .hourAndMinute]
+            )
+            .labelsHidden()
+
+            HStack {
+                Button("Clear") {
+                    updateChecklistDueDate(checklist, dueDate: nil)
+                    dueDateEditorChecklistID = nil
+                }
+                .buttonStyle(.bordered)
+                Spacer()
+                Button("Done") {
+                    dueDateEditorChecklistID = nil
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
     }
 
     private func isChecklistCompleted(_ checklist: ChecklistTemplate) -> Bool {
@@ -5174,7 +6074,11 @@ private struct MacChecklistView: View {
             }
             return "Completed"
         }
-        return "\(checklist.items.count) tasks"
+        let completedCount = checklist.items.filter(\.isDone).count
+        let openCount = max(checklist.items.count - completedCount, 0)
+        return openCount == checklist.items.count
+            ? "\(openCount) open tasks"
+            : "\(openCount) open • \(completedCount) done"
     }
 
     private func checklistGroupTitle(for checklist: ChecklistTemplate) -> String {
@@ -5191,20 +6095,49 @@ private struct MacChecklistView: View {
     }
 
     private func checklistAssigneeLabel(_ checklist: ChecklistTemplate) -> String {
-        let names = checklist.items.compactMap { item in
-            let storedName = item.assignedUserName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if !storedName.isEmpty { return storedName }
-            let storedEmail = item.assignedUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if !storedEmail.isEmpty {
-                return storedEmail.components(separatedBy: "@").first ?? storedEmail
-            }
-            return nil
+        let explicitName = checklist.assignedUserName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !explicitName.isEmpty { return explicitName }
+        let explicitEmail = checklist.assignedUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !explicitEmail.isEmpty {
+            return explicitEmail.components(separatedBy: "@").first ?? explicitEmail
         }
+        return "Unassigned"
+    }
 
-        let uniqueNames = Array(NSOrderedSet(array: names)) as? [String] ?? []
-        if uniqueNames.isEmpty { return "Unassigned" }
-        if uniqueNames.count == 1 { return uniqueNames[0] }
-        return "\(uniqueNames[0]) +\(uniqueNames.count - 1)"
+    private func checklistHasExplicitAssignee(_ checklist: ChecklistTemplate) -> Bool {
+        let assignedID = checklist.assignedUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !assignedID.isEmpty { return true }
+        let assignedName = checklist.assignedUserName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !assignedName.isEmpty { return true }
+        let assignedEmail = checklist.assignedUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return !assignedEmail.isEmpty
+    }
+
+    private func checklistMemberDisplayName(for member: UserProfile) -> String {
+        let trimmed = member.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        return member.email.components(separatedBy: "@").first ?? member.email
+    }
+
+    private func updateChecklistAssignee(_ checklist: ChecklistTemplate, userID: String) {
+        var updated = checklist
+        let trimmedID = userID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedID.isEmpty {
+            updated.assignedUserID = nil
+            updated.assignedUserName = nil
+            updated.assignedUserEmail = nil
+        } else if let member = assignableMembers.first(where: { $0.id == trimmedID }) {
+            updated.assignedUserID = member.id
+            updated.assignedUserName = checklistMemberDisplayName(for: member)
+            updated.assignedUserEmail = member.email.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        store.saveChecklist(updated)
+    }
+
+    private func updateChecklistDueDate(_ checklist: ChecklistTemplate, dueDate: Date?) {
+        var updated = checklist
+        updated.dueDate = dueDate
+        store.saveChecklist(updated)
     }
 
     private func checklistDueDateLabel(_ checklist: ChecklistTemplate) -> String {
@@ -5218,6 +6151,152 @@ private struct MacChecklistView: View {
             return .red
         }
         return .primary
+    }
+
+    private func checklistCompletionFraction(for checklist: ChecklistTemplate) -> Double {
+        guard !checklist.items.isEmpty else { return 0 }
+        let completedCount = checklist.items.filter(\.isDone).count
+        return Double(completedCount) / Double(checklist.items.count)
+    }
+
+    private func checklistProgressLabel(for checklist: ChecklistTemplate) -> String {
+        "\(Int((checklistCompletionFraction(for: checklist) * 100).rounded()))%"
+    }
+
+    private func toggleChecklistCompletion(_ checklist: ChecklistTemplate) {
+        guard !checklist.items.isEmpty else { return }
+        var updated = checklist
+        let shouldComplete = !isChecklistCompleted(checklist)
+        updated.items = updated.items.map { item in
+            var next = item
+            next.isDone = shouldComplete
+            next.completedAt = shouldComplete ? Date() : nil
+            next.completedBy = shouldComplete ? checklistCompletionUserLabel() : nil
+            return next
+        }
+        updated.completedAt = shouldComplete ? Date() : nil
+        updated.completedBy = shouldComplete ? checklistCompletionUserLabel() : nil
+        store.saveChecklist(updated)
+        if selectedChecklist?.id == updated.id {
+            selectedChecklist = updated
+        }
+    }
+
+    private func checklistCompletionUserLabel() -> String {
+        let displayName = store.user?.displayName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !displayName.isEmpty { return displayName }
+        let email = store.user?.email.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !email.isEmpty { return email }
+        return Auth.auth().currentUser?.email ?? "Unknown User"
+    }
+
+    private func dragTokenForChecklist(_ checklist: ChecklistTemplate) -> String {
+        "checklist:\(checklist.id)"
+    }
+
+    private func dragTokenForGroup(_ group: String) -> String {
+        "group:\(group)"
+    }
+
+    private func handleDroppedChecklistToken(_ token: String?, before target: ChecklistTemplate) -> Bool {
+        guard let token, token.hasPrefix("checklist:") else { return false }
+        let draggedID = String(token.dropFirst("checklist:".count))
+        reorderChecklist(draggedID: draggedID, before: target)
+        return true
+    }
+
+    private func handleDroppedGroupToken(_ token: String?, before targetGroup: String) -> Bool {
+        guard store.canPersistChecklistGroupOrder else { return false }
+        guard let token, token.hasPrefix("group:") else { return false }
+        let draggedGroup = String(token.dropFirst("group:".count))
+        var ordered = orderedGroupNames
+        guard let sourceIndex = ordered.firstIndex(of: draggedGroup),
+              let destinationIndex = ordered.firstIndex(of: targetGroup),
+              sourceIndex != destinationIndex else { return false }
+        let moved = ordered.remove(at: sourceIndex)
+        ordered.insert(moved, at: destinationIndex)
+        store.reorderChecklistGroups(ordered)
+        return true
+    }
+
+    private func saveNewChecklistGroup() {
+        let trimmed = newGroupName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        store.addChecklistGroup(trimmed)
+        newGroupName = ""
+        isShowingAddGroup = false
+    }
+
+    private func reorderChecklist(draggedID: String, before target: ChecklistTemplate) {
+        var ordered = store.checklists.sorted {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+        }
+        guard let sourceIndex = ordered.firstIndex(where: { $0.id == draggedID }),
+              let destinationIndex = ordered.firstIndex(where: { $0.id == target.id }),
+              sourceIndex != destinationIndex else { return }
+        var moved = ordered.remove(at: sourceIndex)
+        moved.groupName = target.groupName
+        ordered.insert(moved, at: destinationIndex)
+        store.reorderChecklists(ordered)
+    }
+
+    private func checklistStatusBadge(for checklist: ChecklistTemplate) -> some View {
+        let label: String
+        let foreground: Color
+        let background: Color
+
+        if isChecklistCompleted(checklist) {
+            label = "Done"
+            foreground = .green
+            background = Color.green.opacity(0.14)
+        } else if let dueDate = checklist.dueDate, dueDate < Date() {
+            label = "Overdue"
+            foreground = .red
+            background = Color.red.opacity(0.14)
+        } else if let dueDate = checklist.dueDate, Calendar.current.isDateInToday(dueDate) {
+            label = "Today"
+            foreground = .orange
+            background = Color.orange.opacity(0.14)
+        } else {
+            label = "Active"
+            foreground = .secondary
+            background = Color.white.opacity(0.08)
+        }
+
+        return Text(label)
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(foreground)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(background)
+            .clipShape(Capsule())
+    }
+
+    private func checklistRowBackground(for checklist: ChecklistTemplate) -> some View {
+        let isSelected = selectedChecklist?.id == checklist.id
+        if isSelected {
+            return AnyView(
+                RoundedRectangle(cornerRadius: 0, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.14))
+            )
+        }
+        return AnyView(
+            RoundedRectangle(cornerRadius: 0, style: .continuous)
+                .fill(Color.white.opacity(0.01))
+        )
+    }
+
+    private func isAssignedToCurrentUser(_ checklist: ChecklistTemplate) -> Bool {
+        guard let current = store.user else { return false }
+        let currentID = current.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentEmail = current.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let explicitID = checklist.assignedUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !currentID.isEmpty && explicitID == currentID {
+            return true
+        }
+        let checklistAssignedEmail = checklist.assignedUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        return !currentEmail.isEmpty && !checklistAssignedEmail.isEmpty && checklistAssignedEmail == currentEmail
     }
 
     private func compareChecklistDates(_ lhs: Date?, _ rhs: Date?) -> ComparisonResult {
@@ -5240,6 +6319,16 @@ private struct MacChecklistDetailView: View {
     @State private var checklist: ChecklistTemplate
     @State private var isEditing = false
     @State private var originalChecklist: ChecklistTemplate?
+    @State private var selectedTaskID: String?
+    @State private var taskDraftTitle = ""
+    @State private var taskDraftComment = ""
+    @State private var taskDraftAssignedUserID = ""
+    @State private var taskDraftHasDueDate = false
+    @State private var taskDraftDueDate = Date()
+    @State private var activeTaskCommentMentionQuery = ""
+    @State private var newTaskSubtaskTitle = ""
+    @State private var isUploadingTaskAttachment = false
+    @State private var taskAttachmentError: String?
     @State private var newItemText = ""
     @State private var newItemNotes = ""
     @State private var newItemAssignedUserID = ""
@@ -5253,7 +6342,14 @@ private struct MacChecklistDetailView: View {
     }
 
     private var canAssignTasks: Bool { store.canAssignChecklistTasks }
+    private var canEditTasks: Bool { store.canEditChecklists }
     private var canManageChecklistDueDate: Bool { store.user?.isAdmin == true || store.user?.isOwner == true }
+    private var isChecklistComplete: Bool { !checklist.items.isEmpty && checklist.items.allSatisfy(\.isDone) }
+    private var checklistProgress: Double {
+        guard !checklist.items.isEmpty else { return 0 }
+        return Double(checklist.items.filter(\.isDone).count) / Double(checklist.items.count)
+    }
+    private var progressTint: Color { isChecklistComplete ? .green : .accentColor }
     private var assignableMembers: [UserProfile] {
         store.teamMembers.sorted {
             displayName(for: $0).localizedCaseInsensitiveCompare(displayName(for: $1)) == .orderedAscending
@@ -5262,10 +6358,54 @@ private struct MacChecklistDetailView: View {
     private var showsAssignmentFeatures: Bool { store.teamHasChecklistTaskAssignmentFeatures }
     private var todoItemIndices: [Int] { checklist.items.indices.filter { !checklist.items[$0].isDone } }
     private var completedItemIndices: [Int] { checklist.items.indices.filter { checklist.items[$0].isDone } }
+    private var selectedTaskIndex: Int? {
+        guard let selectedTaskID else { return nil }
+        return checklist.items.firstIndex(where: { $0.id == selectedTaskID })
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(checklist.title)
+                        .font(.system(size: 24, weight: .semibold))
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            detailBadge(text: textValue(checklist.groupName), systemImage: "folder")
+                            detailBadge(text: checklistProgressLabel(), systemImage: "chart.bar.fill")
+                            detailBadge(text: "\(todoItemIndices.count) open", systemImage: "circle")
+                            detailBadge(text: "\(completedItemIndices.count) done", systemImage: "checkmark.circle.fill")
+                            if let dueDate = checklist.dueDate {
+                                detailBadge(
+                                    text: dueDateLabel(for: dueDate),
+                                    systemImage: dueDate < Date() && !isChecklistComplete ? "exclamationmark.circle.fill" : "calendar"
+                                )
+                            }
+                        }
+                    }
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Progress")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text(checklistProgressLabel())
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(progressTint)
+                        }
+                        GeometryReader { proxy in
+                            ZStack(alignment: .leading) {
+                                Capsule()
+                                    .fill(Color.white.opacity(0.08))
+                                Capsule()
+                                    .fill(progressTint.gradient)
+                                    .frame(width: max(proxy.size.width * checklistProgress, checklistProgress > 0 ? 8 : 0))
+                            }
+                        }
+                        .frame(height: 10)
+                    }
+                    .padding(.top, 4)
+                }
                 Spacer()
                 if isEditing {
                     Button("Cancel") {
@@ -5296,8 +6436,8 @@ private struct MacChecklistDetailView: View {
                 }
             }
 
-            Form {
-                if isEditing {
+            if isEditing {
+                Form {
                     Section("Overview") {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Title")
@@ -5311,6 +6451,23 @@ private struct MacChecklistDetailView: View {
                                 .foregroundStyle(.secondary)
                             TextField("Group", text: $checklist.groupName)
                         }
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Assignee")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            if canAssignTasks {
+                                Picker("Assignee", selection: checklistAssignmentSelection) {
+                                    Text("Unassigned").tag("")
+                                    ForEach(assignableMembers) { member in
+                                        Text(displayName(for: member)).tag(member.id)
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                            } else {
+                                Text(checklistAssignmentLabel)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                         LabeledContent("Created By", value: textValue(checklist.createdBy))
                         if canManageChecklistDueDate {
                             Toggle("Set overall due date", isOn: checklistHasDueDateBinding)
@@ -5322,22 +6479,9 @@ private struct MacChecklistDetailView: View {
                         }
                     }
 
-                    Section("To Do") {
-                        if todoItemIndices.isEmpty {
-                            Text("No open tasks")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ForEach(todoItemIndices, id: \.self) { index in
-                                editableTaskCard(index: index)
-                            }
-                        }
-                    }
-                    if !completedItemIndices.isEmpty {
-                        Section("Completed") {
-                            ForEach(completedItemIndices, id: \.self) { index in
-                                editableTaskCard(index: index)
-                            }
-                        }
+                    Section("Tasks") {
+                        Text("Task details now open directly from the task list when checklist editing is off.")
+                            .foregroundStyle(.secondary)
                     }
 
                     Section("Add Task") {
@@ -5356,7 +6500,7 @@ private struct MacChecklistDetailView: View {
                             if newItemHasDueDate {
                                 DatePicker("Task Due", selection: $newItemDueDate, displayedComponents: [.date, .hourAndMinute])
                             }
-                            TextField("Notes (optional)", text: $newItemNotes, axis: .vertical)
+                            TextField("Comment (optional)", text: $newItemNotes, axis: .vertical)
                                 .lineLimit(2...4)
                             HStack {
                                 Spacer()
@@ -5364,14 +6508,15 @@ private struct MacChecklistDetailView: View {
                                     let trimmed = newItemText.trimmingCharacters(in: .whitespacesAndNewlines)
                                     guard !trimmed.isEmpty else { return }
                                     let trimmedNotes = newItemNotes.trimmingCharacters(in: .whitespacesAndNewlines)
-                                    checklist.items.append(
-                                        makeChecklistItem(
-                                            text: trimmed,
-                                            notes: trimmedNotes,
-                                            assignedUserID: newItemAssignedUserID,
-                                            dueDate: newItemHasDueDate ? newItemDueDate : nil
-                                        )
+                                    let newItem = makeChecklistItem(
+                                        text: trimmed,
+                                        notes: trimmedNotes,
+                                        assignedUserID: newItemAssignedUserID,
+                                        dueDate: newItemHasDueDate ? newItemDueDate : nil
                                     )
+                                    checklist.items.append(newItem)
+                                    store.saveChecklist(checklist)
+                                    selectTask(id: newItem.id)
                                     newItemText = ""
                                     newItemNotes = ""
                                     newItemAssignedUserID = ""
@@ -5383,133 +6528,465 @@ private struct MacChecklistDetailView: View {
                             }
                         }
                     }
-                } else {
-                    Section("Overview") {
-                        LabeledContent("Title", value: checklist.title)
-                        LabeledContent("Group", value: textValue(checklist.groupName))
-                        LabeledContent("Items", value: "\(checklist.items.count)")
-                        LabeledContent("Created By", value: textValue(checklist.createdBy))
-                        LabeledContent("Due Date", value: dateValue(checklist.dueDate))
-                        LabeledContent("Completed At", value: dateValue(checklist.completedAt))
-                        LabeledContent("Completed By", value: textValue(checklist.completedBy))
-                    }
-
-                    Section("To Do") {
-                        if todoItemIndices.isEmpty {
-                            Text("No open tasks")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ForEach(todoItemIndices, id: \.self) { index in
-                                readOnlyTaskCard(item: checklist.items[index])
-                            }
-                        }
-                    }
-                    if !completedItemIndices.isEmpty {
-                        Section("Completed") {
-                            ForEach(completedItemIndices, id: \.self) { index in
-                                readOnlyTaskCard(item: checklist.items[index])
-                            }
-                        }
-                    }
+                }
+                .formStyle(.grouped)
+                .scrollContentBackground(.hidden)
+                .background(Color.clear)
+            } else {
+                HStack(alignment: .top, spacing: 18) {
+                    checklistTaskListPane
+                        .frame(width: 360)
+                    selectedTaskInspector
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 }
             }
-            .formStyle(.grouped)
-            .scrollContentBackground(.hidden)
-            .background(Color.clear)
         }
         .navigationTitle(checklist.title)
         .onAppear {
             store.listenToTeamMembers()
+            ensureSelectedTask()
         }
     }
 
-    @ViewBuilder
-    private func editableTaskCard(index: Int) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 10) {
-                TextField("Item", text: $checklist.items[index].text)
-                Button(role: .destructive) {
-                    checklist.items.remove(at: index)
-                } label: {
-                    Image(systemName: "trash")
+    private func detailBadge(text: String, systemImage: String) -> some View {
+        Label(text, systemImage: systemImage)
+            .font(.caption.weight(.medium))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color.white.opacity(0.06))
+            .clipShape(Capsule())
+    }
+
+    private func checklistCompletionFraction() -> Double {
+        checklistProgress
+    }
+
+    private func checklistProgressLabel() -> String {
+        "\(Int((checklistCompletionFraction() * 100).rounded()))%"
+    }
+
+    private var checklistTaskListPane: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                taskSection(title: "To Do", indices: todoItemIndices)
+                if !completedItemIndices.isEmpty {
+                    taskSection(title: "Completed", indices: completedItemIndices)
                 }
-                .buttonStyle(.borderless)
-            }
-
-            if canAssignTasks {
-                Picker("Assigned To", selection: assignmentSelection(for: index)) {
-                    Text("Unassigned").tag("")
-                    ForEach(assignableMembers) { member in
-                        Text(displayName(for: member)).tag(member.id)
-                    }
+                if canEditTasks {
+                    quickAddTaskRow
                 }
-                .pickerStyle(.menu)
             }
-
-            Toggle("Set task due date", isOn: itemHasDueDateBinding(for: index))
-            if checklist.items[index].dueDate != nil {
-                DatePicker("Task Due", selection: itemDueDateBinding(for: index), displayedComponents: [.date, .hourAndMinute])
-            }
-            if showsAssignmentFeatures {
-                taskMetadataRow(for: checklist.items[index])
-            }
-
-            TextField("Notes (optional)", text: $checklist.items[index].notes, axis: .vertical)
-                .lineLimit(2...4)
+            .padding(16)
         }
-        .padding(12)
-        .background(taskCardBackground(for: checklist.items[index]))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .background(Color.white.opacity(0.035))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 12)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(Color.white.opacity(0.06), lineWidth: 1)
         )
     }
 
     @ViewBuilder
-    private func readOnlyTaskCard(item: ChecklistItem) -> some View {
-        Button {
-            toggleItem(itemID: item.id)
-        } label: {
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: item.isDone ? "checkmark.circle.fill" : "circle")
+    private func taskSection(title: String, indices: [Int]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(.headline)
+                .foregroundStyle(.secondary)
+            if indices.isEmpty {
+                Text(title == "To Do" ? "No open tasks" : "No completed tasks")
+                    .foregroundStyle(.secondary)
+                    .font(.subheadline)
+            } else {
+                ForEach(indices, id: \.self) { index in
+                    taskListRow(item: checklist.items[index], isSelected: checklist.items[index].id == selectedTaskID)
+                }
+            }
+        }
+    }
+
+    private var quickAddTaskRow: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "plus")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+
+            TextField("Add task...", text: $newItemText)
+                .textFieldStyle(.plain)
+                .onSubmit {
+                    addQuickTask()
+                }
+
+            Button("Add") {
+                addQuickTask()
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(newItemText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .tertiary : .secondary)
+            .disabled(newItemText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(Color.white.opacity(0.02))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.white.opacity(0.04), lineWidth: 1)
+        )
+    }
+
+    private func taskListRow(item: ChecklistItem, isSelected: Bool) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Button {
+                toggleItem(itemID: item.id)
+                loadSelectedTaskDraftIfNeeded(for: item.id)
+            } label: {
+                Image(systemName: item.isDone ? "checkmark.circle.fill" : "checkmark.circle")
+                    .font(.system(size: 17, weight: .semibold))
                     .foregroundStyle(item.isDone ? Color.green : Color.secondary)
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                selectTask(id: item.id)
+            } label: {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(item.text)
+                        .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(.primary)
-                        .font(.body.weight(.medium))
-                    let trimmedNotes = item.notes.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmedNotes.isEmpty {
-                        Text(trimmedNotes)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    if showsAssignmentFeatures {
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if showsAssignmentFeatures || item.dueDate != nil {
                         taskMetadataRow(for: item)
                     }
-                    if item.isDone, let completedAt = item.completedAt {
-                        if let completedBy = item.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines),
-                           !completedBy.isEmpty {
-                            Text("Checked by \(completedBy) on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(12)
+        .background(isSelected ? Color.accentColor.opacity(0.14) : taskCardBackground(for: item))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(isSelected ? Color.accentColor.opacity(0.35) : Color.white.opacity(0.06), lineWidth: 1)
+        )
+        .draggable("task:\(item.id)")
+        .dropDestination(for: String.self) { items, _ in
+            guard let token = items.first, token.hasPrefix("task:") else { return false }
+            let draggedID = String(token.dropFirst("task:".count))
+            reorderTask(draggedID: draggedID, before: item.id)
+            return true
+        }
+    }
+
+    @ViewBuilder
+    private var selectedTaskInspector: some View {
+        if let index = selectedTaskIndex, checklist.items.indices.contains(index) {
+            let item = checklist.items[index]
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    HStack(spacing: 10) {
+                        markCompleteButton(for: item)
+
+                        Spacer()
+
+                        if canEditTasks {
+                            Button(role: .destructive) {
+                                checklist.items.remove(at: index)
+                                updateChecklistCompletionMetadata()
+                                store.saveChecklist(checklist)
+                                ensureSelectedTask()
+                            } label: {
+                                Label("Delete Task", systemImage: "trash")
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        TextField("Task title", text: $taskDraftTitle)
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 28, weight: .semibold))
+                        if showsAssignmentFeatures || item.dueDate != nil {
+                            taskMetadataRow(for: item)
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        detailFieldLabel("Assignee")
+                        if canAssignTasks {
+                            Picker("Assignee", selection: $taskDraftAssignedUserID) {
+                                Text("Unassigned").tag("")
+                                ForEach(assignableMembers) { member in
+                                    Text(displayName(for: member)).tag(member.id)
+                                }
+                            }
+                            .pickerStyle(.menu)
                         } else {
-                            Text("Checked on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
-                                .font(.caption)
+                            Text(assignmentLabel(for: item) ?? "Unassigned")
                                 .foregroundStyle(.secondary)
                         }
                     }
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        detailFieldLabel("Due date")
+                        if canManageChecklistDueDate {
+                            Toggle("Set due date", isOn: $taskDraftHasDueDate)
+                            if taskDraftHasDueDate {
+                                DatePicker("Task Due", selection: $taskDraftDueDate, displayedComponents: [.date, .hourAndMinute])
+                                    .labelsHidden()
+                            }
+                        } else {
+                            Text(item.dueDate.map { dueDateLabel(for: $0) } ?? "No due date")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        detailFieldLabel("Comment")
+                        TextEditor(text: taskCommentBinding)
+                            .font(.body)
+                            .frame(minHeight: 180)
+                            .padding(8)
+                            .background(Color.white.opacity(0.04))
+                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .stroke(Color.white.opacity(0.06), lineWidth: 1)
+                            )
+                        if let _ = currentMentionContext(in: taskDraftComment) {
+                            taskCommentMentionSuggestions
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        detailFieldLabel("Subtasks")
+                        if item.subtasks.isEmpty {
+                            Text("No subtasks")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(Array(item.subtasks.indices), id: \.self) { subtaskIndex in
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack(spacing: 10) {
+                                        Button {
+                                            toggleSelectedTaskSubtask(at: subtaskIndex)
+                                        } label: {
+                                            Image(systemName: item.subtasks[subtaskIndex].isDone ? "checkmark.circle.fill" : "checkmark.circle")
+                                                .foregroundStyle(item.subtasks[subtaskIndex].isDone ? Color.green : Color.secondary)
+                                        }
+                                        .buttonStyle(.plain)
+
+                                        if canEditTasks {
+                                            TextField("Subtask", text: selectedTaskSubtaskBinding(for: subtaskIndex))
+                                                .textFieldStyle(.roundedBorder)
+                                        } else {
+                                            Text(item.subtasks[subtaskIndex].text)
+                                        }
+
+                                        if canEditTasks {
+                                            Button(role: .destructive) {
+                                                removeSelectedTaskSubtask(at: subtaskIndex)
+                                            } label: {
+                                                Image(systemName: "trash")
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+                                    }
+
+                                    if item.subtasks[subtaskIndex].isDone,
+                                       let completedAt = item.subtasks[subtaskIndex].completedAt {
+                                        let completedBy = item.subtasks[subtaskIndex].completedBy?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                                        Text(
+                                            completedBy.isEmpty
+                                            ? "Completed on \(completedAt.formatted(date: .abbreviated, time: .shortened))"
+                                            : "Completed by \(completedBy) on \(completedAt.formatted(date: .abbreviated, time: .shortened))"
+                                        )
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
+
+                        if canEditTasks {
+                            HStack {
+                                TextField("Add subtask", text: $newTaskSubtaskTitle)
+                                    .onSubmit {
+                                        addSelectedTaskSubtask()
+                                    }
+                                Button("Add") {
+                                    addSelectedTaskSubtask()
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(newTaskSubtaskTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            }
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        detailFieldLabel("Attachments")
+                        if item.attachments.isEmpty {
+                            Text("No attachments")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(item.attachments) { attachment in
+                                HStack {
+                                    if let url = URL(string: attachment.url.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                                        Link(destination: url) {
+                                            Label(attachment.name, systemImage: attachmentSystemImage(for: attachment.kind))
+                                        }
+                                    } else {
+                                        Label(attachment.name, systemImage: attachmentSystemImage(for: attachment.kind))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if canEditTasks {
+                                        Button(role: .destructive) {
+                                            removeSelectedTaskAttachment(id: attachment.id)
+                                        } label: {
+                                            Image(systemName: "trash")
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                            }
+                        }
+
+                        if canEditTasks {
+                            Button {
+                                pickTaskAttachment()
+                            } label: {
+                                Label("Add Attachment", systemImage: "paperclip")
+                            }
+                            .buttonStyle(.bordered)
+                            if isUploadingTaskAttachment {
+                                ProgressView("Uploading attachment…")
+                            }
+                            if let taskAttachmentError, !taskAttachmentError.isEmpty {
+                                Text(taskAttachmentError)
+                                    .font(.caption)
+                                    .foregroundStyle(.red)
+                            }
+                        }
+                    }
+
+                    if item.isDone, let completedAt = item.completedAt {
+                        VStack(alignment: .leading, spacing: 4) {
+                            detailFieldLabel("Completion")
+                            if let completedBy = item.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines),
+                               !completedBy.isEmpty {
+                                Text("Checked by \(completedBy)")
+                            }
+                            Text("Completed on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if canEditTasks {
+                        HStack {
+                            Spacer()
+                            Button("Save Changes") {
+                                saveSelectedTaskChanges()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(taskDraftTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+                    }
                 }
+                .padding(20)
             }
-            .padding(12)
-            .background(taskCardBackground(for: item))
-            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .background(Color.white.opacity(0.035))
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             .overlay(
-                RoundedRectangle(cornerRadius: 12)
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(Color.white.opacity(0.06), lineWidth: 1)
+            )
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Select a task")
+                    .font(.title3.weight(.semibold))
+                Text("Click a task to view details, add a comment, or mark it complete.")
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .padding(20)
+            .background(Color.white.opacity(0.035))
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
                     .stroke(Color.white.opacity(0.06), lineWidth: 1)
             )
         }
-        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func markCompleteButton(for item: ChecklistItem) -> some View {
+        if item.isDone {
+            Button {
+                toggleItem(itemID: item.id)
+                loadSelectedTaskDraftIfNeeded(for: item.id)
+            } label: {
+                Label("Completed", systemImage: "checkmark.circle.fill")
+                    .font(.subheadline.weight(.semibold))
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.green)
+        } else {
+            Button {
+                toggleItem(itemID: item.id)
+                loadSelectedTaskDraftIfNeeded(for: item.id)
+            } label: {
+                Label("Mark Complete", systemImage: "checkmark.circle")
+                    .font(.subheadline.weight(.semibold))
+            }
+            .buttonStyle(.bordered)
+            .tint(.secondary)
+        }
+    }
+
+    private func detailFieldLabel(_ title: String) -> some View {
+        Text(title.uppercased())
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(.secondary)
+    }
+
+    private var taskCommentBinding: Binding<String> {
+        Binding(
+            get: { taskDraftComment },
+            set: { newValue in
+                taskDraftComment = newValue
+                updateTaskCommentMentionContext(for: newValue)
+            }
+        )
+    }
+
+    @ViewBuilder
+    private var taskCommentMentionSuggestions: some View {
+        let suggestions = mentionSuggestions(for: activeTaskCommentMentionQuery)
+        if !suggestions.isEmpty {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(suggestions.prefix(6)) { member in
+                    Button {
+                        applyMentionToTaskDraft(member)
+                    } label: {
+                        Text(displayName(for: member))
+                            .foregroundStyle(.primary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                    }
+                    .buttonStyle(.plain)
+                    if member.id != suggestions.prefix(6).last?.id {
+                        Divider()
+                    }
+                }
+            }
+            .background(Color.white.opacity(0.05))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color.white.opacity(0.06), lineWidth: 1)
+            )
+        }
     }
 
     private func textValue(_ value: String?) -> String {
@@ -5554,6 +7031,35 @@ private struct MacChecklistDetailView: View {
         )
     }
 
+    private var checklistAssignmentSelection: Binding<String> {
+        Binding(
+            get: { checklist.assignedUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" },
+            set: { newValue in
+                let trimmedID = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmedID.isEmpty,
+                      let member = assignableMembers.first(where: { $0.id == trimmedID }) else {
+                    checklist.assignedUserID = nil
+                    checklist.assignedUserName = nil
+                    checklist.assignedUserEmail = nil
+                    return
+                }
+                checklist.assignedUserID = member.id
+                checklist.assignedUserName = displayName(for: member)
+                checklist.assignedUserEmail = member.email.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        )
+    }
+
+    private var checklistAssignmentLabel: String {
+        let assignedName = checklist.assignedUserName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !assignedName.isEmpty { return assignedName }
+        let assignedEmail = checklist.assignedUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !assignedEmail.isEmpty {
+            return assignedEmail.components(separatedBy: "@").first ?? assignedEmail
+        }
+        return "Unassigned"
+    }
+
     private func itemHasDueDateBinding(for index: Int) -> Binding<Bool> {
         Binding(
             get: {
@@ -5584,6 +7090,27 @@ private struct MacChecklistDetailView: View {
         var item = ChecklistItem(text: text, notes: notes, dueDate: dueDate)
         applyAssignment(selectedUserID: assignedUserID, to: &item)
         return item
+    }
+
+    private func addQuickTask() {
+        let trimmed = newItemText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let trimmedNotes = newItemNotes.trimmingCharacters(in: .whitespacesAndNewlines)
+        let newItem = makeChecklistItem(
+            text: trimmed,
+            notes: trimmedNotes,
+            assignedUserID: newItemAssignedUserID,
+            dueDate: newItemHasDueDate ? newItemDueDate : nil
+        )
+        checklist.items.append(newItem)
+        updateChecklistCompletionMetadata()
+        store.saveChecklist(checklist)
+        selectTask(id: newItem.id)
+        newItemText = ""
+        newItemNotes = ""
+        newItemAssignedUserID = ""
+        newItemHasDueDate = false
+        newItemDueDate = Date()
     }
 
     private func applyAssignment(selectedUserID: String, to index: Int) {
@@ -5653,7 +7180,6 @@ private struct MacChecklistDetailView: View {
 
     private func taskCardBackground(for item: ChecklistItem) -> Color {
         if item.isDone { return Color.green.opacity(0.08) }
-        if showsAssignmentFeatures && isAssignedToCurrentUser(item) { return Color.yellow.opacity(0.16) }
         return Color.white.opacity(0.04)
     }
 
@@ -5698,6 +7224,15 @@ private struct MacChecklistDetailView: View {
         guard let idx = checklist.items.firstIndex(where: { $0.id == itemID }) else { return }
         checklist.items[idx].isDone.toggle()
         if checklist.items[idx].isDone {
+            checklist.items[idx].subtasks = checklist.items[idx].subtasks.map { subtask in
+                var updated = subtask
+                updated.isDone = true
+                updated.completedAt = updated.completedAt ?? Date()
+                updated.completedBy = (updated.completedBy ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? completionUserLabel
+                    : updated.completedBy
+                return updated
+            }
             checklist.items[idx].completedAt = Date()
             checklist.items[idx].completedBy = completionUserLabel
         } else {
@@ -5706,6 +7241,7 @@ private struct MacChecklistDetailView: View {
         }
         updateChecklistCompletionMetadata()
         store.saveChecklist(checklist)
+        ensureSelectedTask()
     }
 
     private func updateChecklistCompletionMetadata() {
@@ -5748,6 +7284,264 @@ private struct MacChecklistDetailView: View {
         newItemHasDueDate = false
         newItemDueDate = Date()
         isEditing = false
+        ensureSelectedTask()
+    }
+
+    private func ensureSelectedTask() {
+        if let selectedTaskID,
+           checklist.items.contains(where: { $0.id == selectedTaskID }) {
+            loadSelectedTaskDraftIfNeeded(for: selectedTaskID)
+            return
+        }
+
+        if let firstOpen = checklist.items.first(where: { !$0.isDone }) {
+            selectTask(id: firstOpen.id)
+        } else if let first = checklist.items.first {
+            selectTask(id: first.id)
+        } else {
+            selectedTaskID = nil
+        }
+    }
+
+    private func selectTask(id: String) {
+        selectedTaskID = id
+        loadSelectedTaskDraftIfNeeded(for: id, force: true)
+    }
+
+    private func loadSelectedTaskDraftIfNeeded(for id: String, force: Bool = false) {
+        guard force || selectedTaskID == id,
+              let index = checklist.items.firstIndex(where: { $0.id == id }) else { return }
+        let item = checklist.items[index]
+        taskDraftTitle = item.text
+        taskDraftComment = item.notes
+        taskDraftAssignedUserID = item.assignedUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        taskDraftHasDueDate = item.dueDate != nil
+        taskDraftDueDate = item.dueDate ?? checklist.dueDate ?? Date()
+    }
+
+    private func saveSelectedTaskChanges() {
+        guard let index = selectedTaskIndex, checklist.items.indices.contains(index) else { return }
+        checklist.items[index].text = taskDraftTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        checklist.items[index].notes = taskDraftComment.trimmingCharacters(in: .whitespacesAndNewlines)
+        applyAssignment(selectedUserID: taskDraftAssignedUserID, to: index)
+        checklist.items[index].dueDate = taskDraftHasDueDate ? taskDraftDueDate : nil
+        updateChecklistCompletionMetadata()
+        store.saveChecklist(checklist)
+        loadSelectedTaskDraftIfNeeded(for: checklist.items[index].id, force: true)
+    }
+
+    private func persistSelectedTaskMutation(_ mutate: (inout ChecklistItem) -> Void) {
+        guard let index = selectedTaskIndex, checklist.items.indices.contains(index) else { return }
+        checklist.items[index].text = taskDraftTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        checklist.items[index].notes = taskDraftComment.trimmingCharacters(in: .whitespacesAndNewlines)
+        applyAssignment(selectedUserID: taskDraftAssignedUserID, to: index)
+        checklist.items[index].dueDate = taskDraftHasDueDate ? taskDraftDueDate : nil
+        mutate(&checklist.items[index])
+        updateChecklistCompletionMetadata()
+        store.saveChecklist(checklist)
+        loadSelectedTaskDraftIfNeeded(for: checklist.items[index].id, force: true)
+    }
+
+    private func selectedTaskSubtaskBinding(for index: Int) -> Binding<String> {
+        Binding(
+            get: {
+                guard let selectedTaskIndex, checklist.items[selectedTaskIndex].subtasks.indices.contains(index) else { return "" }
+                return checklist.items[selectedTaskIndex].subtasks[index].text
+            },
+            set: { newValue in
+                persistSelectedTaskMutation { item in
+                    guard item.subtasks.indices.contains(index) else { return }
+                    item.subtasks[index].text = newValue
+                }
+            }
+        )
+    }
+
+    private func addSelectedTaskSubtask() {
+        let trimmed = newTaskSubtaskTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        persistSelectedTaskMutation { item in
+            item.subtasks.append(ChecklistSubtask(text: trimmed))
+        }
+        newTaskSubtaskTitle = ""
+    }
+
+    private func toggleSelectedTaskSubtask(at index: Int) {
+        persistSelectedTaskMutation { item in
+            guard item.subtasks.indices.contains(index) else { return }
+            item.subtasks[index].isDone.toggle()
+            if item.subtasks[index].isDone {
+                item.subtasks[index].completedAt = Date()
+                item.subtasks[index].completedBy = completionUserLabel
+            } else {
+                item.subtasks[index].completedAt = nil
+                item.subtasks[index].completedBy = nil
+            }
+        }
+    }
+
+    private func removeSelectedTaskSubtask(at index: Int) {
+        persistSelectedTaskMutation { item in
+            guard item.subtasks.indices.contains(index) else { return }
+            item.subtasks.remove(at: index)
+        }
+    }
+
+    private func removeSelectedTaskAttachment(id: String) {
+        persistSelectedTaskMutation { item in
+            item.attachments.removeAll { $0.id == id }
+        }
+    }
+
+    private func attachmentSystemImage(for kind: TicketAttachmentKind) -> String {
+        switch kind {
+        case .image: return "photo"
+        case .video: return "video"
+        case .document: return "paperclip"
+        }
+    }
+
+    @MainActor
+    private func pickTaskAttachment() {
+        taskAttachmentError = nil
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = [.item]
+
+        let handleSelection: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else { return }
+            uploadTaskAttachment(from: url, kind: inferredTaskAttachmentKind(for: url))
+        }
+
+        if let keyWindow = NSApp.keyWindow {
+            panel.beginSheetModal(for: keyWindow, completionHandler: handleSelection)
+        } else {
+            handleSelection(panel.runModal())
+        }
+    }
+
+    private func uploadTaskAttachment(from localURL: URL, kind: TicketAttachmentKind) {
+        taskAttachmentError = nil
+        isUploadingTaskAttachment = true
+        let safeName = localURL.lastPathComponent.replacingOccurrences(of: " ", with: "_")
+        let path = "checklistTaskAttachments/\(checklist.id)/\(selectedTaskID ?? UUID().uuidString)/\(UUID().uuidString)-\(safeName)"
+        let storageRef = Storage.storage().reference().child(path)
+        let metadata = StorageMetadata()
+        metadata.contentType = taskAttachmentContentType(for: localURL, kind: kind)
+        let didAccess = localURL.startAccessingSecurityScopedResource()
+
+        storageRef.putFile(from: localURL, metadata: metadata) { _, error in
+            if didAccess {
+                localURL.stopAccessingSecurityScopedResource()
+            }
+
+            if let error {
+                DispatchQueue.main.async {
+                    isUploadingTaskAttachment = false
+                    taskAttachmentError = "Attachment upload failed: \(error.localizedDescription)"
+                }
+                return
+            }
+
+            storageRef.downloadURL { url, downloadError in
+                DispatchQueue.main.async {
+                    isUploadingTaskAttachment = false
+                    if let downloadError {
+                        taskAttachmentError = "Attachment upload failed: \(downloadError.localizedDescription)"
+                        return
+                    }
+                    guard let urlString = url?.absoluteString else { return }
+                    persistSelectedTaskMutation { item in
+                        item.attachments.append(
+                            ChecklistTaskAttachment(url: urlString, name: safeName, kind: kind)
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func inferredTaskAttachmentKind(for url: URL) -> TicketAttachmentKind {
+        let ext = url.pathExtension.lowercased()
+        if ["jpg", "jpeg", "png", "heic", "gif", "webp"].contains(ext) {
+            return .image
+        }
+        if ["mov", "mp4", "m4v", "avi"].contains(ext) {
+            return .video
+        }
+        return .document
+    }
+
+    private func taskAttachmentContentType(for url: URL, kind: TicketAttachmentKind) -> String {
+        if let type = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType {
+            return type
+        }
+        switch kind {
+        case .image: return "image/jpeg"
+        case .video: return "video/quicktime"
+        case .document: return "application/octet-stream"
+        }
+    }
+
+    private func reorderTask(draggedID: String, before targetID: String) {
+        guard let sourceIndex = checklist.items.firstIndex(where: { $0.id == draggedID }),
+              let destinationIndex = checklist.items.firstIndex(where: { $0.id == targetID }),
+              sourceIndex != destinationIndex else { return }
+        let moved = checklist.items.remove(at: sourceIndex)
+        checklist.items.insert(moved, at: destinationIndex)
+        updateChecklistCompletionMetadata()
+        store.saveChecklist(checklist)
+        ensureSelectedTask()
+    }
+
+    private func mentionSuggestions(for query: String) -> [UserProfile] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return store.teamMembers
+            .filter { member in
+                let email = member.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if q.isEmpty { return true }
+                let name = displayName(for: member).lowercased()
+                let localPart = email.split(separator: "@").first.map(String.init) ?? ""
+                return name.contains(q) || email.contains(q) || localPart.contains(q)
+            }
+            .sorted { displayName(for: $0).localizedCaseInsensitiveCompare(displayName(for: $1)) == .orderedAscending }
+    }
+
+    private func currentMentionContext(in text: String) -> (range: Range<String.Index>, query: String)? {
+        guard let atIndex = text.lastIndex(of: "@") else { return nil }
+        if atIndex != text.startIndex {
+            let previous = text[text.index(before: atIndex)]
+            if !previous.isWhitespace { return nil }
+        }
+        let queryStart = text.index(after: atIndex)
+        let queryPart = text[queryStart...]
+        if queryPart.contains(where: { $0.isWhitespace }) { return nil }
+        return (atIndex..<text.endIndex, String(queryPart))
+    }
+
+    private func updateTaskCommentMentionContext(for text: String) {
+        if let context = currentMentionContext(in: text) {
+            activeTaskCommentMentionQuery = context.query
+        } else {
+            activeTaskCommentMentionQuery = ""
+        }
+    }
+
+    private func mentionToken(for member: UserProfile) -> String {
+        let name = displayName(for: member).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !name.isEmpty {
+            return name.lowercased().replacingOccurrences(of: " ", with: ".")
+        }
+        let email = member.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return email.split(separator: "@").first.map(String.init) ?? "user"
+    }
+
+    private func applyMentionToTaskDraft(_ member: UserProfile) {
+        guard let context = currentMentionContext(in: taskDraftComment) else { return }
+        taskDraftComment.replaceSubrange(context.range, with: "@\(mentionToken(for: member)) ")
+        updateTaskCommentMentionContext(for: taskDraftComment)
     }
 
     private var completionUserLabel: String {

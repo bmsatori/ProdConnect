@@ -8,6 +8,7 @@ import FirebaseStorage
 import FirebaseAuth
 import StoreKit
 import PhotosUI
+import UniformTypeIdentifiers
 import OneSignalFramework
 import WebKit
 import SafariServices
@@ -7037,6 +7038,15 @@ struct TrainingListView: View {
         
         return lessons
     }
+    private var groupedLessons: [(group: String, items: [TrainingLesson])] {
+        let grouped = Dictionary(grouping: filteredLessons) { trainingGroupTitle(for: $0) }
+        return grouped.keys.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }.map { key in
+            let items = (grouped[key] ?? []).sorted {
+                $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+            }
+            return (group: key, items: items)
+        }
+    }
 
     private var visibleLessons: [TrainingLesson] {
         guard let currentUser = store.user else { return [] }
@@ -7087,28 +7097,32 @@ struct TrainingListView: View {
                 .padding(.horizontal)
 
                 List {
-                    ForEach(filteredLessons) { lesson in
-                        NavigationLink(destination: TrainingDetailView(lesson: lesson).environmentObject(store)) {
-                            HStack {
-                                VStack(alignment: .leading) {
-                                    Text(lesson.title).font(.headline)
-                                    Text(lesson.category).font(.caption).foregroundColor(.secondary)
-                                    if let label = assignmentLabel(for: lesson) {
-                                        Text(label).font(.caption2).foregroundColor(.blue)
+                    ForEach(groupedLessons, id: \.group) { section in
+                        Section(section.group) {
+                            ForEach(section.items) { lesson in
+                                NavigationLink(destination: TrainingDetailView(lesson: lesson).environmentObject(store)) {
+                                    HStack {
+                                        VStack(alignment: .leading) {
+                                            Text(lesson.title).font(.headline)
+                                            Text(lesson.category).font(.caption).foregroundColor(.secondary)
+                                            if let label = assignmentLabel(for: lesson) {
+                                                Text(label).font(.caption2).foregroundColor(.blue)
+                                            }
+                                        }
+                                        Spacer()
+                                        if lesson.isCompleted {
+                                            Image(systemName: "checkmark.circle.fill")
+                                                .foregroundColor(.green)
+                                        }
                                     }
                                 }
-                                Spacer()
-                                if lesson.isCompleted {
-                                    Image(systemName: "checkmark.circle.fill")
-                                        .foregroundColor(.green)
+                            }
+                            .onDelete { idx in
+                                guard canEdit else { return }
+                                for i in idx {
+                                    store.deleteLesson(section.items[i])
                                 }
                             }
-                        }
-                    }
-                    .onDelete { idx in
-                        guard canEdit else { return }
-                        for i in idx {
-                            store.deleteLesson(filteredLessons[i])
                         }
                     }
                 }
@@ -7142,6 +7156,11 @@ struct TrainingListView: View {
             return "https://img.youtube.com/vi/\(videoID)/hqdefault.jpg"
         }
         return ""
+    }
+
+    private func trainingGroupTitle(for lesson: TrainingLesson) -> String {
+        let trimmed = lesson.groupName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "Ungrouped" : trimmed
     }
 }
 
@@ -7293,6 +7312,7 @@ struct AddTrainingView: View {
     @State private var category = "Audio" // Default selection
     @State private var videoSource: String = "local" // "local" or "youtube"
     @State private var youtubeLink = ""
+    @State private var groupName = ""
     @State private var selectedVideoItem: PhotosPickerItem?
     @State private var localVideoURL: URL?
     @State private var isUploading = false
@@ -7351,6 +7371,7 @@ struct AddTrainingView: View {
                         ForEach(categories, id: \.self) { Text($0) }
                     }
                     .pickerStyle(MenuPickerStyle())
+                    TextField("Group", text: $groupName)
 
                     if canAssignLesson {
                         Picker("Assign To", selection: $selectedAssignedUserID) {
@@ -7419,6 +7440,7 @@ struct AddTrainingView: View {
                                         let lesson = TrainingLesson(
                                             title: title.isEmpty ? "Untitled" : title,
                                             category: category,
+                                            groupName: normalizedTrainingGroupName(groupName),
                                             teamCode: store.teamCode ?? "",
                                             durationSeconds: 0,
                                             urlString: urlString,
@@ -7440,6 +7462,7 @@ struct AddTrainingView: View {
                         let lesson = TrainingLesson(
                             title: title.isEmpty ? "Untitled" : title,
                             category: category,
+                            groupName: normalizedTrainingGroupName(groupName),
                             teamCode: store.teamCode ?? "",
                             durationSeconds: 0,
                             urlString: normalizedYouTubeURL,
@@ -7463,6 +7486,11 @@ struct AddTrainingView: View {
     }
     // ...existing code...
 
+}
+
+private func normalizedTrainingGroupName(_ value: String) -> String? {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
 }
 
 // MARK: - Gear Detail View
@@ -9545,19 +9573,14 @@ struct ChecklistsListView: View {
     @State private var collapsedGroups: Set<String> = []
 
     var canEdit: Bool { store.canEditChecklists }
+    private var orderedGroupNames: [String] {
+        store.availableChecklistGroups
+    }
     private var groupedChecklists: [(group: String, items: [ChecklistTemplate])] {
         let grouped = Dictionary(grouping: store.checklists) { checklistGroupTitle(for: $0) }
-        let allGroups = Set(grouped.keys).union(store.availableChecklistGroups.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })
-        return allGroups.sorted { lhs, rhs in
-            if lhs == "Ungrouped" { return false }
-            if rhs == "Ungrouped" { return true }
-            return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
-        }
-        .map { key in
+        return orderedGroupNames.map { key in
             let items = (grouped[key] ?? []).sorted { lhs, rhs in
-                if isChecklistCompleted(lhs) != isChecklistCompleted(rhs) {
-                    return !isChecklistCompleted(lhs)
-                }
+                if lhs.position != rhs.position { return lhs.position < rhs.position }
                 return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
             }
             return (group: key, items: items)
@@ -9594,6 +9617,10 @@ struct ChecklistsListView: View {
                                 }
                             }
                             .buttonStyle(.plain)
+                            .draggable(store.canPersistChecklistGroupOrder ? dragTokenForGroup(section.group) : "")
+                            .dropDestination(for: String.self) { items, _ in
+                                handleDroppedGroupToken(items.first, before: section.group)
+                            }
                         }
                     }
                 }
@@ -9641,9 +9668,33 @@ struct ChecklistsListView: View {
 
     @ViewBuilder
     private func checklistRow(_ template: ChecklistTemplate) -> some View {
-        NavigationLink { ChecklistRunView(template: template) } label: {
+        HStack(alignment: .top, spacing: 10) {
+            Button {
+                toggleChecklistCompletion(template)
+            } label: {
+                Image(systemName: isChecklistCompleted(template) ? "checkmark.circle.fill" : "checkmark.circle")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(isChecklistCompleted(template) ? .green : .secondary)
+                    .padding(.top, 2)
+            }
+            .buttonStyle(.plain)
+
+            NavigationLink { ChecklistRunView(template: template) } label: {
             VStack(alignment: .leading, spacing: 4) {
-                Text(template.title).font(.headline)
+                HStack(spacing: 8) {
+                    Text(template.title)
+                        .font(.headline)
+                    Spacer(minLength: 8)
+                    Text(checklistProgressLabel(for: template))
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(isChecklistCompleted(template) ? .green : .blue)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background((isChecklistCompleted(template) ? Color.green : Color.blue).opacity(0.12))
+                        .clipShape(Capsule())
+                }
+                ProgressView(value: checklistCompletionFraction(for: template))
+                    .tint(isChecklistCompleted(template) ? .green : .blue)
                 if let dueDate = template.dueDate {
                     Text("Due: \(dueDate.formatted(date: .abbreviated, time: .shortened))")
                         .font(.caption2)
@@ -9669,6 +9720,7 @@ struct ChecklistsListView: View {
                 }
             }
         }
+        }
         .contextMenu {
             if canEdit {
                 Button("Edit") {
@@ -9692,10 +9744,89 @@ struct ChecklistsListView: View {
                 .tint(.blue)
             }
         }
+        .draggable(dragTokenForChecklist(template))
+        .dropDestination(for: String.self) { items, _ in
+            handleDroppedChecklistToken(items.first, before: template)
+        }
     }
 
     private func isChecklistCompleted(_ template: ChecklistTemplate) -> Bool {
         !template.items.isEmpty && template.items.allSatisfy(\.isDone)
+    }
+
+    private func checklistCompletionFraction(for template: ChecklistTemplate) -> Double {
+        guard !template.items.isEmpty else { return 0 }
+        let completedCount = template.items.filter(\.isDone).count
+        return Double(completedCount) / Double(template.items.count)
+    }
+
+    private func checklistProgressLabel(for template: ChecklistTemplate) -> String {
+        "\(Int((checklistCompletionFraction(for: template) * 100).rounded()))%"
+    }
+
+    private func toggleChecklistCompletion(_ template: ChecklistTemplate) {
+        guard !template.items.isEmpty else { return }
+        var updated = template
+        let shouldComplete = !isChecklistCompleted(template)
+        updated.items = updated.items.map { item in
+            var next = item
+            next.isDone = shouldComplete
+            next.completedAt = shouldComplete ? Date() : nil
+            next.completedBy = shouldComplete ? completionUserLabel() : nil
+            return next
+        }
+        updated.completedAt = shouldComplete ? Date() : nil
+        updated.completedBy = shouldComplete ? completionUserLabel() : nil
+        store.saveChecklist(updated)
+    }
+
+    private func completionUserLabel() -> String {
+        let displayName = store.user?.displayName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !displayName.isEmpty { return displayName }
+        return store.user?.email ?? Auth.auth().currentUser?.email ?? "Unknown User"
+    }
+
+    private func dragTokenForChecklist(_ checklist: ChecklistTemplate) -> String {
+        "checklist:\(checklist.id)"
+    }
+
+    private func dragTokenForGroup(_ group: String) -> String {
+        "group:\(group)"
+    }
+
+    private func handleDroppedChecklistToken(_ token: String?, before target: ChecklistTemplate) -> Bool {
+        guard let token, token.hasPrefix("checklist:") else { return false }
+        let draggedID = String(token.dropFirst("checklist:".count))
+        reorderChecklist(draggedID: draggedID, before: target)
+        return true
+    }
+
+    private func handleDroppedGroupToken(_ token: String?, before targetGroup: String) -> Bool {
+        guard store.canPersistChecklistGroupOrder else { return false }
+        guard let token, token.hasPrefix("group:") else { return false }
+        let draggedGroup = String(token.dropFirst("group:".count))
+        var ordered = orderedGroupNames
+        guard let sourceIndex = ordered.firstIndex(of: draggedGroup),
+              let destinationIndex = ordered.firstIndex(of: targetGroup),
+              sourceIndex != destinationIndex else { return false }
+        let moved = ordered.remove(at: sourceIndex)
+        ordered.insert(moved, at: destinationIndex)
+        store.reorderChecklistGroups(ordered)
+        return true
+    }
+
+    private func reorderChecklist(draggedID: String, before target: ChecklistTemplate) {
+        var ordered = store.checklists.sorted {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+        }
+        guard let sourceIndex = ordered.firstIndex(where: { $0.id == draggedID }),
+              let destinationIndex = ordered.firstIndex(where: { $0.id == target.id }),
+              sourceIndex != destinationIndex else { return }
+        var moved = ordered.remove(at: sourceIndex)
+        moved.groupName = target.groupName
+        ordered.insert(moved, at: destinationIndex)
+        store.reorderChecklists(ordered)
     }
 
     private func duplicateChecklist(_ template: ChecklistTemplate) {
@@ -9743,6 +9874,10 @@ struct ChecklistRunView: View {
         case newItem
     }
 
+    private struct SelectedTask: Identifiable {
+        let id: String
+    }
+
     @EnvironmentObject var store: ProdConnectStore
     @State var template: ChecklistTemplate
     @Environment(\.dismiss) private var dismiss
@@ -9756,12 +9891,14 @@ struct ChecklistRunView: View {
     @State private var newChecklistItemAssignedUserID = ""
     @State private var newChecklistItemHasDueDate = false
     @State private var newChecklistItemDueDate = Date()
+    @State private var selectedTask: SelectedTask?
     @State private var activeMentionTarget: MentionTarget? = nil
     @State private var activeMentionQuery: String = ""
     var canEdit: Bool { store.canEditChecklists }
     private var canAssignTasks: Bool { store.canAssignChecklistTasks }
     private var showsAssignmentFeatures: Bool { store.teamHasChecklistTaskAssignmentFeatures }
     private var canManageChecklistDueDate: Bool { store.user?.isAdmin == true || store.user?.isOwner == true }
+    private var progressTint: Color { progress >= 1 ? .green : .blue }
     private var assignableMembers: [UserProfile] {
         store.teamMembers.sorted {
             displayName(for: $0).localizedCaseInsensitiveCompare(displayName(for: $1)) == .orderedAscending
@@ -9805,8 +9942,36 @@ struct ChecklistRunView: View {
                         .foregroundColor(.secondary)
                 }
             }
+            Section(header: Text("Assignee")) {
+                if canEdit && isEditingChecklist && canAssignTasks {
+                    Picker("Assignee", selection: checklistAssignmentSelection) {
+                        Text("Unassigned").tag("")
+                        ForEach(assignableMembers) { member in
+                            Text(displayName(for: member)).tag(member.id)
+                        }
+                    }
+                } else {
+                    Text(checklistAssignmentLabel)
+                        .foregroundColor(.secondary)
+                }
+            }
             Section(header: Text("Progress")) {
-                ProgressView(value: progress)
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text("\(Int((progress * 100).rounded()))% complete")
+                            .font(.headline)
+                            .foregroundColor(progressTint)
+                        Spacer()
+                        Text("\(template.items.filter(\.isDone).count)/\(template.items.count)")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundColor(.secondary)
+                    }
+
+                    ProgressView(value: progress)
+                        .tint(progressTint)
+                        .scaleEffect(x: 1, y: 1.8, anchor: .center)
+                        .padding(.vertical, 4)
+                }
             }
             Section(header: Text("Due Date")) {
                 if canEdit && isEditingChecklist && canManageChecklistDueDate {
@@ -9850,7 +10015,7 @@ struct ChecklistRunView: View {
                     }
                 }
             }
-            if canEdit && isEditingChecklist {
+            if canEdit {
                 Section(header: Text("Add Task")) {
                     TextField("New checklist item", text: Binding(
                         get: { newChecklistItemText },
@@ -9858,6 +10023,9 @@ struct ChecklistRunView: View {
                             newChecklistItemText = newValue
                         }
                     ))
+                    .onSubmit {
+                        addDraftChecklistTask()
+                    }
                     if canAssignTasks {
                         Picker("Assigned To", selection: $newChecklistItemAssignedUserID) {
                             Text("Unassigned").tag("")
@@ -9875,33 +10043,19 @@ struct ChecklistRunView: View {
                     HStack {
                         Spacer()
                         Button("Add") {
-                            let trimmed = newChecklistItemText.trimmingCharacters(in: .whitespacesAndNewlines)
-                            guard !trimmed.isEmpty else { return }
-                            let trimmedNotes = newChecklistItemNotes.trimmingCharacters(in: .whitespacesAndNewlines)
-                            template.items.append(
-                                makeChecklistItem(
-                                    text: trimmed,
-                                    notes: trimmedNotes,
-                                    assignedUserID: newChecklistItemAssignedUserID,
-                                    dueDate: newChecklistItemHasDueDate ? newChecklistItemDueDate : nil
-                                )
-                            )
-                            newChecklistItemText = ""
-                            newChecklistItemNotes = ""
-                            newChecklistItemAssignedUserID = ""
-                            newChecklistItemHasDueDate = false
-                            newChecklistItemDueDate = Date()
-                            persistChecklistDraft()
+                            addDraftChecklistTask()
                         }
                         .disabled(newChecklistItemText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }
-                Section {
+                if isEditingChecklist {
+                    Section {
                     Text(canManageChecklistDueDate
                          ? "Only paid subscriptions include task assignment. Only admins and owners can assign users."
                          : "Only owners and admins can set the overall checklist due date. Only paid subscriptions include task assignment.")
                         .font(.caption)
                         .foregroundColor(.secondary)
+                    }
                 }
             }
             Section {
@@ -9927,6 +10081,21 @@ struct ChecklistRunView: View {
                 }
             }
         }
+        .sheet(item: $selectedTask) { selection in
+            NavigationStack {
+                ChecklistTaskDetailView(
+                    template: $template,
+                    itemID: selection.id,
+                    canEdit: canEdit,
+                    canAssignTasks: canAssignTasks,
+                    showsAssignmentFeatures: showsAssignmentFeatures,
+                    canManageChecklistDueDate: canManageChecklistDueDate,
+                    assignableMembers: assignableMembers,
+                    displayName: displayName(for:),
+                    onSave: { persistChecklistDraft() }
+                )
+            }
+        }
         .onAppear {
             // Ensure the system-provided back affordance is hidden and any left items removed
             // Unconditional diagnostic to ensure we see a log entry when this view appears
@@ -9948,6 +10117,7 @@ struct ChecklistRunView: View {
             newChecklistItemHasDueDate = false
             newChecklistItemDueDate = Date()
             draftGroupName = template.groupName.trimmingCharacters(in: .whitespacesAndNewlines)
+            selectedTask = nil
             activeMentionTarget = nil
             activeMentionQuery = ""
         }
@@ -10000,36 +10170,18 @@ struct ChecklistRunView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .top, spacing: 10) {
                 Button(action: { toggleItem(itemID: item.id) }) {
-                    Image(systemName: item.isDone ? "checkmark.circle.fill" : "circle")
+                    Image(systemName: item.isDone ? "checkmark.circle.fill" : "checkmark.circle")
                         .foregroundColor(item.isDone ? .green : .secondary)
                 }
                 .buttonStyle(.plain)
-                .disabled(!canEdit)
 
-                VStack(alignment: .leading, spacing: 8) {
-                    if canEdit && isEditingChecklist {
-                        TextField("Checklist item", text: itemTextBinding(for: item.id))
-                    } else {
+                Button {
+                    selectedTask = SelectedTask(id: item.id)
+                } label: {
+                    VStack(alignment: .leading, spacing: 8) {
                         Text(displayChecklistText(item.text))
                             .font(.body.weight(.medium))
-                    }
-
-                    if canEdit && isEditingChecklist {
-                        if canAssignTasks {
-                            Picker("Assigned To", selection: assignmentSelection(for: item.id)) {
-                                Text("Unassigned").tag("")
-                                ForEach(assignableMembers) { member in
-                                    Text(displayName(for: member)).tag(member.id)
-                                }
-                            }
-                        }
-                        Toggle("Set task due date", isOn: itemHasDueDateBinding(for: item.id))
-                        if itemDueDateExists(item.id) {
-                            DatePicker("Task Due", selection: itemDueDateBinding(for: item.id), displayedComponents: [.date, .hourAndMinute])
-                        }
-                        TextField("Notes (optional)", text: itemNotesBinding(for: item.id), axis: .vertical)
-                            .lineLimit(2...4)
-                    } else {
+                            .foregroundColor(.primary)
                         let trimmedNotes = item.notes.trimmingCharacters(in: .whitespacesAndNewlines)
                         if !trimmedNotes.isEmpty {
                             Text(trimmedNotes)
@@ -10038,23 +10190,25 @@ struct ChecklistRunView: View {
                         }
                     }
 
-                    if showsAssignmentFeatures {
-                        taskMetadataRow(item)
-                    }
+                        if showsAssignmentFeatures {
+                            taskMetadataRow(item)
+                        }
 
-                    if item.isDone, let completedAt = item.completedAt {
-                        let by = item.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if let by, !by.isEmpty {
-                            Text("Checked by \(by) on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                        } else {
-                            Text("Checked on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
+                        if item.isDone, let completedAt = item.completedAt {
+                            let by = item.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if let by, !by.isEmpty {
+                                Text("Checked by \(by) on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            } else {
+                                Text("Checked on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
                         }
                     }
                 }
+                .buttonStyle(.plain)
 
                 if canEdit && isEditingChecklist {
                     Button(role: .destructive) {
@@ -10075,12 +10229,25 @@ struct ChecklistRunView: View {
         )
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
+        .draggable(dragTokenForTask(item))
+        .dropDestination(for: String.self) { items, _ in
+            handleDroppedTaskToken(items.first, before: item)
+        }
     }
 
     private func toggleItem(itemID: String) {
         guard let idx = template.items.firstIndex(where: { $0.id == itemID }) else { return }
         template.items[idx].isDone.toggle()
         if template.items[idx].isDone {
+            template.items[idx].subtasks = template.items[idx].subtasks.map { subtask in
+                var updated = subtask
+                updated.isDone = true
+                updated.completedAt = updated.completedAt ?? Date()
+                updated.completedBy = (updated.completedBy ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? completionUserLabel
+                    : updated.completedBy
+                return updated
+            }
             template.items[idx].completedAt = Date()
             template.items[idx].completedBy = completionUserLabel
         } else {
@@ -10121,6 +10288,26 @@ struct ChecklistRunView: View {
         persistChecklistDraft()
     }
 
+    private func dragTokenForTask(_ item: ChecklistItem) -> String {
+        "task:\(item.id)"
+    }
+
+    private func handleDroppedTaskToken(_ token: String?, before target: ChecklistItem) -> Bool {
+        guard let token, token.hasPrefix("task:") else { return false }
+        let draggedID = String(token.dropFirst("task:".count))
+        reorderTask(draggedID: draggedID, before: target.id)
+        return true
+    }
+
+    private func reorderTask(draggedID: String, before targetID: String) {
+        guard let sourceIndex = template.items.firstIndex(where: { $0.id == draggedID }),
+              let destinationIndex = template.items.firstIndex(where: { $0.id == targetID }),
+              sourceIndex != destinationIndex else { return }
+        let moved = template.items.remove(at: sourceIndex)
+        template.items.insert(moved, at: destinationIndex)
+        persistChecklistDraft()
+    }
+
     var progress: Double {
         guard !template.items.isEmpty else { return 0 }
         return Double(template.items.filter { $0.isDone }.count) / Double(template.items.count)
@@ -10142,6 +10329,77 @@ struct ChecklistRunView: View {
                 persistChecklistDraft()
             }
         )
+    }
+
+    private var checklistAssignmentSelection: Binding<String> {
+        Binding(
+            get: { resolvedChecklistAssignmentUserID() },
+            set: { newValue in
+                let trimmedID = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmedID.isEmpty,
+                      let member = assignableMembers.first(where: { $0.id == trimmedID }) else {
+                    template.assignedUserID = nil
+                    template.assignedUserName = nil
+                    template.assignedUserEmail = nil
+                    return
+                }
+                template.assignedUserID = member.id
+                template.assignedUserName = displayName(for: member)
+                template.assignedUserEmail = member.email.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        )
+    }
+
+    private var checklistAssignmentLabel: String {
+        let assignedName = template.assignedUserName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !assignedName.isEmpty { return assignedName }
+        let assignedEmail = template.assignedUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !assignedEmail.isEmpty {
+            return assignedEmail.components(separatedBy: "@").first ?? assignedEmail
+        }
+
+        let inferredTaskNames = Array(NSOrderedSet(array: template.items.compactMap { item in
+            let storedName = item.assignedUserName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !storedName.isEmpty { return storedName }
+            let storedEmail = item.assignedUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !storedEmail.isEmpty {
+                return storedEmail.components(separatedBy: "@").first ?? storedEmail
+            }
+            return nil
+        })) as? [String] ?? []
+        if inferredTaskNames.count == 1 {
+            return inferredTaskNames[0]
+        }
+
+        return "Unassigned"
+    }
+
+    private func resolvedChecklistAssignmentUserID() -> String {
+        let explicitID = template.assignedUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !explicitID.isEmpty {
+            return explicitID
+        }
+
+        let inferredIDs = Array(NSOrderedSet(array: template.items.compactMap { item in
+            let assignedID = item.assignedUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return assignedID.isEmpty ? nil : assignedID
+        })) as? [String] ?? []
+        if inferredIDs.count == 1 {
+            return inferredIDs[0]
+        }
+
+        let inferredEmails = Array(NSOrderedSet(array: template.items.compactMap { item in
+            let assignedEmail = item.assignedUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            return assignedEmail.isEmpty ? nil : assignedEmail
+        })) as? [String] ?? []
+        if inferredEmails.count == 1,
+           let member = assignableMembers.first(where: {
+               $0.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == inferredEmails[0]
+           }) {
+            return member.id
+        }
+
+        return ""
     }
 
     private func itemNotesBinding(for itemID: String) -> Binding<String> {
@@ -10201,6 +10459,26 @@ struct ChecklistRunView: View {
         var item = ChecklistItem(text: text, notes: notes, dueDate: dueDate)
         applyAssignment(selectedUserID: assignedUserID, to: &item)
         return item
+    }
+
+    private func addDraftChecklistTask() {
+        let trimmed = newChecklistItemText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let trimmedNotes = newChecklistItemNotes.trimmingCharacters(in: .whitespacesAndNewlines)
+        let newItem = makeChecklistItem(
+            text: trimmed,
+            notes: trimmedNotes,
+            assignedUserID: newChecklistItemAssignedUserID,
+            dueDate: newChecklistItemHasDueDate ? newChecklistItemDueDate : nil
+        )
+        template.items.append(newItem)
+        newChecklistItemText = ""
+        newChecklistItemNotes = ""
+        newChecklistItemAssignedUserID = ""
+        newChecklistItemHasDueDate = false
+        newChecklistItemDueDate = Date()
+        persistChecklistDraft()
+        selectedTask = SelectedTask(id: newItem.id)
     }
 
     private func applyAssignment(selectedUserID: String, to index: Int) {
@@ -10293,9 +10571,6 @@ struct ChecklistRunView: View {
     private func taskRowBackground(for item: ChecklistItem) -> some ShapeStyle {
         if item.isDone {
             return AnyShapeStyle(Color.green.opacity(0.08))
-        }
-        if showsAssignmentFeatures && isAssignedToCurrentUser(item: item) {
-            return AnyShapeStyle(Color.yellow.opacity(0.16))
         }
         return AnyShapeStyle(Color.white.opacity(0.04))
     }
@@ -10449,6 +10724,681 @@ struct ChecklistRunView: View {
         }
         updateChecklistCompletionMetadata()
         store.saveChecklist(template)
+    }
+}
+
+private struct ChecklistTaskDetailView: View {
+    @Environment(\.dismiss) private var dismiss
+    @Binding var template: ChecklistTemplate
+    @State private var activeMentionQuery = ""
+    @State private var newSubtaskTitle = ""
+    @State private var selectedPhotoItem: PhotosPickerItem?
+    @State private var showingFileImporter = false
+    @State private var isUploadingAttachment = false
+    @State private var attachmentError: String?
+    let itemID: String
+    let canEdit: Bool
+    let canAssignTasks: Bool
+    let showsAssignmentFeatures: Bool
+    let canManageChecklistDueDate: Bool
+    let assignableMembers: [UserProfile]
+    let displayName: (UserProfile) -> String
+    let onSave: () -> Void
+
+    private var itemIndex: Int? {
+        template.items.firstIndex(where: { $0.id == itemID })
+    }
+
+    private var item: ChecklistItem? {
+        guard let itemIndex else { return nil }
+        return template.items[itemIndex]
+    }
+
+    private var progressTint: Color {
+        item?.isDone == true ? .green : .blue
+    }
+
+    var body: some View {
+        Group {
+            if let item {
+                Form {
+                    Section {
+                        Button {
+                            toggleComplete()
+                        } label: {
+                            Label(item.isDone ? "Completed" : "Mark Complete", systemImage: item.isDone ? "checkmark.circle.fill" : "checkmark.circle")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(item.isDone ? .borderedProminent : .bordered)
+                        .tint(item.isDone ? .green : .secondary)
+                    }
+
+                    Section("Task") {
+                        if canEdit {
+                            TextField("Task title", text: itemTextBinding)
+                        } else {
+                            Text(displayChecklistText(item.text))
+                        }
+                    }
+
+                    Section("Comment") {
+                        if canEdit {
+                            VStack(alignment: .leading, spacing: 10) {
+                                TextEditor(text: itemNotesBinding)
+                                    .frame(minHeight: 180)
+                                if let _ = currentMentionContext(in: item?.notes ?? "") {
+                                    mentionSuggestionsList
+                                }
+                            }
+                        } else {
+                            Text(item.notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "No comment" : item.notes)
+                                .foregroundColor(item.notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .secondary : .primary)
+                        }
+                    }
+
+                    Section("Details") {
+                        if canAssignTasks {
+                            Picker("Assignee", selection: assignmentSelection) {
+                                Text("Unassigned").tag("")
+                                ForEach(assignableMembers) { member in
+                                    Text(displayName(member)).tag(member.id)
+                                }
+                            }
+                        } else {
+                            LabeledContent("Assignee", value: assignmentLabel(for: item) ?? "Unassigned")
+                        }
+
+                        if canManageChecklistDueDate {
+                            Toggle("Set due date", isOn: itemHasDueDateBinding)
+                            if itemDueDateExists {
+                                DatePicker("Task Due", selection: itemDueDateBinding, displayedComponents: [.date, .hourAndMinute])
+                            }
+                        } else {
+                            LabeledContent("Due date", value: item.dueDate.map { dueDateLabel(for: $0) } ?? "No due date")
+                        }
+                    }
+
+                    Section("Subtasks") {
+                        if let itemIndex {
+                            if template.items[itemIndex].subtasks.isEmpty {
+                                Text("No subtasks")
+                                    .foregroundColor(.secondary)
+                            } else {
+                                ForEach(Array(template.items[itemIndex].subtasks.indices), id: \.self) { subtaskIndex in
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        HStack(spacing: 10) {
+                                            Button {
+                                                toggleSubtask(at: subtaskIndex)
+                                            } label: {
+                                                Image(systemName: template.items[itemIndex].subtasks[subtaskIndex].isDone ? "checkmark.circle.fill" : "checkmark.circle")
+                                                    .foregroundColor(template.items[itemIndex].subtasks[subtaskIndex].isDone ? .green : .secondary)
+                                            }
+                                            .buttonStyle(.plain)
+
+                                            if canEdit {
+                                                TextField("Subtask", text: subtaskTextBinding(for: subtaskIndex))
+                                            } else {
+                                                Text(template.items[itemIndex].subtasks[subtaskIndex].text)
+                                                    .foregroundColor(.primary)
+                                            }
+
+                                            if canEdit {
+                                                Button(role: .destructive) {
+                                                    removeSubtask(at: subtaskIndex)
+                                                } label: {
+                                                    Image(systemName: "trash")
+                                                }
+                                                .buttonStyle(.plain)
+                                            }
+                                        }
+
+                                        if template.items[itemIndex].subtasks[subtaskIndex].isDone,
+                                           let completedAt = template.items[itemIndex].subtasks[subtaskIndex].completedAt {
+                                            let completedBy = template.items[itemIndex].subtasks[subtaskIndex].completedBy?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                                            Text(
+                                                completedBy.isEmpty
+                                                ? "Completed on \(completedAt.formatted(date: .abbreviated, time: .shortened))"
+                                                : "Completed by \(completedBy) on \(completedAt.formatted(date: .abbreviated, time: .shortened))"
+                                            )
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                        }
+                                    }
+                                }
+                            }
+
+                            if canEdit {
+                                HStack {
+                                    TextField("Add subtask", text: $newSubtaskTitle)
+                                        .onSubmit {
+                                            addSubtask()
+                                        }
+                                    Button("Add") {
+                                        addSubtask()
+                                    }
+                                    .disabled(newSubtaskTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                }
+                            }
+                        }
+                    }
+
+                    Section("Attachments") {
+                        if let itemIndex {
+                            if template.items[itemIndex].attachments.isEmpty {
+                                Text("No attachments")
+                                    .foregroundColor(.secondary)
+                            } else {
+                                ForEach(template.items[itemIndex].attachments) { attachment in
+                                    HStack {
+                                        if let url = URL(string: attachment.url.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                                            Link(destination: url) {
+                                                Label(attachment.name, systemImage: attachmentSystemImage(for: attachment.kind))
+                                            }
+                                        } else {
+                                            Label(attachment.name, systemImage: attachmentSystemImage(for: attachment.kind))
+                                                .foregroundColor(.secondary)
+                                        }
+                                        Spacer()
+                                        if canEdit {
+                                            Button(role: .destructive) {
+                                                removeAttachment(id: attachment.id)
+                                            } label: {
+                                                Image(systemName: "trash")
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if canEdit {
+                            PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
+                                Label("Add Photo", systemImage: "photo")
+                            }
+                            Button {
+                                showingFileImporter = true
+                            } label: {
+                                Label("Add File", systemImage: "paperclip")
+                            }
+                            if isUploadingAttachment {
+                                ProgressView("Uploading attachment…")
+                            }
+                            if let attachmentError, !attachmentError.isEmpty {
+                                Text(attachmentError)
+                                    .font(.caption)
+                                    .foregroundColor(.red)
+                            }
+                        }
+                    }
+
+                    if showsAssignmentFeatures {
+                        Section("Status") {
+                            taskMetadataRow(item)
+                        }
+                    }
+
+                    if item.isDone, let completedAt = item.completedAt {
+                        Section("Completion") {
+                            if let by = item.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines), !by.isEmpty {
+                                Text("Checked by \(by)")
+                            }
+                            Text("Completed on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                .navigationTitle(displayChecklistText(item.text))
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("Done") {
+                            dismiss()
+                        }
+                    }
+                }
+                .onChange(of: selectedPhotoItem) { _, newValue in
+                    guard let newValue else { return }
+                    Task {
+                        await uploadPhotoAttachment(from: newValue)
+                        await MainActor.run {
+                            selectedPhotoItem = nil
+                        }
+                    }
+                }
+                .fileImporter(
+                    isPresented: $showingFileImporter,
+                    allowedContentTypes: [.item],
+                    allowsMultipleSelection: false
+                ) { result in
+                    handleFileImport(result)
+                }
+            } else {
+                ContentUnavailableView("Task Not Found", systemImage: "checkmark.circle")
+            }
+        }
+    }
+
+    private var itemTextBinding: Binding<String> {
+        Binding(
+            get: { item?.text ?? "" },
+            set: { newValue in
+                guard let itemIndex else { return }
+                template.items[itemIndex].text = newValue
+                onSave()
+            }
+        )
+    }
+
+    private var itemNotesBinding: Binding<String> {
+        Binding(
+            get: { item?.notes ?? "" },
+            set: { newValue in
+                guard let itemIndex else { return }
+                template.items[itemIndex].notes = newValue
+                updateMentionContext(for: newValue)
+                onSave()
+            }
+        )
+    }
+
+    @ViewBuilder
+    private var mentionSuggestionsList: some View {
+        let suggestions = mentionSuggestions(for: activeMentionQuery)
+        if !suggestions.isEmpty {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(suggestions.prefix(6)) { member in
+                    Button {
+                        applyMention(member)
+                    } label: {
+                        Text(displayName(member))
+                            .foregroundColor(.primary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                    }
+                    .buttonStyle(.plain)
+                    if member.id != suggestions.prefix(6).last?.id {
+                        Divider()
+                    }
+                }
+            }
+        }
+    }
+
+    private var assignmentSelection: Binding<String> {
+        Binding(
+            get: { item?.assignedUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" },
+            set: { newValue in
+                guard let itemIndex else { return }
+                applyAssignment(selectedUserID: newValue, to: itemIndex)
+                onSave()
+            }
+        )
+    }
+
+    private var itemHasDueDateBinding: Binding<Bool> {
+        Binding(
+            get: { item?.dueDate != nil },
+            set: { shouldSet in
+                guard let itemIndex else { return }
+                template.items[itemIndex].dueDate = shouldSet ? (template.items[itemIndex].dueDate ?? template.dueDate ?? Date()) : nil
+                onSave()
+            }
+        )
+    }
+
+    private var itemDueDateBinding: Binding<Date> {
+        Binding(
+            get: { item?.dueDate ?? template.dueDate ?? Date() },
+            set: { newValue in
+                guard let itemIndex else { return }
+                template.items[itemIndex].dueDate = newValue
+                onSave()
+            }
+        )
+    }
+
+    private var itemDueDateExists: Bool {
+        item?.dueDate != nil
+    }
+
+    private func subtaskTextBinding(for index: Int) -> Binding<String> {
+        Binding(
+            get: {
+                guard let itemIndex, template.items[itemIndex].subtasks.indices.contains(index) else { return "" }
+                return template.items[itemIndex].subtasks[index].text
+            },
+            set: { newValue in
+                guard let itemIndex, template.items[itemIndex].subtasks.indices.contains(index) else { return }
+                template.items[itemIndex].subtasks[index].text = newValue
+                onSave()
+            }
+        )
+    }
+
+    private func addSubtask() {
+        let trimmed = newSubtaskTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let itemIndex else { return }
+        template.items[itemIndex].subtasks.append(ChecklistSubtask(text: trimmed))
+        newSubtaskTitle = ""
+        onSave()
+    }
+
+    private func toggleSubtask(at index: Int) {
+        guard let itemIndex, template.items[itemIndex].subtasks.indices.contains(index) else { return }
+        template.items[itemIndex].subtasks[index].isDone.toggle()
+        if template.items[itemIndex].subtasks[index].isDone {
+            template.items[itemIndex].subtasks[index].completedAt = Date()
+            template.items[itemIndex].subtasks[index].completedBy = completionUserLabel
+        } else {
+            template.items[itemIndex].subtasks[index].completedAt = nil
+            template.items[itemIndex].subtasks[index].completedBy = nil
+        }
+        onSave()
+    }
+
+    private func removeSubtask(at index: Int) {
+        guard let itemIndex, template.items[itemIndex].subtasks.indices.contains(index) else { return }
+        template.items[itemIndex].subtasks.remove(at: index)
+        onSave()
+    }
+
+    private func removeAttachment(id: String) {
+        guard let itemIndex else { return }
+        template.items[itemIndex].attachments.removeAll { $0.id == id }
+        onSave()
+    }
+
+    private func attachmentSystemImage(for kind: TicketAttachmentKind) -> String {
+        switch kind {
+        case .image: return "photo"
+        case .video: return "video"
+        case .document: return "paperclip"
+        }
+    }
+
+    private func handleFileImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            uploadFileAttachment(from: url)
+        case .failure(let error):
+            attachmentError = "Attachment upload failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func toggleComplete() {
+        guard let itemIndex else { return }
+        template.items[itemIndex].isDone.toggle()
+        if template.items[itemIndex].isDone {
+            template.items[itemIndex].subtasks = template.items[itemIndex].subtasks.map { subtask in
+                var updated = subtask
+                updated.isDone = true
+                updated.completedAt = updated.completedAt ?? Date()
+                return updated
+            }
+            template.items[itemIndex].completedAt = Date()
+            template.items[itemIndex].completedBy = completionUserLabel()
+        } else {
+            template.items[itemIndex].completedAt = nil
+            template.items[itemIndex].completedBy = nil
+        }
+        updateChecklistCompletionMetadata()
+        onSave()
+    }
+
+    @MainActor
+    private func uploadPhotoAttachment(from item: PhotosPickerItem) async {
+        guard let itemIndex,
+              let data = try? await item.loadTransferable(type: Data.self) else { return }
+        isUploadingAttachment = true
+        attachmentError = nil
+        let filename = "Photo-\(UUID().uuidString.prefix(8)).jpg"
+        let path = "checklistTaskAttachments/\(template.id)/\(itemID)/\(UUID().uuidString)-\(filename)"
+        let metadata = StorageMetadata()
+        metadata.contentType = "image/jpeg"
+        let storageRef = Storage.storage().reference().child(path)
+        storageRef.putData(data, metadata: metadata) { _, error in
+            if let error {
+                DispatchQueue.main.async {
+                    isUploadingAttachment = false
+                    attachmentError = "Attachment upload failed: \(error.localizedDescription)"
+                }
+                return
+            }
+            storageRef.downloadURL { url, downloadError in
+                DispatchQueue.main.async {
+                    isUploadingAttachment = false
+                    if let downloadError {
+                        attachmentError = "Attachment upload failed: \(downloadError.localizedDescription)"
+                        return
+                    }
+                    guard let urlString = url?.absoluteString else { return }
+                    template.items[itemIndex].attachments.append(
+                        ChecklistTaskAttachment(url: urlString, name: filename, kind: .image)
+                    )
+                    onSave()
+                }
+            }
+        }
+    }
+
+    private func uploadFileAttachment(from url: URL) {
+        guard let itemIndex else { return }
+        attachmentError = nil
+        isUploadingAttachment = true
+        let didAccess = url.startAccessingSecurityScopedResource()
+        let safeName = url.lastPathComponent.replacingOccurrences(of: " ", with: "_")
+        let kind = inferredAttachmentKind(for: url)
+        let path = "checklistTaskAttachments/\(template.id)/\(itemID)/\(UUID().uuidString)-\(safeName)"
+        let metadata = StorageMetadata()
+        metadata.contentType = contentType(for: url, kind: kind)
+        let storageRef = Storage.storage().reference().child(path)
+        storageRef.putFile(from: url, metadata: metadata) { _, error in
+            if didAccess {
+                url.stopAccessingSecurityScopedResource()
+            }
+            if let error {
+                DispatchQueue.main.async {
+                    isUploadingAttachment = false
+                    attachmentError = "Attachment upload failed: \(error.localizedDescription)"
+                }
+                return
+            }
+            storageRef.downloadURL { downloadURL, downloadError in
+                DispatchQueue.main.async {
+                    isUploadingAttachment = false
+                    if let downloadError {
+                        attachmentError = "Attachment upload failed: \(downloadError.localizedDescription)"
+                        return
+                    }
+                    guard let urlString = downloadURL?.absoluteString else { return }
+                    template.items[itemIndex].attachments.append(
+                        ChecklistTaskAttachment(url: urlString, name: safeName, kind: kind)
+                    )
+                    onSave()
+                }
+            }
+        }
+    }
+
+    private func inferredAttachmentKind(for url: URL) -> TicketAttachmentKind {
+        let ext = url.pathExtension.lowercased()
+        if ["jpg", "jpeg", "png", "heic", "gif", "webp"].contains(ext) {
+            return .image
+        }
+        if ["mov", "mp4", "m4v", "avi"].contains(ext) {
+            return .video
+        }
+        return .document
+    }
+
+    private func contentType(for url: URL, kind: TicketAttachmentKind) -> String {
+        if let type = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType {
+            return type
+        }
+        switch kind {
+        case .image: return "image/jpeg"
+        case .video: return "video/quicktime"
+        case .document: return "application/octet-stream"
+        }
+    }
+
+    private func applyAssignment(selectedUserID: String, to index: Int) {
+        let trimmedID = selectedUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedID.isEmpty,
+              let member = assignableMembers.first(where: { $0.id == trimmedID }) else {
+            template.items[index].assignedUserID = nil
+            template.items[index].assignedUserName = nil
+            template.items[index].assignedUserEmail = nil
+            return
+        }
+        template.items[index].assignedUserID = member.id
+        template.items[index].assignedUserName = displayName(member)
+        template.items[index].assignedUserEmail = member.email.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func assignmentLabel(for item: ChecklistItem) -> String? {
+        if let member = assignedMember(for: item) {
+            return displayName(member)
+        }
+        let storedName = item.assignedUserName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !storedName.isEmpty { return storedName }
+        let storedEmail = item.assignedUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !storedEmail.isEmpty {
+            return storedEmail.components(separatedBy: "@").first ?? storedEmail
+        }
+        return nil
+    }
+
+    private func assignedMember(for item: ChecklistItem) -> UserProfile? {
+        let assignedID = item.assignedUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !assignedID.isEmpty,
+           let member = assignableMembers.first(where: { $0.id == assignedID }) {
+            return member
+        }
+        let assignedEmail = item.assignedUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if !assignedEmail.isEmpty {
+            return assignableMembers.first {
+                $0.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == assignedEmail
+            }
+        }
+        return nil
+    }
+
+    @ViewBuilder
+    private func taskMetadataRow(_ item: ChecklistItem) -> some View {
+        HStack(spacing: 8) {
+            if let assignmentText = assignmentLabel(for: item) {
+                Label(assignmentText, systemImage: "person.crop.circle")
+                    .font(.caption.weight(.medium))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.blue.opacity(0.14))
+                    .clipShape(Capsule())
+            }
+            if let dueDate = item.dueDate {
+                Label(dueDateLabel(for: dueDate), systemImage: dueDate < Date() && !item.isDone ? "exclamationmark.circle" : "calendar")
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(dueDate < Date() && !item.isDone ? .red : .secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background((dueDate < Date() && !item.isDone ? Color.red : Color.gray).opacity(0.12))
+                    .clipShape(Capsule())
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func dueDateLabel(for dueDate: Date) -> String {
+        if Calendar.current.isDateInToday(dueDate) { return "Today" }
+        if Calendar.current.isDateInTomorrow(dueDate) { return "Tomorrow" }
+        return dueDate.formatted(date: .abbreviated, time: .shortened)
+    }
+
+    private func displayChecklistText(_ text: String) -> String {
+        let pattern = "(?<!\\S)@[A-Za-z0-9._-]+"
+        let nsText = text as NSString
+        let fullRange = NSRange(location: 0, length: nsText.length)
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+        var cleaned = regex.stringByReplacingMatches(in: text, options: [], range: fullRange, withTemplate: "")
+        cleaned = cleaned.replacingOccurrences(of: "\\s{2,}", with: " ", options: .regularExpression)
+        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func updateChecklistCompletionMetadata() {
+        if template.items.isEmpty {
+            template.completedAt = nil
+            template.completedBy = nil
+            return
+        }
+        if template.items.allSatisfy(\.isDone) {
+            if template.completedAt == nil {
+                template.completedAt = Date()
+            }
+            if (template.completedBy ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                template.completedBy = completionUserLabel()
+            }
+        } else {
+            template.completedAt = nil
+            template.completedBy = nil
+        }
+    }
+
+    private func completionUserLabel() -> String {
+        assignableMembers.first(where: { $0.email == Auth.auth().currentUser?.email })?.displayName
+        ?? Auth.auth().currentUser?.email
+        ?? "Unknown User"
+    }
+
+    private func mentionSuggestions(for query: String) -> [UserProfile] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return assignableMembers
+            .filter { member in
+                let email = member.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if q.isEmpty { return true }
+                let name = displayName(member).lowercased()
+                let localPart = email.split(separator: "@").first.map(String.init) ?? ""
+                return name.contains(q) || email.contains(q) || localPart.contains(q)
+            }
+    }
+
+    private func currentMentionContext(in text: String) -> (range: Range<String.Index>, query: String)? {
+        guard let atIndex = text.lastIndex(of: "@") else { return nil }
+        if atIndex != text.startIndex {
+            let previous = text[text.index(before: atIndex)]
+            if !previous.isWhitespace { return nil }
+        }
+        let queryStart = text.index(after: atIndex)
+        let queryPart = text[queryStart...]
+        if queryPart.contains(where: { $0.isWhitespace }) { return nil }
+        return (atIndex..<text.endIndex, String(queryPart))
+    }
+
+    private func updateMentionContext(for text: String) {
+        if let context = currentMentionContext(in: text) {
+            activeMentionQuery = context.query
+        } else {
+            activeMentionQuery = ""
+        }
+    }
+
+    private func mentionToken(for member: UserProfile) -> String {
+        let name = displayName(member).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !name.isEmpty {
+            return name.lowercased().replacingOccurrences(of: " ", with: ".")
+        }
+        let email = member.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return email.split(separator: "@").first.map(String.init) ?? "user"
+    }
+
+    private func applyMention(_ member: UserProfile) {
+        guard let itemIndex,
+              let context = currentMentionContext(in: template.items[itemIndex].notes) else { return }
+        template.items[itemIndex].notes.replaceSubrange(context.range, with: "@\(mentionToken(for: member)) ")
+        updateMentionContext(for: template.items[itemIndex].notes)
+        onSave()
     }
 }
 

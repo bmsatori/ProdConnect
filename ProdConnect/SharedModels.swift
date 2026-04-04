@@ -274,12 +274,91 @@ struct TrainingLesson: Identifiable, Codable {
     var id: String = UUID().uuidString
     var title: String
     var category: String
+    var groupName: String? = nil
     var teamCode: String
     var durationSeconds: Int = 0
     var urlString: String? = nil
     var isCompleted: Bool = false
     var assignedToUserID: String? = nil
     var assignedToUserEmail: String? = nil
+}
+
+struct ChecklistSubtask: Identifiable, Codable {
+    var id: String = UUID().uuidString
+    var text: String
+    var isDone: Bool = false
+    var completedAt: Date? = nil
+    var completedBy: String? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case text
+        case isDone
+        case completedAt
+        case completedBy
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        text: String,
+        isDone: Bool = false,
+        completedAt: Date? = nil,
+        completedBy: String? = nil
+    ) {
+        self.id = id
+        self.text = text
+        self.isDone = isDone
+        self.completedAt = completedAt
+        self.completedBy = completedBy
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        text = try container.decode(String.self, forKey: .text)
+        isDone = try container.decodeIfPresent(Bool.self, forKey: .isDone) ?? false
+        completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
+        completedBy = try container.decodeIfPresent(String.self, forKey: .completedBy)
+    }
+}
+
+struct ChecklistTaskAttachment: Identifiable, Codable {
+    var id: String = UUID().uuidString
+    var url: String
+    var name: String
+    var kind: TicketAttachmentKind = .document
+    var createdAt: Date = Date()
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case url
+        case name
+        case kind
+        case createdAt
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        url: String,
+        name: String,
+        kind: TicketAttachmentKind = .document,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.url = url
+        self.name = name
+        self.kind = kind
+        self.createdAt = createdAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        url = try container.decode(String.self, forKey: .url)
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? "Attachment"
+        kind = try container.decodeIfPresent(TicketAttachmentKind.self, forKey: .kind) ?? .document
+        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+    }
 }
 
 struct ChecklistItem: Identifiable, Codable {
@@ -290,6 +369,8 @@ struct ChecklistItem: Identifiable, Codable {
     var assignedUserName: String? = nil
     var assignedUserEmail: String? = nil
     var dueDate: Date? = nil
+    var subtasks: [ChecklistSubtask] = []
+    var attachments: [ChecklistTaskAttachment] = []
     var isDone: Bool = false
     var completedAt: Date? = nil
     var completedBy: String? = nil
@@ -302,6 +383,8 @@ struct ChecklistItem: Identifiable, Codable {
         case assignedUserName
         case assignedUserEmail
         case dueDate
+        case subtasks
+        case attachments
         case isDone
         case completedAt
         case completedBy
@@ -315,6 +398,8 @@ struct ChecklistItem: Identifiable, Codable {
         assignedUserName: String? = nil,
         assignedUserEmail: String? = nil,
         dueDate: Date? = nil,
+        subtasks: [ChecklistSubtask] = [],
+        attachments: [ChecklistTaskAttachment] = [],
         isDone: Bool = false,
         completedAt: Date? = nil,
         completedBy: String? = nil
@@ -326,6 +411,8 @@ struct ChecklistItem: Identifiable, Codable {
         self.assignedUserName = assignedUserName
         self.assignedUserEmail = assignedUserEmail
         self.dueDate = dueDate
+        self.subtasks = subtasks
+        self.attachments = attachments
         self.isDone = isDone
         self.completedAt = completedAt
         self.completedBy = completedBy
@@ -340,6 +427,8 @@ struct ChecklistItem: Identifiable, Codable {
         assignedUserName = try container.decodeIfPresent(String.self, forKey: .assignedUserName)
         assignedUserEmail = try container.decodeIfPresent(String.self, forKey: .assignedUserEmail)
         dueDate = try container.decodeIfPresent(Date.self, forKey: .dueDate)
+        subtasks = try container.decodeIfPresent([ChecklistSubtask].self, forKey: .subtasks) ?? []
+        attachments = try container.decodeIfPresent([ChecklistTaskAttachment].self, forKey: .attachments) ?? []
         isDone = try container.decodeIfPresent(Bool.self, forKey: .isDone) ?? false
         completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
         completedBy = try container.decodeIfPresent(String.self, forKey: .completedBy)
@@ -350,45 +439,69 @@ struct ChecklistTemplate: Identifiable, Codable {
     var id: String = UUID().uuidString
     var title: String
     var teamCode: String
+    var position: Int = 0
     var groupName: String = ""
+    var assignedUserID: String? = nil
+    var assignedUserName: String? = nil
+    var assignedUserEmail: String? = nil
     var items: [ChecklistItem] = []
     var createdBy: String? = nil
     var dueDate: Date? = nil
     var completedAt: Date? = nil
     var completedBy: String? = nil
+    var archivedAt: Date? = nil
+    var archivedBy: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case id
         case title
         case teamCode
+        case position
         case groupName
+        case assignedUserID
+        case assignedUserName
+        case assignedUserEmail
         case items
         case createdBy
         case dueDate
         case completedAt
         case completedBy
+        case archivedAt
+        case archivedBy
     }
 
     init(
         id: String = UUID().uuidString,
         title: String,
         teamCode: String,
+        position: Int = 0,
         groupName: String = "",
+        assignedUserID: String? = nil,
+        assignedUserName: String? = nil,
+        assignedUserEmail: String? = nil,
         items: [ChecklistItem] = [],
         createdBy: String? = nil,
         dueDate: Date? = nil,
         completedAt: Date? = nil,
-        completedBy: String? = nil
+        completedBy: String? = nil,
+        archivedAt: Date? = nil,
+        archivedBy: String? = nil
     ) {
         self.id = id
         self.title = title
         self.teamCode = teamCode
+        self.position = position
         self.groupName = groupName
+        self.assignedUserID = assignedUserID
+        self.assignedUserName = assignedUserName
+        self.assignedUserEmail = assignedUserEmail
         self.items = items
         self.createdBy = createdBy
         self.dueDate = dueDate
         self.completedAt = completedAt
         self.completedBy = completedBy
+        self.archivedAt = archivedAt
+        self.archivedBy = archivedBy
     }
 
     init(from decoder: Decoder) throws {
@@ -396,12 +509,18 @@ struct ChecklistTemplate: Identifiable, Codable {
         id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
         title = try container.decode(String.self, forKey: .title)
         teamCode = try container.decode(String.self, forKey: .teamCode)
+        position = try container.decodeIfPresent(Int.self, forKey: .position) ?? 0
         groupName = try container.decodeIfPresent(String.self, forKey: .groupName) ?? ""
+        assignedUserID = try container.decodeIfPresent(String.self, forKey: .assignedUserID)
+        assignedUserName = try container.decodeIfPresent(String.self, forKey: .assignedUserName)
+        assignedUserEmail = try container.decodeIfPresent(String.self, forKey: .assignedUserEmail)
         items = try container.decodeIfPresent([ChecklistItem].self, forKey: .items) ?? []
         createdBy = try container.decodeIfPresent(String.self, forKey: .createdBy)
         dueDate = try container.decodeIfPresent(Date.self, forKey: .dueDate)
         completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
         completedBy = try container.decodeIfPresent(String.self, forKey: .completedBy)
+        archivedAt = try container.decodeIfPresent(Date.self, forKey: .archivedAt)
+        archivedBy = try container.decodeIfPresent(String.self, forKey: .archivedBy)
     }
 }
 
