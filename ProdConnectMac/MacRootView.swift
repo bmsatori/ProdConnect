@@ -1,6 +1,11 @@
 import AVFoundation
 import AVKit
 import AppKit
+import Combine
+#if canImport(CoreMIDI)
+import CoreMIDI
+#endif
+import Darwin
 import FirebaseAuth
 import FirebaseFirestore
 import FirebaseStorage
@@ -212,6 +217,7 @@ private enum MacFreshserviceAPI {
 private enum MacRoute: String, CaseIterable, Identifiable {
     case chat
     case patchsheet
+    case runOfShow
     case training
     case gear
     case tickets
@@ -227,12 +233,13 @@ private enum MacRoute: String, CaseIterable, Identifiable {
         switch self {
         case .chat: return "Chat"
         case .patchsheet: return "Patchsheet"
+        case .runOfShow: return "Run of Show"
         case .training: return "Training"
         case .gear: return "Assets"
         case .tickets: return "Tickets"
         case .checklists: return "Checklist"
         case .ideas: return "Ideas"
-        case .customize: return "Customize"
+        case .customize: return "Settings"
         case .users: return "Users"
         case .account: return "Account"
         }
@@ -242,17 +249,30 @@ private enum MacRoute: String, CaseIterable, Identifiable {
         switch self {
         case .chat: return "message"
         case .patchsheet: return "square.grid.3x2"
+        case .runOfShow: return "list.bullet.rectangle.portrait"
         case .training: return "graduationcap"
         case .gear: return "shippingbox"
         case .tickets: return "ticket"
         case .checklists: return "checklist"
         case .ideas: return "lightbulb"
-        case .customize: return "paintbrush"
+        case .customize: return "slider.horizontal.3"
         case .users: return "person.3"
         case .account: return "person.crop.circle"
         }
     }
 
+}
+
+private enum MacSettingsSection: String, CaseIterable, Identifiable {
+    case importData = "Import"
+    case locationsRooms = "Locations / Rooms"
+    case tickets = "Tickets"
+    case integrations = "Integrations"
+    case ndi = "NDI"
+    case midi = "MIDI"
+    case users = "Users"
+
+    var id: String { rawValue }
 }
 
 private func externalTicketFormSlug(from organizationName: String) -> String {
@@ -297,23 +317,31 @@ private func adaptiveTableColumnWidths(
 
 struct MacRootView: View {
     @EnvironmentObject private var store: ProdConnectStore
+    @EnvironmentObject private var ndiSettings: MacNDISettingsController
+    @EnvironmentObject private var runOfShowControls: MacRunOfShowControlController
     @State private var selectedRoute: MacRoute? = .chat
     @State private var isShowingNotifications = false
     @State private var showsWelcomeScreen = true
+    @AppStorage("prodconnect.mac.sidebarRouteOrder") private var sidebarRouteOrderStorage = ""
 
     private var sidebarRoutes: [MacRoute] {
-        MacRoute.allCases.filter { route in
+        let visibleRoutes = MacRoute.allCases.filter { route in
             switch route {
             case .chat:
                 return store.canSeeChat
+            case .runOfShow:
+                return store.canSeeRunOfShow
             case .training:
                 return store.canSeeTrainingTab
             case .tickets:
                 return store.canUseTickets
+            case .users:
+                return false
             default:
                 return true
             }
         }
+        return resolvedSidebarRoutes(from: visibleRoutes)
     }
 
     private var shellGradient: LinearGradient {
@@ -423,9 +451,12 @@ struct MacRootView: View {
     }
 
     private var sidebar: some View {
-        List(sidebarRoutes, selection: $selectedRoute) { route in
-            Label(route.title, systemImage: route.icon)
-                .tag(route)
+        List(selection: $selectedRoute) {
+            ForEach(sidebarRoutes) { route in
+                Label(route.title, systemImage: route.icon)
+                    .tag(route)
+            }
+            .onMove(perform: moveSidebarRoutes)
         }
         .navigationTitle("ProdConnect")
         .scrollContentBackground(.hidden)
@@ -439,6 +470,8 @@ struct MacRootView: View {
             MacChatView()
         case .patchsheet:
             MacPatchsheetView()
+        case .runOfShow:
+            MacRunOfShowView()
         case .training:
             MacTrainingView()
         case .gear:
@@ -450,12 +483,41 @@ struct MacRootView: View {
         case .ideas:
             MacIdeasView()
         case .customize:
-            MacCustomizeView()
+            MacSettingsView()
+                .environmentObject(store)
+                .environmentObject(ndiSettings)
+                .environmentObject(runOfShowControls)
         case .users:
             MacUsersView()
         case .account:
             MacAccountView()
         }
+    }
+
+    private func resolvedSidebarRoutes(from visibleRoutes: [MacRoute]) -> [MacRoute] {
+        let preferred = sidebarRouteOrderStorage
+            .split(separator: ",")
+            .compactMap { MacRoute(rawValue: String($0)) }
+        let visibleSet = Set(visibleRoutes)
+        var ordered: [MacRoute] = []
+
+        for route in preferred where visibleSet.contains(route) && !ordered.contains(route) {
+            ordered.append(route)
+        }
+        for route in visibleRoutes where !ordered.contains(route) {
+            ordered.append(route)
+        }
+        return ordered
+    }
+
+    private func persistSidebarRoutes(_ routes: [MacRoute]) {
+        sidebarRouteOrderStorage = routes.map(\.rawValue).joined(separator: ",")
+    }
+
+    private func moveSidebarRoutes(from source: IndexSet, to destination: Int) {
+        var routes = sidebarRoutes
+        routes.move(fromOffsets: source, toOffset: destination)
+        persistSidebarRoutes(routes)
     }
 }
 
@@ -1489,12 +1551,16 @@ private struct MacChatAttachmentPreviewView: View {
 
 private struct MacPatchsheetView: View {
     @EnvironmentObject private var store: ProdConnectStore
+    @EnvironmentObject private var ndiSettings: MacNDISettingsController
+    @AppStorage("prodconnect.mac.patchsheetZoom") private var patchsheetZoom = 1.0
     @State private var selectedCategory = "Audio"
     @State private var field1 = ""
     @State private var field2 = ""
     @State private var field3 = ""
     @State private var field4 = ""
     @State private var selectedPatch: PatchRow?
+    @State private var noteDrafts: [String: String] = [:]
+    @FocusState private var focusedNotesPatchID: String?
 
     private let categories = ["Audio", "Video", "Lighting"]
 
@@ -1503,78 +1569,112 @@ private struct MacPatchsheetView: View {
             .filter { $0.category == selectedCategory }
             .sorted(by: PatchRow.autoSort)
     }
+    private var hasNDIFeature: Bool {
+        guard let user = store.user else { return false }
+        return user.normalizedSubscriptionTier != "free"
+    }
+    private var canManageNDI: Bool {
+        guard let user = store.user else { return false }
+        return hasNDIFeature && (user.isAdmin || user.isOwner)
+    }
+    private var nameColumnTitle: String {
+        selectedCategory == "Lighting" ? "Fixture" : "Name"
+    }
+    private var inputColumnTitle: String {
+        switch selectedCategory {
+        case "Video": return "Source"
+        case "Lighting": return "DMX Channel"
+        default: return "Input"
+        }
+    }
+    private var outputColumnTitle: String {
+        switch selectedCategory {
+        case "Video": return "Destination"
+        case "Lighting": return "Channel Count"
+        default: return "Output"
+        }
+    }
+    private var showsLightingUniverseColumn: Bool {
+        selectedCategory == "Lighting"
+    }
+    private var patchsheetNameColumnWidth: CGFloat { 250 * patchsheetZoom }
+    private var patchsheetInputColumnWidth: CGFloat { 160 * patchsheetZoom }
+    private var patchsheetOutputColumnWidth: CGFloat { 160 * patchsheetZoom }
+    private var patchsheetUniverseColumnWidth: CGFloat { 110 * patchsheetZoom }
+    private var patchsheetNotesColumnWidth: CGFloat { 260 * patchsheetZoom }
+    private var patchsheetNDIColumnWidth: CGFloat { 72 }
+    private var patchsheetTableWidth: CGFloat {
+        patchsheetNameColumnWidth
+            + patchsheetInputColumnWidth
+            + patchsheetOutputColumnWidth
+            + (showsLightingUniverseColumn ? patchsheetUniverseColumnWidth : 0)
+            + patchsheetNotesColumnWidth
+            + (hasNDIFeature ? patchsheetNDIColumnWidth : 0)
+    }
+    private var patchsheetHeaderFont: Font { .system(size: 11 * patchsheetZoom, weight: .semibold) }
+    private var patchsheetRowFont: Font { .system(size: 13 * patchsheetZoom) }
+    private var patchsheetEmphasisFont: Font { .system(size: 13 * patchsheetZoom, weight: .semibold) }
+    private var patchsheetCellVerticalPadding: CGFloat { 10 * patchsheetZoom }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Picker("Category", selection: $selectedCategory) {
-                ForEach(categories, id: \.self) { Text($0).tag($0) }
-            }
-            .pickerStyle(.segmented)
+            HStack(alignment: .center, spacing: 16) {
+                Picker("Category", selection: $selectedCategory) {
+                    ForEach(categories, id: \.self) { Text($0).tag($0) }
+                }
+                .pickerStyle(.segmented)
 
-            List {
-                ForEach(filtered) { item in
-                    Button {
-                        selectedPatch = item
-                    } label: {
-                        HStack {
-                            VStack(alignment: .leading) {
-                                Text(item.name).font(.headline)
-                                Text("\(item.input) -> \(item.output)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            if !item.campus.isEmpty {
-                                Text(item.campus)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                    .buttonStyle(.plain)
+                HStack(spacing: 10) {
+                    Text("Zoom")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Slider(value: $patchsheetZoom, in: 0.8...1.5, step: 0.05)
+                        .frame(width: 180)
+                    Text("\(Int((patchsheetZoom * 100).rounded()))%")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(width: 42, alignment: .trailing)
                 }
-                .onDelete { indexSet in
-                    for index in indexSet {
-                        store.deletePatch(filtered[index])
-                    }
-                }
+
+                Spacer(minLength: 0)
+
             }
-            .scrollContentBackground(.hidden)
+
+            patchsheetTable
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
             GroupBox("Add Patch") {
                 VStack(spacing: 10) {
                     TextField(selectedCategory == "Lighting" ? "Fixture" : "Name", text: $field1)
+                        .onSubmit {
+                            submitNewPatch()
+                        }
                     HStack(spacing: 10) {
                         TextField(primaryPlaceholder, text: $field2)
+                            .onSubmit {
+                                submitNewPatch()
+                            }
                         TextField(secondaryPlaceholder, text: $field3)
+                            .onSubmit {
+                                submitNewPatch()
+                            }
                     }
                     if selectedCategory == "Lighting" {
                         TextField("Universe", text: $field4)
+                            .onSubmit {
+                                submitNewPatch()
+                            }
                     }
                     Button("Save Patch") {
-                        store.savePatch(
-                            PatchRow(
-                                name: field1,
-                                input: field2,
-                                output: field3,
-                                teamCode: store.teamCode ?? "",
-                                category: selectedCategory,
-                                campus: "",
-                                room: "",
-                                channelCount: selectedCategory == "Lighting" ? Int(field3.trimmingCharacters(in: .whitespacesAndNewlines)) : nil,
-                                universe: selectedCategory == "Lighting" ? field4.trimmingCharacters(in: .whitespacesAndNewlines) : nil
-                            )
-                        )
-                        field1 = ""
-                        field2 = ""
-                        field3 = ""
-                        field4 = ""
+                        submitNewPatch()
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(field1.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(!canSubmitNewPatch)
                 }
             }
+            Spacer(minLength: 0)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .padding()
         .background(Color.clear)
         .navigationTitle("Patchsheet")
@@ -1582,6 +1682,138 @@ private struct MacPatchsheetView: View {
             MacEditPatchView(patch: patch)
                 .environmentObject(store)
         }
+        .onChange(of: focusedNotesPatchID) { oldValue, newValue in
+            guard oldValue != newValue, let oldValue else { return }
+            saveNotes(forPatchID: oldValue)
+        }
+    }
+
+    private var patchsheetTable: some View {
+        ScrollView([.horizontal, .vertical]) {
+            VStack(alignment: .leading, spacing: 0) {
+                patchsheetHeaderRow
+                ForEach(filtered) { item in
+                    Button {
+                        selectedPatch = item
+                    } label: {
+                        patchsheetRow(for: item)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .frame(width: patchsheetTableWidth, alignment: .leading)
+            .padding(.top, 8)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(Color.white.opacity(0.02))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+    }
+
+    private var patchsheetHeaderRow: some View {
+        HStack(spacing: 0) {
+            patchsheetHeaderCell(nameColumnTitle, width: patchsheetNameColumnWidth)
+            patchsheetHeaderCell(inputColumnTitle, width: patchsheetInputColumnWidth)
+            patchsheetHeaderCell(outputColumnTitle, width: patchsheetOutputColumnWidth)
+            if showsLightingUniverseColumn {
+                patchsheetHeaderCell("Universe", width: patchsheetUniverseColumnWidth)
+            }
+            patchsheetHeaderCell("Notes", width: patchsheetNotesColumnWidth)
+            if hasNDIFeature {
+                patchsheetHeaderCell("NDI", width: patchsheetNDIColumnWidth, alignment: .center)
+            }
+        }
+        .background(Color.white.opacity(0.045))
+    }
+
+    private func patchsheetHeaderCell(_ title: String, width: CGFloat, alignment: Alignment = .leading) -> some View {
+        Text(title)
+            .font(patchsheetHeaderFont)
+            .textCase(.uppercase)
+            .foregroundStyle(.secondary)
+            .frame(width: width, alignment: alignment)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11 * patchsheetZoom)
+    }
+
+    private func patchsheetRow(for patch: PatchRow) -> some View {
+        HStack(spacing: 0) {
+            patchsheetValueButtonCell(patch.name, width: patchsheetNameColumnWidth, emphasized: true) {
+                selectedPatch = patch
+            }
+            patchsheetValueButtonCell(patch.input, width: patchsheetInputColumnWidth) {
+                selectedPatch = patch
+            }
+            patchsheetValueButtonCell(patch.output, width: patchsheetOutputColumnWidth) {
+                selectedPatch = patch
+            }
+            if showsLightingUniverseColumn {
+                patchsheetValueButtonCell(patch.universe ?? "", width: patchsheetUniverseColumnWidth) {
+                    selectedPatch = patch
+                }
+            }
+            patchsheetNotesCell(for: patch)
+            if hasNDIFeature {
+                patchsheetNDICell(for: patch)
+            }
+        }
+        .background(Color.white.opacity(0.02))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color.white.opacity(0.05))
+                .frame(height: 1)
+        }
+    }
+
+    private func patchsheetValueCell(_ value: String, width: CGFloat, emphasized: Bool = false) -> some View {
+        Text(value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? " " : value)
+            .font(emphasized ? patchsheetEmphasisFont : patchsheetRowFont)
+            .foregroundStyle(.primary)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(width: width, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.vertical, patchsheetCellVerticalPadding)
+    }
+
+    private func patchsheetValueButtonCell(_ value: String, width: CGFloat, emphasized: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            patchsheetValueCell(value, width: width, emphasized: emphasized)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func patchsheetNotesCell(for patch: PatchRow) -> some View {
+        TextField("Notes", text: notesBinding(for: patch), axis: .vertical)
+            .textFieldStyle(.plain)
+            .font(patchsheetRowFont)
+            .foregroundStyle(.primary)
+            .lineLimit(1...3)
+            .frame(width: patchsheetNotesColumnWidth, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.vertical, patchsheetCellVerticalPadding)
+            .focused($focusedNotesPatchID, equals: patch.id)
+            .disabled(!store.canEditPatchsheet)
+            .onSubmit {
+                saveNotes(forPatchID: patch.id)
+            }
+    }
+
+    private func patchsheetNDICell(for patch: PatchRow) -> some View {
+        Button {
+            toggleNDI(for: patch)
+        } label: {
+            Image(systemName: patch.ndiEnabled ? "checkmark.square.fill" : "square")
+                .foregroundStyle(canManageNDI ? (patch.ndiEnabled ? .green : .secondary) : .secondary)
+                .font(.system(size: 15, weight: .semibold))
+                .frame(width: patchsheetNDIColumnWidth, alignment: .center)
+                .padding(.vertical, patchsheetCellVerticalPadding)
+        }
+        .buttonStyle(.plain)
+        .disabled(!canManageNDI)
     }
 
     private var primaryPlaceholder: String {
@@ -1599,6 +1831,2060 @@ private struct MacPatchsheetView: View {
         default: return "Output"
         }
     }
+
+    private var canSubmitNewPatch: Bool {
+        !field1.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func submitNewPatch() {
+        guard canSubmitNewPatch else { return }
+        store.savePatch(
+            PatchRow(
+                name: field1,
+                input: field2,
+                output: field3,
+                teamCode: store.teamCode ?? "",
+                category: selectedCategory,
+                campus: "",
+                room: "",
+                channelCount: selectedCategory == "Lighting" ? Int(field3.trimmingCharacters(in: .whitespacesAndNewlines)) : nil,
+                universe: selectedCategory == "Lighting" ? field4.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+            )
+        )
+        field1 = ""
+        field2 = ""
+        field3 = ""
+        field4 = ""
+    }
+
+    private func toggleNDI(for patch: PatchRow) {
+        guard canManageNDI else { return }
+        var updated = patch
+        updated.ndiEnabled.toggle()
+        store.savePatch(updated)
+        if selectedPatch?.id == updated.id {
+            selectedPatch = updated
+        }
+    }
+
+    private func notesBinding(for patch: PatchRow) -> Binding<String> {
+        Binding(
+            get: {
+                noteDrafts[patch.id] ?? patch.notes
+            },
+            set: { newValue in
+                noteDrafts[patch.id] = newValue
+            }
+        )
+    }
+
+    private func saveNotes(forPatchID patchID: String) {
+        guard store.canEditPatchsheet else { return }
+        guard let patch = store.patchsheet.first(where: { $0.id == patchID }) else { return }
+        let draft = (noteDrafts[patchID] ?? patch.notes).trimmingCharacters(in: .whitespacesAndNewlines)
+        let current = patch.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard draft != current else { return }
+
+        var updated = patch
+        updated.notes = draft
+        noteDrafts[patchID] = draft
+        store.savePatch(updated)
+        if selectedPatch?.id == updated.id {
+            selectedPatch = updated
+        }
+    }
+}
+
+enum MacNDIOrientation: String, CaseIterable, Codable, Identifiable {
+    case landscape
+    case portrait
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .landscape: return "Landscape"
+        case .portrait: return "Portrait"
+        }
+    }
+
+    var outputSize: CGSize {
+        switch self {
+        case .landscape: return CGSize(width: 1920, height: 1080)
+        case .portrait: return CGSize(width: 1080, height: 1920)
+        }
+    }
+
+    var windowSize: CGSize {
+        switch self {
+        case .landscape: return CGSize(width: 1200, height: 720)
+        case .portrait: return CGSize(width: 720, height: 1200)
+        }
+    }
+}
+
+enum MacNDIFeedSourceType: String, CaseIterable, Codable, Identifiable {
+    case patchsheet
+    case runOfShow
+    case runOfShowLive
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .patchsheet: return "Patchsheet"
+        case .runOfShow: return "Run of Show"
+        case .runOfShowLive: return "Run of Show Live"
+        }
+    }
+}
+
+struct MacNDIFeedConfiguration: Identifiable, Codable, Equatable {
+    var id: String = UUID().uuidString
+    var title: String = "ProdConnect Feed"
+    var sourceType: MacNDIFeedSourceType = .patchsheet
+    var category: String = "Audio"
+    var runOfShowID: String?
+    var isLive = false
+    var showsHeaders = true
+    var scale = 1.2
+    var orientation: MacNDIOrientation = .landscape
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case sourceType
+        case category
+        case runOfShowID
+        case isLive
+        case showsHeaders
+        case scale
+        case orientation
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        title: String = "ProdConnect Feed",
+        sourceType: MacNDIFeedSourceType = .patchsheet,
+        category: String = "Audio",
+        runOfShowID: String? = nil,
+        isLive: Bool = false,
+        showsHeaders: Bool = true,
+        scale: Double = 1.2,
+        orientation: MacNDIOrientation = .landscape
+    ) {
+        self.id = id
+        self.title = title
+        self.sourceType = sourceType
+        self.category = category
+        self.runOfShowID = runOfShowID
+        self.isLive = isLive
+        self.showsHeaders = showsHeaders
+        self.scale = scale
+        self.orientation = orientation
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? "ProdConnect Feed"
+        sourceType = try container.decodeIfPresent(MacNDIFeedSourceType.self, forKey: .sourceType) ?? .patchsheet
+        category = try container.decodeIfPresent(String.self, forKey: .category) ?? "Audio"
+        runOfShowID = try container.decodeIfPresent(String.self, forKey: .runOfShowID)
+        isLive = try container.decodeIfPresent(Bool.self, forKey: .isLive) ?? false
+        showsHeaders = try container.decodeIfPresent(Bool.self, forKey: .showsHeaders) ?? true
+        scale = try container.decodeIfPresent(Double.self, forKey: .scale) ?? 1.2
+        orientation = try container.decodeIfPresent(MacNDIOrientation.self, forKey: .orientation) ?? .landscape
+    }
+}
+
+@MainActor
+final class MacNDISettingsController: ObservableObject {
+    @Published var feeds: [MacNDIFeedConfiguration] {
+        didSet {
+            persistFeeds()
+            syncOutputs()
+        }
+    }
+
+    @Published private(set) var previewVisibleFeedIDs: Set<String> = []
+
+    private let store: ProdConnectStore
+    private let userDefaults = UserDefaults.standard
+    private let feedsDefaultsKey = "prodconnect.mac.ndiFeeds.v1"
+    private var controllers: [String: MacPatchsheetNDIOutputWindowController] = [:]
+    private var cancellables: Set<AnyCancellable> = []
+
+    init(store: ProdConnectStore) {
+        self.store = store
+        self.feeds = Self.loadPersistedFeeds()
+
+        store.$patchsheet
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.syncOutputs()
+            }
+            .store(in: &cancellables)
+
+        store.$runOfShows
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.syncOutputs()
+            }
+            .store(in: &cancellables)
+
+        store.$user
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.syncOutputs()
+            }
+            .store(in: &cancellables)
+
+        syncOutputs()
+    }
+
+    var runtimeAvailable: Bool {
+        MacNDISender.isRuntimeAvailable
+    }
+
+    var hasNDIFeature: Bool {
+        guard let user = store.user else { return false }
+        return user.normalizedSubscriptionTier != "free"
+    }
+
+    var canManageNDI: Bool {
+        guard let user = store.user else { return false }
+        return hasNDIFeature && (user.isAdmin || user.isOwner)
+    }
+
+    func addFeed() {
+        feeds.append(
+            MacNDIFeedConfiguration(
+                title: "ProdConnect Feed \(feeds.count + 1)",
+                category: "Audio"
+            )
+        )
+    }
+
+    func removeFeed(id: String) {
+        feeds.removeAll { $0.id == id }
+        if let controller = controllers.removeValue(forKey: id) {
+            controller.close()
+        }
+        previewVisibleFeedIDs.remove(id)
+    }
+
+    func togglePreview(for feedID: String) {
+        let controller = controller(for: feedID)
+        if controller.isWindowVisible {
+            controller.hideWindow()
+            previewVisibleFeedIDs.remove(feedID)
+        } else {
+            controller.showWindow()
+            previewVisibleFeedIDs.insert(feedID)
+        }
+    }
+
+    func isPreviewVisible(for feedID: String) -> Bool {
+        previewVisibleFeedIDs.contains(feedID)
+    }
+
+    func updateFeedValue<Value>(_ value: Value, at index: Int, keyPath: WritableKeyPath<MacNDIFeedConfiguration, Value>) {
+        guard feeds.indices.contains(index) else { return }
+        DispatchQueue.main.async {
+            guard self.feeds.indices.contains(index) else { return }
+            self.feeds[index][keyPath: keyPath] = value
+        }
+    }
+
+    func updateRunOfShowID(_ runOfShowID: String?, at index: Int) {
+        guard feeds.indices.contains(index) else { return }
+        let normalizedID = runOfShowID?.isEmpty == true ? nil : runOfShowID
+        DispatchQueue.main.async {
+            guard self.feeds.indices.contains(index) else { return }
+            self.feeds[index].runOfShowID = normalizedID
+        }
+    }
+
+    func patches(for category: String) -> [PatchRow] {
+        store.patchsheet
+            .filter { $0.category == category && $0.ndiEnabled }
+            .sorted(by: PatchRow.autoSort)
+    }
+
+    func runOfShows() -> [RunOfShowDocument] {
+        store.runOfShows.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    func runOfShow(for feed: MacNDIFeedConfiguration) -> RunOfShowDocument? {
+        let shows = runOfShows()
+        if let runOfShowID = feed.runOfShowID,
+           let matched = shows.first(where: { $0.id == runOfShowID }) {
+            return matched
+        }
+        return shows.first
+    }
+
+    func descriptorText(for feed: MacNDIFeedConfiguration) -> String {
+        switch feed.sourceType {
+        case .patchsheet:
+            return "\(patches(for: feed.category).count) selected patches in \(feed.category)"
+        case .runOfShow:
+            let show = runOfShow(for: feed)
+            let title = show?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return "\(show?.sortedItems.count ?? 0) items in \(title.isEmpty ? "selected show" : title)"
+        case .runOfShowLive:
+            let show = runOfShow(for: feed)
+            let title = show?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return "Live view for \(title.isEmpty ? "selected show" : title)"
+        }
+    }
+
+    func syncOutputs() {
+        let validIDs = Set(feeds.map(\.id))
+
+        for (id, controller) in controllers where !validIDs.contains(id) {
+            controller.close()
+            controllers.removeValue(forKey: id)
+        }
+
+        guard canManageNDI else {
+            for controller in controllers.values {
+                controller.close()
+            }
+            previewVisibleFeedIDs = []
+            return
+        }
+
+        for feed in feeds {
+            controller(for: feed.id).update(
+                configuration: MacPatchsheetNDIOutputConfiguration(
+                    isActive: feed.isLive,
+                    title: feed.title,
+                    sourceType: feed.sourceType,
+                    category: feed.category,
+                    runOfShow: runOfShow(for: feed),
+                    patches: patches(for: feed.category),
+                    nameColumnTitle: Self.nameColumnTitle(for: feed.category),
+                    inputColumnTitle: Self.inputColumnTitle(for: feed.category),
+                    outputColumnTitle: Self.outputColumnTitle(for: feed.category),
+                    showsUniverseColumn: feed.category == "Lighting",
+                    showsHeaders: feed.showsHeaders,
+                    scale: feed.scale,
+                    orientation: feed.orientation
+                )
+            )
+        }
+
+        let visibleFeedIDs = Set(
+            controllers.compactMap { id, controller in
+                controller.isWindowVisible ? id : nil
+            }
+        )
+        if previewVisibleFeedIDs != visibleFeedIDs {
+            DispatchQueue.main.async {
+                self.previewVisibleFeedIDs = visibleFeedIDs
+            }
+        }
+    }
+
+    private func controller(for feedID: String) -> MacPatchsheetNDIOutputWindowController {
+        if let existing = controllers[feedID] {
+            return existing
+        }
+        let controller = MacPatchsheetNDIOutputWindowController()
+        controllers[feedID] = controller
+        return controller
+    }
+
+    private func persistFeeds() {
+        guard let data = try? JSONEncoder().encode(feeds) else { return }
+        userDefaults.set(data, forKey: feedsDefaultsKey)
+    }
+
+    private static func loadPersistedFeeds() -> [MacNDIFeedConfiguration] {
+        let defaults = UserDefaults.standard
+        if let data = defaults.data(forKey: "prodconnect.mac.ndiFeeds.v1"),
+           let decoded = try? JSONDecoder().decode([MacNDIFeedConfiguration].self, from: data),
+           !decoded.isEmpty {
+            return decoded
+        }
+
+        let legacyTitle = defaults.string(forKey: "prodconnect.mac.patchsheet.ndiOutputName") ?? "ProdConnect Patchsheet"
+        let legacyLive = defaults.bool(forKey: "prodconnect.mac.patchsheet.ndiPreviewEnabled")
+        let legacyHeaders = defaults.object(forKey: "prodconnect.mac.patchsheet.ndiShowsHeaders") as? Bool ?? true
+        let legacyScale = defaults.object(forKey: "prodconnect.mac.patchsheet.ndiPreviewScale") as? Double ?? 1.0
+
+        return [
+            MacNDIFeedConfiguration(
+                title: legacyTitle,
+                category: "Audio",
+                isLive: legacyLive,
+                showsHeaders: legacyHeaders,
+                scale: legacyScale
+            )
+        ]
+    }
+
+    static func nameColumnTitle(for category: String) -> String {
+        category == "Lighting" ? "Fixture" : "Name"
+    }
+
+    static func inputColumnTitle(for category: String) -> String {
+        switch category {
+        case "Video": return "Source"
+        case "Lighting": return "DMX Channel"
+        default: return "Input"
+        }
+    }
+
+    static func outputColumnTitle(for category: String) -> String {
+        switch category {
+        case "Video": return "Destination"
+        case "Lighting": return "Channel Count"
+        default: return "Output"
+        }
+    }
+}
+
+enum MacRunOfShowMIDIMessageType: String, CaseIterable, Identifiable, Codable {
+    case noteOn = "Note"
+    case controlChange = "CC"
+
+    var id: String { rawValue }
+}
+
+enum MacRunOfShowMIDIAction: String, CaseIterable, Identifiable {
+    case startRestart = "Start / Restart"
+    case previous = "Previous"
+    case next = "Next"
+    case reset = "Reset"
+
+    var id: String { rawValue }
+}
+
+struct MacRunOfShowMIDIMapping: Codable, Equatable {
+    var messageType: MacRunOfShowMIDIMessageType = .noteOn
+    var channel: Int = 1
+    var value: Int = 0
+    var velocity: Int = 127
+
+    enum CodingKeys: String, CodingKey {
+        case messageType
+        case channel
+        case value
+        case velocity
+    }
+
+    init(
+        messageType: MacRunOfShowMIDIMessageType = .noteOn,
+        channel: Int = 1,
+        value: Int = 0,
+        velocity: Int = 127
+    ) {
+        self.messageType = messageType
+        self.channel = channel
+        self.value = value
+        self.velocity = velocity
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        messageType = try container.decodeIfPresent(MacRunOfShowMIDIMessageType.self, forKey: .messageType) ?? .noteOn
+        channel = try container.decodeIfPresent(Int.self, forKey: .channel) ?? 1
+        value = try container.decodeIfPresent(Int.self, forKey: .value) ?? 0
+        velocity = try container.decodeIfPresent(Int.self, forKey: .velocity) ?? 127
+    }
+}
+
+struct MacMIDISourceDescriptor: Identifiable, Equatable {
+    let id: String
+    let uniqueID: MIDIUniqueID
+    let name: String
+}
+
+@MainActor
+final class MacRunOfShowControlController: ObservableObject {
+    @Published var selectedShowID: String? {
+        didSet { userDefaults.set(selectedShowID, forKey: selectedShowDefaultsKey) }
+    }
+    @Published var midiEnabled: Bool {
+        didSet { userDefaults.set(midiEnabled, forKey: midiEnabledDefaultsKey) }
+    }
+    @Published var selectedMIDISourceID: String? {
+        didSet {
+            userDefaults.set(selectedMIDISourceID, forKey: selectedMIDISourceDefaultsKey)
+#if canImport(CoreMIDI)
+            refreshMIDISourceConnection()
+#endif
+        }
+    }
+    @Published var startRestartMapping: MacRunOfShowMIDIMapping {
+        didSet { persistMappings() }
+    }
+    @Published var previousMapping: MacRunOfShowMIDIMapping {
+        didSet { persistMappings() }
+    }
+    @Published var nextMapping: MacRunOfShowMIDIMapping {
+        didSet { persistMappings() }
+    }
+    @Published var resetMapping: MacRunOfShowMIDIMapping {
+        didSet { persistMappings() }
+    }
+    @Published var listeningAction: MacRunOfShowMIDIAction?
+
+    private let store: ProdConnectStore
+    private let userDefaults = UserDefaults.standard
+    private let selectedShowDefaultsKey = "prodconnect.mac.runOfShow.selectedShowID"
+    private let midiEnabledDefaultsKey = "prodconnect.mac.runOfShow.midiEnabled"
+    private let selectedMIDISourceDefaultsKey = "prodconnect.mac.runOfShow.selectedMIDISourceID"
+    private let mappingDefaultsKey = "prodconnect.mac.runOfShow.midiMappings.v1"
+    private var autoStartTimer: Timer?
+    private var autoStartSuppressedShowIDs: Set<String> = []
+
+#if canImport(CoreMIDI)
+    private var midiClient = MIDIClientRef()
+    private var inputPort = MIDIPortRef()
+    private var connectedSourceID: MIDIUniqueID?
+#endif
+
+    init(store: ProdConnectStore) {
+        self.store = store
+        self.selectedShowID = userDefaults.string(forKey: selectedShowDefaultsKey)
+        self.midiEnabled = userDefaults.bool(forKey: midiEnabledDefaultsKey)
+        self.selectedMIDISourceID = userDefaults.string(forKey: selectedMIDISourceDefaultsKey)
+
+        let persistedMappings = Self.loadPersistedMappings(userDefaults: userDefaults)
+        self.startRestartMapping = persistedMappings[.startRestart] ?? MacRunOfShowMIDIMapping(messageType: .noteOn, channel: 1, value: 20)
+        self.previousMapping = persistedMappings[.previous] ?? MacRunOfShowMIDIMapping(messageType: .noteOn, channel: 1, value: 21)
+        self.nextMapping = persistedMappings[.next] ?? MacRunOfShowMIDIMapping(messageType: .noteOn, channel: 1, value: 22)
+        self.resetMapping = persistedMappings[.reset] ?? MacRunOfShowMIDIMapping(messageType: .noteOn, channel: 1, value: 23)
+        self.listeningAction = nil
+
+        startAutoStartTimer()
+#if canImport(CoreMIDI)
+        configureMIDI()
+#endif
+    }
+
+    deinit {
+        autoStartTimer?.invalidate()
+#if canImport(CoreMIDI)
+        if inputPort != 0 { MIDIPortDispose(inputPort) }
+        if midiClient != 0 { MIDIClientDispose(midiClient) }
+#endif
+    }
+
+    var shows: [RunOfShowDocument] {
+        store.runOfShows.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    var selectedShow: RunOfShowDocument? {
+        if let selectedShowID,
+           let show = shows.first(where: { $0.id == selectedShowID }) {
+            return show
+        }
+        return shows.first
+    }
+
+    var midiSourceCount: Int {
+#if canImport(CoreMIDI)
+        midiSources.count
+#else
+        0
+#endif
+    }
+
+    var midiSources: [MacMIDISourceDescriptor] {
+#if canImport(CoreMIDI)
+        var result: [MacMIDISourceDescriptor] = []
+        let sourceCount = MIDIGetNumberOfSources()
+        for index in 0..<sourceCount {
+            let source = MIDIGetSource(index)
+            var sourceID = MIDIUniqueID()
+            guard MIDIObjectGetIntegerProperty(source, kMIDIPropertyUniqueID, &sourceID) == noErr else { continue }
+            let name = midiSourceName(for: source) ?? "MIDI Source \(index + 1)"
+            result.append(MacMIDISourceDescriptor(id: String(sourceID), uniqueID: sourceID, name: name))
+        }
+        return result
+#else
+        return []
+#endif
+    }
+
+    var canManageControls: Bool {
+        guard let user = store.user else { return false }
+        return user.hasPaidSubscription && (user.isAdmin || user.isOwner)
+    }
+
+    func binding(for action: MacRunOfShowMIDIAction) -> Binding<MacRunOfShowMIDIMapping> {
+        Binding(
+            get: { self.mapping(for: action) },
+            set: { self.setMapping($0, for: action) }
+        )
+    }
+
+    func updateSelectedShowID(_ id: String) {
+        selectedShowID = id.isEmpty ? nil : id
+    }
+
+    func updateSelectedMIDISourceID(_ id: String) {
+        selectedMIDISourceID = id.isEmpty ? nil : id
+    }
+
+    func updateAutoStart(_ enabled: Bool, for show: RunOfShowDocument) {
+        guard canManageControls else { return }
+        var updatedShow = show
+        updatedShow.autoStartLive = enabled
+        if !enabled {
+            autoStartSuppressedShowIDs.remove(show.id)
+        }
+        store.saveRunOfShow(updatedShow)
+    }
+
+    func suppressAutoStart(for showID: String) {
+        autoStartSuppressedShowIDs.insert(showID)
+    }
+
+    func clearAutoStartSuppression(for showID: String) {
+        autoStartSuppressedShowIDs.remove(showID)
+    }
+
+    func isAutoStartSuppressed(for showID: String) -> Bool {
+        autoStartSuppressedShowIDs.contains(showID)
+    }
+
+    func toggleListening(for action: MacRunOfShowMIDIAction) {
+        listeningAction = listeningAction == action ? nil : action
+    }
+
+    func isListening(for action: MacRunOfShowMIDIAction) -> Bool {
+        listeningAction == action
+    }
+
+    private func mapping(for action: MacRunOfShowMIDIAction) -> MacRunOfShowMIDIMapping {
+        switch action {
+        case .startRestart: return startRestartMapping
+        case .previous: return previousMapping
+        case .next: return nextMapping
+        case .reset: return resetMapping
+        }
+    }
+
+    private func setMapping(_ mapping: MacRunOfShowMIDIMapping, for action: MacRunOfShowMIDIAction) {
+        let normalized = MacRunOfShowMIDIMapping(
+            messageType: mapping.messageType,
+            channel: min(max(mapping.channel, 1), 16),
+            value: min(max(mapping.value, 0), 127),
+            velocity: min(max(mapping.velocity, 0), 127)
+        )
+        switch action {
+        case .startRestart: startRestartMapping = normalized
+        case .previous: previousMapping = normalized
+        case .next: nextMapping = normalized
+        case .reset: resetMapping = normalized
+        }
+    }
+
+    private func persistMappings() {
+        let mappings: [String: MacRunOfShowMIDIMapping] = [
+            MacRunOfShowMIDIAction.startRestart.rawValue: startRestartMapping,
+            MacRunOfShowMIDIAction.previous.rawValue: previousMapping,
+            MacRunOfShowMIDIAction.next.rawValue: nextMapping,
+            MacRunOfShowMIDIAction.reset.rawValue: resetMapping
+        ]
+        guard let data = try? JSONEncoder().encode(mappings) else { return }
+        userDefaults.set(data, forKey: mappingDefaultsKey)
+    }
+
+    private static func loadPersistedMappings(userDefaults: UserDefaults) -> [MacRunOfShowMIDIAction: MacRunOfShowMIDIMapping] {
+        guard let data = userDefaults.data(forKey: "prodconnect.mac.runOfShow.midiMappings.v1"),
+              let decoded = try? JSONDecoder().decode([String: MacRunOfShowMIDIMapping].self, from: data) else {
+            return [:]
+        }
+        return Dictionary(uniqueKeysWithValues: decoded.compactMap { key, value in
+            guard let action = MacRunOfShowMIDIAction(rawValue: key) else { return nil }
+            return (action, value)
+        })
+    }
+
+    private func startAutoStartTimer() {
+        autoStartTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                self.performAutoStartIfNeeded()
+            }
+        }
+        if let autoStartTimer {
+            RunLoop.main.add(autoStartTimer, forMode: .common)
+        }
+    }
+
+    private func performAutoStartIfNeeded() {
+        guard canManageControls else { return }
+        let now = Date()
+        for show in shows where show.autoStartLive && !autoStartSuppressedShowIDs.contains(show.id) && !show.isLiveActive && show.liveCurrentItemID == nil && !show.sortedItems.isEmpty && now >= show.scheduledStart {
+            startOrRestart(show)
+        }
+    }
+
+    private func startOrRestart(_ show: RunOfShowDocument) {
+        autoStartSuppressedShowIDs.remove(show.id)
+        var updated = show
+        let items = updated.sortedItems
+        guard let first = items.first else { return }
+        let now = Date()
+        updated.isLiveActive = true
+        updated.liveCurrentItemID = first.id
+        updated.liveShowStartedAt = now
+        updated.liveItemStartedAt = now
+        store.saveRunOfShow(updated)
+    }
+
+    private func move(_ show: RunOfShowDocument, direction: Int) {
+        var updated = show
+        let items = updated.sortedItems
+        guard let currentIndex = updated.itemIndex(for: updated.liveCurrentItemID) else { return }
+        let newIndex = currentIndex + direction
+        guard items.indices.contains(newIndex) else { return }
+        updated.isLiveActive = true
+        updated.liveCurrentItemID = items[newIndex].id
+        updated.liveItemStartedAt = Date()
+        if updated.liveShowStartedAt == nil {
+            updated.liveShowStartedAt = Date()
+        }
+        store.saveRunOfShow(updated)
+    }
+
+    private func reset(_ show: RunOfShowDocument) {
+        autoStartSuppressedShowIDs.insert(show.id)
+        var updated = show
+        updated.isLiveActive = false
+        updated.liveCurrentItemID = nil
+        updated.liveShowStartedAt = nil
+        updated.liveItemStartedAt = nil
+        store.saveRunOfShow(updated)
+    }
+
+    private func perform(action: MacRunOfShowMIDIAction) {
+        guard midiEnabled, canManageControls, let show = selectedShow else { return }
+        switch action {
+        case .startRestart:
+            startOrRestart(show)
+        case .previous:
+            move(show, direction: -1)
+        case .next:
+            move(show, direction: 1)
+        case .reset:
+            reset(show)
+        }
+    }
+
+#if canImport(CoreMIDI)
+    private func configureMIDI() {
+        MIDIClientCreateWithBlock("ProdConnect Run Of Show MIDI" as CFString, &midiClient) { _ in }
+        MIDIInputPortCreateWithBlock(midiClient, "ProdConnect Input" as CFString, &inputPort) { [weak self] packetList, _ in
+            guard let self else { return }
+            self.handle(packetList: packetList)
+        }
+        if selectedMIDISourceID == nil {
+            selectedMIDISourceID = midiSources.first?.id
+        }
+        refreshMIDISourceConnection()
+    }
+
+    private func refreshMIDISourceConnection() {
+        if let connectedSourceID,
+           let source = midiSourceRef(for: connectedSourceID) {
+            MIDIPortDisconnectSource(inputPort, source)
+            self.connectedSourceID = nil
+        }
+
+        guard let selectedMIDISourceID,
+              let parsedUniqueID = Int32(selectedMIDISourceID),
+              let selectedUniqueID = MIDIUniqueID(exactly: parsedUniqueID),
+              let source = midiSourceRef(for: selectedUniqueID) else { return }
+
+        MIDIPortConnectSource(inputPort, source, nil)
+        connectedSourceID = selectedUniqueID
+    }
+
+    private func handle(packetList: UnsafePointer<MIDIPacketList>) {
+        var packet = packetList.pointee.packet
+        for _ in 0..<packetList.pointee.numPackets {
+            let length = Int(packet.length)
+            let bytes = withUnsafeBytes(of: packet.data) { rawBuffer in
+                Array(rawBuffer.prefix(length))
+            }
+            handle(bytes: bytes)
+            packet = MIDIPacketNext(&packet).pointee
+        }
+    }
+
+    private func handle(bytes: [UInt8]) {
+        guard bytes.count >= 3 else { return }
+        let status = bytes[0]
+        let type = status & 0xF0
+        let channel = Int((status & 0x0F) + 1)
+        let number = Int(bytes[1])
+        let velocity = Int(bytes[2])
+
+        let messageType: MacRunOfShowMIDIMessageType?
+        switch type {
+        case 0x90 where velocity > 0:
+            messageType = .noteOn
+        case 0xB0:
+            messageType = .controlChange
+        default:
+            messageType = nil
+        }
+
+        guard let messageType else { return }
+
+        if let listeningAction {
+            let learnedMapping = MacRunOfShowMIDIMapping(
+                messageType: messageType,
+                channel: channel,
+                value: number,
+                velocity: velocity
+            )
+            Task { @MainActor in
+                self.setMapping(learnedMapping, for: listeningAction)
+                self.listeningAction = nil
+            }
+            return
+        }
+
+        let matchedAction: MacRunOfShowMIDIAction?
+        matchedAction = self.action(for: messageType, channel: channel, value: number, velocity: velocity)
+
+        guard let matchedAction else { return }
+        Task { @MainActor in
+            self.perform(action: matchedAction)
+        }
+    }
+
+    private func midiSourceRef(for uniqueID: MIDIUniqueID) -> MIDIEndpointRef? {
+        let sourceCount = MIDIGetNumberOfSources()
+        for index in 0..<sourceCount {
+            let source = MIDIGetSource(index)
+            var sourceID = MIDIUniqueID()
+            guard MIDIObjectGetIntegerProperty(source, kMIDIPropertyUniqueID, &sourceID) == noErr else { continue }
+            if sourceID == uniqueID {
+                return source
+            }
+        }
+        return nil
+    }
+
+    private func midiSourceName(for source: MIDIEndpointRef) -> String? {
+        var unmanagedName: Unmanaged<CFString>?
+        guard MIDIObjectGetStringProperty(source, kMIDIPropertyDisplayName, &unmanagedName) == noErr
+                || MIDIObjectGetStringProperty(source, kMIDIPropertyName, &unmanagedName) == noErr else {
+            return nil
+        }
+        return unmanagedName?.takeRetainedValue() as String?
+    }
+#endif
+
+    private func action(for messageType: MacRunOfShowMIDIMessageType, channel: Int, value: Int, velocity: Int) -> MacRunOfShowMIDIAction? {
+        for action in MacRunOfShowMIDIAction.allCases {
+            let mapping = mapping(for: action)
+            if mapping.messageType == messageType
+                && mapping.channel == channel
+                && mapping.value == value
+                && mapping.velocity == velocity {
+                return action
+            }
+        }
+        return nil
+    }
+}
+
+struct MacSettingsView: View {
+    @EnvironmentObject private var store: ProdConnectStore
+    @EnvironmentObject private var ndiSettings: MacNDISettingsController
+    @EnvironmentObject private var runOfShowControls: MacRunOfShowControlController
+    @State private var selectedSection: MacSettingsSection = .integrations
+
+    private let categories = ["Audio", "Video", "Lighting"]
+    private let sourceTypes = MacNDIFeedSourceType.allCases
+
+    private var hasNDIFeature: Bool {
+        guard let user = store.user else { return false }
+        return user.normalizedSubscriptionTier != "free"
+    }
+
+    private var canManageNDI: Bool {
+        guard let user = store.user else { return false }
+        return hasNDIFeature && (user.isAdmin || user.isOwner)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                Text("Settings")
+                    .font(.system(size: 28, weight: .bold))
+
+                settingsTabBar
+                selectedSectionContent
+            }
+            .padding(20)
+        }
+        .frame(minWidth: 860, minHeight: 620)
+    }
+
+    private var settingsTabBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 10) {
+                ForEach(MacSettingsSection.allCases) { section in
+                    Button {
+                        selectedSection = section
+                    } label: {
+                        Text(section.rawValue)
+                            .font(.subheadline.weight(.semibold))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(selectedSection == section ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.12))
+                            .foregroundStyle(selectedSection == section ? Color.accentColor : Color.primary)
+                            .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var selectedSectionContent: some View {
+        switch selectedSection {
+        case .importData, .locationsRooms, .tickets, .integrations:
+            MacCustomizeView(section: selectedSection)
+                .environmentObject(store)
+        case .ndi:
+            if !hasNDIFeature {
+                Text("NDI settings are available on paid subscriptions.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ndiSettingsSection
+            }
+        case .midi:
+            if !hasNDIFeature {
+                Text("Run of Show Live MIDI controls are available on paid subscriptions.")
+                    .foregroundStyle(.secondary)
+            } else {
+                runOfShowControlsSection
+            }
+        case .users:
+            MacUsersView()
+                .environmentObject(store)
+        }
+    }
+
+    private var runOfShowControlsSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Run of Show Live Controls")
+                .font(.title2.weight(.semibold))
+
+            if runOfShowControls.shows.isEmpty {
+                Text("Create a Run of Show first to configure auto-start and MIDI control.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            } else {
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Picker(
+                            "Controlled Show",
+                            selection: Binding(
+                                get: { runOfShowControls.selectedShowID ?? runOfShowControls.shows.first?.id ?? "" },
+                                set: { runOfShowControls.updateSelectedShowID($0) }
+                            )
+                        ) {
+                            ForEach(runOfShowControls.shows) { show in
+                                Text(show.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled Show" : show.title)
+                                    .tag(show.id)
+                            }
+                        }
+                        .disabled(!runOfShowControls.canManageControls)
+
+                        Toggle("Enable MIDI control", isOn: $runOfShowControls.midiEnabled)
+                            .disabled(!runOfShowControls.canManageControls)
+
+                        Picker(
+                            "MIDI Input",
+                            selection: Binding(
+                                get: { runOfShowControls.selectedMIDISourceID ?? runOfShowControls.midiSources.first?.id ?? "" },
+                                set: { runOfShowControls.updateSelectedMIDISourceID($0) }
+                            )
+                        ) {
+                            if runOfShowControls.midiSources.isEmpty {
+                                Text("No MIDI Devices").tag("")
+                            }
+                            ForEach(runOfShowControls.midiSources) { source in
+                                Text(source.name).tag(source.id)
+                            }
+                        }
+                        .disabled(!runOfShowControls.canManageControls || runOfShowControls.midiSources.isEmpty)
+
+                        Text("Listening to \(runOfShowControls.midiSourceCount) available MIDI source\(runOfShowControls.midiSourceCount == 1 ? "" : "s"). The selected device triggers Start/Restart, Previous, Next, and Reset.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        midiMappingEditor(title: "Start / Restart", action: .startRestart)
+                        midiMappingEditor(title: "Previous", action: .previous)
+                        midiMappingEditor(title: "Next", action: .next)
+                        midiMappingEditor(title: "Reset", action: .reset)
+                    }
+                    .disabled(!runOfShowControls.canManageControls)
+                } label: {
+                    Text("Live Automation")
+                        .font(.headline)
+                }
+            }
+        }
+    }
+
+    private var ndiSettingsSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("NDI Outputs")
+                        .font(.title2.weight(.semibold))
+                    Text("Each feed can target Patchsheet, Run of Show, or Run of Show Live.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Add Feed") {
+                    ndiSettings.addFeed()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canManageNDI)
+            }
+
+            if !canManageNDI {
+                Text("Only admins and owners can manage NDI settings.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if !ndiSettings.runtimeAvailable {
+                Text("NDI runtime is unavailable in this build. Preview windows work, but network NDI output stays disabled until the bundled runtime is present.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            ForEach(Array(ndiSettings.feeds.enumerated()), id: \.element.id) { index, feed in
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            TextField("Feed Name", text: feedBinding(index, \.title))
+                                .textFieldStyle(.roundedBorder)
+                            Picker("Source", selection: feedBinding(index, \.sourceType)) {
+                                ForEach(sourceTypes) { sourceType in
+                                    Text(sourceType.title).tag(sourceType)
+                                }
+                            }
+                            .frame(width: 140)
+                            if feed.sourceType == .patchsheet {
+                                Picker("Category", selection: feedBinding(index, \.category)) {
+                                    ForEach(categories, id: \.self) { category in
+                                        Text(category).tag(category)
+                                    }
+                                }
+                                .frame(width: 140)
+                            } else {
+                                Picker(
+                                    "Show",
+                                    selection: runOfShowBinding(for: index, feed: feed)
+                                ) {
+                                    if ndiSettings.runOfShows().isEmpty {
+                                        Text("No Run of Show").tag("")
+                                    }
+                                    ForEach(ndiSettings.runOfShows()) { show in
+                                        Text(show.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled Show" : show.title)
+                                            .tag(show.id)
+                                    }
+                                }
+                                .frame(width: 220)
+                            }
+                            Button("Remove") {
+                                ndiSettings.removeFeed(id: feed.id)
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(!canManageNDI || ndiSettings.feeds.count == 1)
+                        }
+
+                        HStack(spacing: 14) {
+                            Toggle("Live", isOn: feedBinding(index, \.isLive))
+                            Toggle("Show Headers", isOn: feedBinding(index, \.showsHeaders))
+                            Picker("Orientation", selection: feedBinding(index, \.orientation)) {
+                                ForEach(MacNDIOrientation.allCases) { orientation in
+                                    Text(orientation.title).tag(orientation)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .frame(width: 220)
+                        }
+
+                        HStack {
+                            Text("Preview Scale")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Slider(value: feedBinding(index, \.scale), in: 0.9...2.2, step: 0.05)
+                            Text("\(Int((feed.scale * 100).rounded()))%")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                                .frame(width: 48, alignment: .trailing)
+                        }
+
+                        HStack {
+                            Text(ndiSettings.descriptorText(for: feed))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button(ndiSettings.isPreviewVisible(for: feed.id) ? "Hide Preview" : "Show Preview") {
+                                ndiSettings.togglePreview(for: feed.id)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+
+                        ndiPreview(for: feed)
+                        .frame(height: feed.orientation == .portrait ? 320 : 240)
+                    }
+                    .disabled(!canManageNDI)
+                } label: {
+                    Text("Feed \(index + 1)")
+                        .font(.headline)
+                }
+            }
+        }
+    }
+
+    private func midiMappingEditor(title: String, action: MacRunOfShowMIDIAction) -> some View {
+        let binding = runOfShowControls.binding(for: action)
+        let messageNumberLabel = binding.wrappedValue.messageType == .noteOn ? "Note #\(binding.wrappedValue.value)" : "CC #\(binding.wrappedValue.value)"
+        let velocityLabel = "Velocity \(binding.wrappedValue.velocity)"
+        return HStack(spacing: 12) {
+            Text(title)
+                .frame(width: 120, alignment: .leading)
+            Picker("Type", selection: Binding(
+                get: { binding.wrappedValue.messageType },
+                set: { newValue in
+                    var updated = binding.wrappedValue
+                    updated.messageType = newValue
+                    binding.wrappedValue = updated
+                }
+            )) {
+                ForEach(MacRunOfShowMIDIMessageType.allCases) { messageType in
+                    Text(messageType.rawValue).tag(messageType)
+                }
+            }
+            .frame(width: 90)
+
+            Stepper(
+                "Ch \(binding.wrappedValue.channel)",
+                value: Binding(
+                    get: { binding.wrappedValue.channel },
+                    set: { newValue in
+                        var updated = binding.wrappedValue
+                        updated.channel = newValue
+                        binding.wrappedValue = updated
+                    }
+                ),
+                in: 1...16
+            )
+            .frame(width: 120)
+
+            Stepper(
+                messageNumberLabel,
+                value: Binding(
+                    get: { binding.wrappedValue.value },
+                    set: { newValue in
+                        var updated = binding.wrappedValue
+                        updated.value = newValue
+                        binding.wrappedValue = updated
+                    }
+                ),
+                in: 0...127
+            )
+            .frame(width: 120)
+
+            Stepper(
+                velocityLabel,
+                value: Binding(
+                    get: { binding.wrappedValue.velocity },
+                    set: { newValue in
+                        var updated = binding.wrappedValue
+                        updated.velocity = newValue
+                        binding.wrappedValue = updated
+                    }
+                ),
+                in: 0...127
+            )
+            .frame(width: 128)
+
+            Button(runOfShowControls.isListening(for: action) ? "Listening..." : "Listen") {
+                runOfShowControls.toggleListening(for: action)
+            }
+            .buttonStyle(.borderedProminent)
+
+            Spacer()
+        }
+    }
+
+    private func feedBinding<Value>(_ index: Int, _ keyPath: WritableKeyPath<MacNDIFeedConfiguration, Value>) -> Binding<Value> {
+        Binding(
+            get: { ndiSettings.feeds[index][keyPath: keyPath] },
+            set: { ndiSettings.updateFeedValue($0, at: index, keyPath: keyPath) }
+        )
+    }
+
+    private func runOfShowBinding(for index: Int, feed: MacNDIFeedConfiguration) -> Binding<String> {
+        Binding(
+            get: { feed.runOfShowID ?? ndiSettings.runOfShows().first?.id ?? "" },
+            set: { newValue in
+                ndiSettings.updateRunOfShowID(newValue, at: index)
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func ndiPreview(for feed: MacNDIFeedConfiguration) -> some View {
+        switch feed.sourceType {
+        case .patchsheet:
+            MacPatchsheetNDIPreview(
+                patches: ndiSettings.patches(for: feed.category),
+                category: feed.category,
+                outputName: feed.title,
+                nameColumnTitle: MacNDISettingsController.nameColumnTitle(for: feed.category),
+                inputColumnTitle: MacNDISettingsController.inputColumnTitle(for: feed.category),
+                outputColumnTitle: MacNDISettingsController.outputColumnTitle(for: feed.category),
+                showsUniverseColumn: feed.category == "Lighting",
+                showsHeaders: feed.showsHeaders,
+                isActive: feed.isLive,
+                scale: min(feed.scale, 1.0)
+            )
+        case .runOfShow:
+            MacRunOfShowNDIPreview(
+                show: ndiSettings.runOfShow(for: feed),
+                outputName: feed.title,
+                isActive: feed.isLive,
+                scale: min(feed.scale, 1.0)
+            )
+        case .runOfShowLive:
+            MacRunOfShowLiveNDIPreview(
+                show: ndiSettings.runOfShow(for: feed),
+                outputName: feed.title,
+                isActive: feed.isLive,
+                scale: min(feed.scale, 1.0),
+                now: Date()
+            )
+        }
+    }
+}
+
+private struct MacPatchsheetNDIOutputConfiguration {
+    let isActive: Bool
+    let title: String
+    let sourceType: MacNDIFeedSourceType
+    let category: String
+    let runOfShow: RunOfShowDocument?
+    let patches: [PatchRow]
+    let nameColumnTitle: String
+    let inputColumnTitle: String
+    let outputColumnTitle: String
+    let showsUniverseColumn: Bool
+    let showsHeaders: Bool
+    let scale: Double
+    let orientation: MacNDIOrientation
+}
+
+@MainActor
+private final class MacPatchsheetNDIOutputWindowController {
+    private var window: NSWindow?
+    private var currentConfiguration: MacPatchsheetNDIOutputConfiguration?
+    private var frameTimer: Timer?
+    private let sender = MacNDISender()
+    var isWindowVisible: Bool { window != nil }
+
+    func update(configuration: MacPatchsheetNDIOutputConfiguration) {
+        currentConfiguration = configuration
+
+        let resolvedTitle = configuration.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "ProdConnect Patchsheet"
+            : configuration.title.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if configuration.isActive {
+            sender.updateOutputName(resolvedTitle)
+            startFrameTimerIfNeeded()
+            sendCurrentFrameIfPossible()
+        } else {
+            frameTimer?.invalidate()
+            frameTimer = nil
+            sender.stop()
+        }
+
+        refreshWindowIfVisible()
+    }
+
+    func showWindow() {
+        refreshWindowIfVisible(forceCreate: true)
+    }
+
+    func hideWindow() {
+        window?.close()
+        window = nil
+    }
+
+    func close() {
+        frameTimer?.invalidate()
+        frameTimer = nil
+        currentConfiguration = nil
+        sender.stop()
+        hideWindow()
+    }
+
+    private func refreshWindowIfVisible(forceCreate: Bool = false) {
+        guard let currentConfiguration else { return }
+        guard forceCreate || window != nil else { return }
+
+        let resolvedTitle = currentConfiguration.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "ProdConnect Patchsheet"
+            : currentConfiguration.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let windowSize = currentConfiguration.orientation.windowSize
+
+        let rootView = outputPreviewView(for: currentConfiguration, title: resolvedTitle)
+            .frame(minWidth: windowSize.width, minHeight: windowSize.height)
+
+        if window == nil {
+            let newWindow = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: windowSize.width, height: windowSize.height),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                backing: .buffered,
+                defer: false
+            )
+            newWindow.center()
+            newWindow.isReleasedWhenClosed = false
+            newWindow.titleVisibility = .visible
+            newWindow.titlebarAppearsTransparent = true
+            newWindow.backgroundColor = .black
+            newWindow.contentView = NSHostingView(rootView: rootView)
+            newWindow.makeKeyAndOrderFront(nil)
+            window = newWindow
+        } else {
+            window?.setContentSize(windowSize)
+            window?.contentView = NSHostingView(rootView: rootView)
+            window?.makeKeyAndOrderFront(nil)
+        }
+
+        window?.title = resolvedTitle
+    }
+
+    private func outputPreviewView(for configuration: MacPatchsheetNDIOutputConfiguration, title: String) -> some View {
+        Group {
+            switch configuration.sourceType {
+            case .patchsheet:
+                MacPatchsheetNDIPreview(
+                    patches: configuration.patches,
+                    category: configuration.category,
+                    outputName: title,
+                    nameColumnTitle: configuration.nameColumnTitle,
+                    inputColumnTitle: configuration.inputColumnTitle,
+                    outputColumnTitle: configuration.outputColumnTitle,
+                    showsUniverseColumn: configuration.showsUniverseColumn,
+                    showsHeaders: configuration.showsHeaders,
+                    isActive: sender.isReadyToSend,
+                    scale: configuration.scale
+                )
+            case .runOfShow:
+                MacRunOfShowNDIPreview(
+                    show: configuration.runOfShow,
+                    outputName: title,
+                    isActive: sender.isReadyToSend,
+                    scale: configuration.scale
+                )
+            case .runOfShowLive:
+                MacRunOfShowLiveNDIPreview(
+                    show: configuration.runOfShow,
+                    outputName: title,
+                    isActive: sender.isReadyToSend,
+                    scale: configuration.scale,
+                    now: Date()
+                )
+            }
+        }
+    }
+
+    private func startFrameTimerIfNeeded() {
+        guard frameTimer == nil else { return }
+        frameTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 12.0, repeats: true) { [weak self] _ in
+            guard let controller = self else { return }
+            Task { @MainActor [controller] in
+                controller.sendCurrentFrameIfPossible()
+            }
+        }
+        if let frameTimer {
+            RunLoop.main.add(frameTimer, forMode: .common)
+        }
+    }
+
+    private func sendCurrentFrameIfPossible() {
+        guard sender.isReadyToSend, let currentConfiguration else { return }
+        let resolvedTitle = currentConfiguration.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "ProdConnect Patchsheet"
+            : currentConfiguration.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let outputSize = currentConfiguration.orientation.outputSize
+        let preview = outputPreviewView(for: currentConfiguration, title: resolvedTitle)
+            .frame(width: outputSize.width, height: outputSize.height)
+        guard let image = MacNDIRenderer.snapshot(of: preview, size: outputSize) else { return }
+        sender.send(image: image)
+    }
+}
+
+private enum MacNDIRenderer {
+    @MainActor
+    static func snapshot<Content: View>(of view: Content, size: CGSize) -> CGImage? {
+        let renderer = ImageRenderer(
+            content: view
+                .frame(width: size.width, height: size.height)
+        )
+        renderer.proposedSize = ProposedViewSize(size)
+        renderer.scale = NSScreen.main?.backingScaleFactor ?? 2.0
+        return renderer.cgImage
+    }
+}
+
+private struct NDISendCreateSettings {
+    var p_ndi_name: UnsafePointer<CChar>?
+    var p_groups: UnsafePointer<CChar>?
+    var clock_video: UInt8
+    var clock_audio: UInt8
+}
+
+private struct NDIVideoFrameV2 {
+    var xres: Int32
+    var yres: Int32
+    var FourCC: UInt32
+    var frame_rate_N: Int32
+    var frame_rate_D: Int32
+    var picture_aspect_ratio: Float
+    var frame_format_type: Int32
+    var timecode: Int64
+    var p_data: UnsafeMutablePointer<UInt8>?
+    var line_stride_in_bytes: Int32
+    var p_metadata: UnsafePointer<CChar>?
+    var timestamp: Int64
+}
+
+private typealias NDIInitializeFunction = @convention(c) () -> Bool
+private typealias NDIDestroyFunction = @convention(c) () -> Void
+private typealias NDISendCreateFunction = @convention(c) (UnsafeRawPointer?) -> OpaquePointer?
+private typealias NDISendDestroyFunction = @convention(c) (OpaquePointer?) -> Void
+private typealias NDISendVideoFunction = @convention(c) (OpaquePointer?, UnsafeRawPointer?) -> Void
+
+private final class MacNDIRuntime {
+    static let shared = MacNDIRuntime()
+
+    let isAvailable: Bool
+    private let handle: UnsafeMutableRawPointer?
+    private let destroyFunction: NDIDestroyFunction?
+    private let sendCreateFunction: NDISendCreateFunction?
+    private let sendDestroyFunction: NDISendDestroyFunction?
+    private let sendVideoFunction: NDISendVideoFunction?
+
+    private init() {
+        let candidatePaths = Self.candidateLibraryPaths()
+
+        var loadedHandle: UnsafeMutableRawPointer?
+        for path in candidatePaths {
+            loadedHandle = dlopen(path, RTLD_NOW | RTLD_LOCAL)
+            if loadedHandle != nil { break }
+        }
+
+        handle = loadedHandle
+
+        guard let handle,
+              let initializeSymbol = dlsym(handle, "NDIlib_initialize"),
+              let destroySymbol = dlsym(handle, "NDIlib_destroy"),
+              let sendCreateSymbol = dlsym(handle, "NDIlib_send_create"),
+              let sendDestroySymbol = dlsym(handle, "NDIlib_send_destroy"),
+              let sendVideoSymbol = dlsym(handle, "NDIlib_send_send_video_v2") else {
+            isAvailable = false
+            destroyFunction = nil
+            sendCreateFunction = nil
+            sendDestroyFunction = nil
+            sendVideoFunction = nil
+            return
+        }
+
+        let initialize = unsafeBitCast(initializeSymbol, to: NDIInitializeFunction.self)
+        destroyFunction = unsafeBitCast(destroySymbol, to: NDIDestroyFunction.self)
+        sendCreateFunction = unsafeBitCast(sendCreateSymbol, to: NDISendCreateFunction.self)
+        sendDestroyFunction = unsafeBitCast(sendDestroySymbol, to: NDISendDestroyFunction.self)
+        sendVideoFunction = unsafeBitCast(sendVideoSymbol, to: NDISendVideoFunction.self)
+        isAvailable = initialize()
+    }
+
+    deinit {
+        if isAvailable {
+            destroyFunction?()
+        }
+        if let handle {
+            dlclose(handle)
+        }
+    }
+
+    private static func candidateLibraryPaths() -> [String] {
+        var paths: [String] = []
+
+        if let bundled = bundledLibraryPaths() {
+            paths.append(contentsOf: bundled)
+        }
+
+        paths.append(contentsOf: [
+            ProcessInfo.processInfo.environment["NDI_RUNTIME_PATH"],
+            "/Library/NDI SDK for Apple/lib/macOS/libndi.dylib",
+            "/usr/local/lib/libndi.dylib",
+            "/Library/Application Support/NDI/lib/macOS/libndi.dylib",
+            "libndi.dylib"
+        ].compactMap { $0 })
+
+        var seen: Set<String> = []
+        return paths.filter { seen.insert($0).inserted }
+    }
+
+    private static func bundledLibraryPaths() -> [String]? {
+        guard let bundleURL = Bundle.main.bundleURL.standardizedFileURL as URL? else { return nil }
+
+        let bundleRelativeCandidates = [
+            "Contents/Frameworks/libndi.dylib",
+            "Contents/Frameworks/NDIlib.framework/NDIlib",
+            "Contents/Frameworks/NDI.framework/NDI",
+            "Contents/Resources/NDI/libndi.dylib",
+            "Contents/Resources/NDI/NDIlib.framework/NDIlib",
+            "Contents/Resources/libndi.dylib"
+        ]
+
+        let directCandidates = [
+            Bundle.main.privateFrameworksURL?.appendingPathComponent("libndi.dylib"),
+            Bundle.main.privateFrameworksURL?.appendingPathComponent("NDIlib.framework/NDIlib"),
+            Bundle.main.privateFrameworksURL?.appendingPathComponent("NDI.framework/NDI"),
+            Bundle.main.resourceURL?.appendingPathComponent("NDI/libndi.dylib"),
+            Bundle.main.resourceURL?.appendingPathComponent("NDI/NDIlib.framework/NDIlib"),
+            Bundle.main.resourceURL?.appendingPathComponent("libndi.dylib")
+        ]
+        .compactMap { $0?.path }
+
+        let relativeCandidates = bundleRelativeCandidates.map {
+            bundleURL.appendingPathComponent($0).path
+        }
+
+        return directCandidates + relativeCandidates
+    }
+
+    func makeSender(named name: String) -> OpaquePointer? {
+        guard let sendCreateFunction else { return nil }
+        return name.withCString { ndiName in
+            var settings = NDISendCreateSettings(
+                p_ndi_name: ndiName,
+                p_groups: nil,
+                clock_video: 0,
+                clock_audio: 0
+            )
+            return withUnsafePointer(to: &settings) { pointer in
+                sendCreateFunction(UnsafeRawPointer(pointer))
+            }
+        }
+    }
+
+    func destroySender(_ sender: OpaquePointer?) {
+        sendDestroyFunction?(sender)
+    }
+
+    func sendVideo(_ frame: NDIVideoFrameV2, on sender: OpaquePointer?) {
+        guard let sendVideoFunction else { return }
+        var mutableFrame = frame
+        withUnsafePointer(to: &mutableFrame) { pointer in
+            sendVideoFunction(sender, UnsafeRawPointer(pointer))
+        }
+    }
+}
+
+@MainActor
+private final class MacNDISender {
+    static var isRuntimeAvailable: Bool { MacNDIRuntime.shared.isAvailable }
+
+    private let runtime = MacNDIRuntime.shared
+    private var senderInstance: OpaquePointer?
+    private var currentOutputName = ""
+
+    var isReadyToSend: Bool {
+        senderInstance != nil
+    }
+
+    func updateOutputName(_ outputName: String) {
+        guard runtime.isAvailable else { return }
+        let resolved = outputName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "ProdConnect Patchsheet"
+            : outputName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard currentOutputName != resolved || senderInstance == nil else { return }
+        stop()
+        senderInstance = runtime.makeSender(named: resolved)
+        currentOutputName = resolved
+    }
+
+    func send(image: CGImage) {
+        guard let senderInstance else { return }
+        guard let payload = makeVideoFramePayload(from: image) else { return }
+        runtime.sendVideo(payload.frame, on: senderInstance)
+        _ = payload
+    }
+
+    func stop() {
+        if let senderInstance {
+            runtime.destroySender(senderInstance)
+        }
+        senderInstance = nil
+        currentOutputName = ""
+    }
+
+    private func makeVideoFramePayload(from image: CGImage) -> (frame: NDIVideoFrameV2, storage: [UInt8])? {
+        let width = image.width
+        let height = image.height
+        guard width > 0, height > 0 else { return nil }
+
+        let bytesPerRow = width * 4
+        var storage = [UInt8](repeating: 0, count: height * bytesPerRow)
+        let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        guard let context = CGContext(
+            data: &storage,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: bitmapInfo
+        ) else {
+            return nil
+        }
+
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        let frame = storage.withUnsafeMutableBufferPointer { buffer -> NDIVideoFrameV2 in
+            NDIVideoFrameV2(
+                xres: Int32(width),
+                yres: Int32(height),
+                FourCC: MacNDISender.fourCC("BGRA"),
+                frame_rate_N: 30000,
+                frame_rate_D: 1000,
+                picture_aspect_ratio: Float(width) / Float(height),
+                frame_format_type: 1,
+                timecode: Int64.max,
+                p_data: buffer.baseAddress,
+                line_stride_in_bytes: Int32(bytesPerRow),
+                p_metadata: nil,
+                timestamp: 0
+            )
+        }
+
+        return (frame, storage)
+    }
+
+    private static func fourCC(_ value: String) -> UInt32 {
+        let utf8 = Array(value.utf8.prefix(4))
+        guard utf8.count == 4 else { return 0 }
+        return UInt32(utf8[0])
+            | (UInt32(utf8[1]) << 8)
+            | (UInt32(utf8[2]) << 16)
+            | (UInt32(utf8[3]) << 24)
+    }
+}
+
+private struct MacPatchsheetNDIPreview: View {
+    let patches: [PatchRow]
+    let category: String
+    let outputName: String
+    let nameColumnTitle: String
+    let inputColumnTitle: String
+    let outputColumnTitle: String
+    let showsUniverseColumn: Bool
+    let showsHeaders: Bool
+    let isActive: Bool
+    let scale: Double
+
+    private var titleFont: Font { .system(size: 20 * scale, weight: .bold) }
+    private var subtitleFont: Font { .system(size: 12 * scale, weight: .medium) }
+    private var headerFont: Font { .system(size: 11 * scale, weight: .semibold) }
+    private var rowFont: Font { .system(size: 18 * scale, weight: .semibold) }
+    private var cellPadding: CGFloat { 12 * scale }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(outputName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "ProdConnect Patchsheet" : outputName)
+                        .font(titleFont)
+                        .foregroundStyle(.white)
+                    Text("\(category) preview")
+                        .font(subtitleFont)
+                        .textCase(.uppercase)
+                        .foregroundStyle(Color.white.opacity(0.65))
+                }
+                Spacer()
+                Text(isActive ? "LIVE" : "PREVIEW")
+                    .font(.system(size: 10 * scale, weight: .bold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background((isActive ? Color.green : Color.gray).opacity(0.22))
+                    .clipShape(Capsule())
+                    .foregroundStyle(isActive ? Color.green : Color.white.opacity(0.75))
+            }
+
+            if patches.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("No patches selected")
+                        .font(.system(size: 18 * scale, weight: .semibold))
+                        .foregroundStyle(.white)
+                    Text("Enable the NDI checkbox on any patch row to include it in this output.")
+                        .font(.system(size: 13 * scale))
+                        .foregroundStyle(Color.white.opacity(0.72))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .padding(.top, 12)
+            } else {
+                if showsHeaders {
+                    HStack(spacing: 0) {
+                        headerCell(nameColumnTitle)
+                        headerCell(inputColumnTitle)
+                        headerCell(outputColumnTitle)
+                        if showsUniverseColumn {
+                            headerCell("Universe")
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(patches) { patch in
+                        HStack(spacing: 0) {
+                            valueCell(patch.name)
+                            valueCell(patch.input)
+                            valueCell(patch.output)
+                            if showsUniverseColumn {
+                                valueCell(patch.universe ?? "")
+                            }
+                        }
+                        .overlay(alignment: .bottom) {
+                            Rectangle()
+                                .fill(Color.white.opacity(0.08))
+                                .frame(height: 1)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(18 * scale)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color(red: 0.08, green: 0.17, blue: 0.27),
+                            Color(red: 0.04, green: 0.08, blue: 0.12)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private func headerCell(_ value: String) -> some View {
+        Text(value)
+            .font(headerFont)
+            .textCase(.uppercase)
+            .foregroundStyle(Color.white.opacity(0.62))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, cellPadding)
+            .padding(.vertical, 10 * scale)
+            .background(Color.white.opacity(0.06))
+    }
+
+    private func valueCell(_ value: String) -> some View {
+        Text(value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? " " : value)
+            .font(rowFont)
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, cellPadding)
+            .padding(.vertical, 12 * scale)
+    }
+}
+
+private struct MacRunOfShowNDIPreview: View {
+    let show: RunOfShowDocument?
+    let outputName: String
+    let isActive: Bool
+    let scale: Double
+
+    private var titleFont: Font { .system(size: 22 * scale, weight: .bold) }
+    private var subtitleFont: Font { .system(size: 12 * scale, weight: .medium) }
+    private var rowFont: Font { .system(size: 16 * scale, weight: .semibold) }
+
+    var body: some View {
+        let resolvedShow = show
+        let items = resolvedShow?.sortedItems ?? []
+
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    let showTitle = resolvedShow?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    Text(outputName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "ProdConnect Run of Show" : outputName)
+                        .font(titleFont)
+                        .foregroundStyle(.white)
+                    Text(showTitle.isEmpty ? "Run of Show Preview" : showTitle)
+                        .font(subtitleFont)
+                        .foregroundStyle(Color.white.opacity(0.7))
+                }
+                Spacer()
+                Text(isActive ? "LIVE" : "PREVIEW")
+                    .font(.system(size: 10 * scale, weight: .bold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background((isActive ? Color.green : Color.gray).opacity(0.22))
+                    .clipShape(Capsule())
+                    .foregroundStyle(isActive ? Color.green : Color.white.opacity(0.75))
+            }
+
+            if items.isEmpty {
+                Text("No run of show items available.")
+                    .foregroundStyle(Color.white.opacity(0.75))
+            } else {
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack(spacing: 0) {
+                        headerCell("Length")
+                            .frame(width: 110, alignment: .leading)
+                        headerCell("Title")
+                        headerCell("Person")
+                        headerCell("Notes")
+                    }
+
+                    ForEach(items) { item in
+                        HStack(spacing: 0) {
+                            valueCell(item.formattedDuration)
+                                .frame(width: 110, alignment: .leading)
+                            valueCell(item.title)
+                            valueCell(item.person)
+                            valueCell(item.notes)
+                        }
+                        .overlay(alignment: .bottom) {
+                            Rectangle()
+                                .fill(Color.white.opacity(0.08))
+                                .frame(height: 1)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(18 * scale)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color(red: 0.13, green: 0.13, blue: 0.16),
+                            Color(red: 0.08, green: 0.08, blue: 0.11)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+        )
+    }
+
+    private func headerCell(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 11 * scale, weight: .semibold))
+            .textCase(.uppercase)
+            .foregroundStyle(Color.white.opacity(0.62))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10 * scale)
+            .padding(.vertical, 10 * scale)
+            .background(Color.white.opacity(0.06))
+    }
+
+    private func valueCell(_ text: String) -> some View {
+        Text(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? " " : text)
+            .font(rowFont)
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10 * scale)
+            .padding(.vertical, 12 * scale)
+    }
+}
+
+private struct MacRunOfShowLiveNDIPreview: View {
+    let show: RunOfShowDocument?
+    let outputName: String
+    let isActive: Bool
+    let scale: Double
+    let now: Date
+
+    var body: some View {
+        let items = show?.sortedItems ?? []
+        let activeCurrentItemID = show?.isLiveActive == true ? show?.liveCurrentItemID : items.first?.id
+        let currentIndex = show?.itemIndex(for: activeCurrentItemID)
+        let currentItem = currentIndex.flatMap { items.indices.contains($0) ? items[$0] : nil }
+        let nextItem = currentIndex.flatMap { index in
+            let nextIndex = index + 1
+            return items.indices.contains(nextIndex) ? items[nextIndex] : nil
+        }
+        let remaining = {
+            guard let show, let currentItem else { return 0 }
+            if show.isLiveActive {
+                return show.currentRemainingSeconds(at: now)
+            }
+            return currentItem.durationSeconds
+        }()
+        let overrunSeconds = show?.isLiveActive == true ? (show?.currentOverrunSeconds(at: now) ?? 0) : 0
+        let isOverrun = overrunSeconds > 0
+        let endTime = {
+            guard let show else { return now }
+            if show.isLiveActive {
+                return show.projectedEndTime(at: now)
+            }
+            return show.scheduledStart.addingTimeInterval(TimeInterval(show.totalDurationSeconds))
+        }()
+        let currentTitle = currentItem?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let currentNotes = currentItem?.notes.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let nextTitle = nextItem?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let currentSummary = currentItem.map { "\($0.formattedDuration) • \($0.person.isEmpty ? "No person assigned" : $0.person)" } ?? "Waiting to start"
+        let nextSummary = nextItem.map { "\($0.formattedDuration) • \($0.person.isEmpty ? "No person assigned" : $0.person)" } ?? "End of show"
+
+        return HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                VStack(spacing: 8 * scale) {
+                    Text(isOverrun ? runOfShowOverrunClock(seconds: overrunSeconds) : runOfShowFormattedClock(seconds: remaining))
+                        .font(.system(size: 40 * scale, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
+                    Text("Show should end \(endTime.formatted(date: .omitted, time: .shortened))")
+                        .font(.system(size: 10 * scale, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.82))
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 18 * scale)
+                .background(isOverrun ? Color(red: 0.79, green: 0.17, blue: 0.2) : Color(red: 0.2, green: 0.68, blue: 0.36))
+
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(items.prefix(6).enumerated()), id: \.element.id) { _, item in
+                        HStack(spacing: 8 * scale) {
+                            Text(item.title)
+                                .font(.system(size: 11 * scale, weight: item.id == currentItem?.id ? .semibold : .regular))
+                                .foregroundStyle(item.id == currentItem?.id ? Color.white : Color.white.opacity(0.68))
+                                .lineLimit(2)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 10 * scale)
+                        .padding(.vertical, 8 * scale)
+                        .background(item.id == currentItem?.id ? Color.orange.opacity(0.2) : Color.clear)
+                    }
+                }
+                .background(Color(red: 0.1, green: 0.11, blue: 0.14))
+
+                Spacer(minLength: 0)
+            }
+            .frame(width: 210 * scale)
+
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(alignment: .bottom, spacing: 12 * scale) {
+                    Text("NOW")
+                        .font(.system(size: 12 * scale, weight: .bold))
+                        .foregroundStyle(Color.white.opacity(0.7))
+                        .padding(.horizontal, 12 * scale)
+                        .padding(.vertical, 5 * scale)
+                        .background(Color.white.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 6 * scale, style: .continuous))
+
+                    Text(currentTitle.isEmpty ? "No active item" : currentTitle)
+                        .font(.system(size: 30 * scale, weight: .light))
+                        .foregroundStyle(.white)
+                        .lineLimit(2)
+                    Spacer()
+                }
+                .padding(18 * scale)
+                .background(Color(red: 0.11, green: 0.12, blue: 0.15))
+                .overlay(alignment: .bottom) {
+                    Rectangle()
+                        .fill(Color(red: 0.2, green: 0.68, blue: 0.36))
+                        .frame(height: max(1, 2 * scale))
+                }
+
+                VStack(alignment: .leading, spacing: 6 * scale) {
+                    Text("ITEM NOTES")
+                        .font(.system(size: 10 * scale, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.65))
+                    Text(currentNotes.isEmpty ? "No item notes" : currentNotes)
+                        .font(.system(size: 13 * scale))
+                        .foregroundStyle(Color.white.opacity(0.86))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10 * scale)
+                        .background(Color.white.opacity(0.06))
+                        .clipShape(RoundedRectangle(cornerRadius: 8 * scale, style: .continuous))
+                }
+                .padding(18 * scale)
+                .background(Color(red: 0.11, green: 0.12, blue: 0.15))
+
+                VStack(alignment: .leading, spacing: 10 * scale) {
+                    Text("NEXT")
+                        .font(.system(size: 12 * scale, weight: .bold))
+                        .foregroundStyle(Color.white.opacity(0.7))
+                        .padding(.horizontal, 12 * scale)
+                        .padding(.vertical, 5 * scale)
+                        .background(Color.white.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 6 * scale, style: .continuous))
+
+                    Text(nextTitle.isEmpty ? "No next item" : nextTitle)
+                        .font(.system(size: 24 * scale, weight: .light))
+                        .foregroundStyle(Color.white.opacity(0.92))
+                        .lineLimit(2)
+
+                    Text(nextSummary)
+                        .font(.system(size: 12 * scale))
+                        .foregroundStyle(Color.white.opacity(0.64))
+
+                    Text(currentSummary)
+                        .font(.system(size: 11 * scale))
+                        .foregroundStyle(Color.white.opacity(0.52))
+
+                    Spacer(minLength: 0)
+                }
+                .padding(18 * scale)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .background(Color(red: 0.09, green: 0.1, blue: 0.13))
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color(red: 0.08, green: 0.09, blue: 0.11))
+        .clipShape(RoundedRectangle(cornerRadius: 18 * scale, style: .continuous))
+    }
+}
+
+private func runOfShowFormattedClock(seconds: Int) -> String {
+    let minutes = max(seconds, 0) / 60
+    let remainingSeconds = max(seconds, 0) % 60
+    return String(format: "%02d:%02d", minutes, remainingSeconds)
+}
+
+private func runOfShowOverrunClock(seconds: Int) -> String {
+    let minutes = max(seconds, 0) / 60
+    let remainingSeconds = max(seconds, 0) % 60
+    return String(format: "-%02d:%02d", minutes, remainingSeconds)
 }
 
 private struct MacEditPatchView: View {
@@ -1636,6 +3922,10 @@ private struct MacEditPatchView: View {
                         TextField("Input", text: $patch.input).disabled(!canEdit)
                         TextField("Output", text: $patch.output).disabled(!canEdit)
                     }
+
+                    TextField("Notes", text: $patch.notes, axis: .vertical)
+                        .lineLimit(2...6)
+                        .disabled(!canEdit)
 
                     if store.locations.isEmpty {
                         TextField("Campus/Location", text: $patch.campus).disabled(!canEdit)
@@ -1728,10 +4018,769 @@ private struct MacEditPatchView: View {
     }
 }
 
+private struct MacRunOfShowView: View {
+    @EnvironmentObject private var store: ProdConnectStore
+    @EnvironmentObject private var runOfShowControls: MacRunOfShowControlController
+    @State private var selectedShowID: String?
+    @State private var showToDelete: RunOfShowDocument?
+
+    private var canEdit: Bool {
+        store.canEditRunOfShow
+    }
+
+    private var shows: [RunOfShowDocument] {
+        store.runOfShows.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private var selectedShow: RunOfShowDocument? {
+        guard let selectedShowID else { return shows.first }
+        return shows.first(where: { $0.id == selectedShowID }) ?? shows.first
+    }
+
+    var body: some View {
+        HSplitView {
+            sidebar
+                .frame(minWidth: 240, idealWidth: 280, maxWidth: 320)
+
+            if let show = selectedShow {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        showHeader(show)
+                        timelineGrid(for: show)
+                        livePanel(for: show)
+                    }
+                    .padding(20)
+                }
+                .navigationTitle("Run of Show")
+            } else {
+                ContentUnavailableView(
+                    "No Run of Show",
+                    systemImage: "list.bullet.rectangle.portrait",
+                    description: Text("Create a show to build your timeline and live view.")
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .onAppear {
+            if selectedShowID == nil {
+                selectedShowID = shows.first?.id
+            }
+        }
+        .onChange(of: shows.map(\.id)) { _, ids in
+            if let selectedShowID, ids.contains(selectedShowID) {
+                return
+            }
+            self.selectedShowID = ids.first
+        }
+        .alert("Delete Run of Show?", isPresented: Binding(
+            get: { showToDelete != nil },
+            set: { if !$0 { showToDelete = nil } }
+        )) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                guard let showToDelete else { return }
+                store.deleteRunOfShow(showToDelete)
+                if selectedShowID == showToDelete.id {
+                    selectedShowID = shows.first(where: { $0.id != showToDelete.id })?.id
+                }
+                self.showToDelete = nil
+            }
+        } message: {
+            Text("This permanently deletes the selected run of show.")
+        }
+    }
+
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Run of Show")
+                    .font(.system(size: 20, weight: .bold))
+                Spacer()
+                Button {
+                    addShow()
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canEdit)
+            }
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(shows) { show in
+                        Button {
+                            selectedShowID = show.id
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(show.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled Show" : show.title)
+                                    .font(.headline)
+                                    .foregroundStyle(.primary)
+                                Text(show.scheduledStart.formatted(date: .omitted, time: .shortened))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
+                            .background(
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .fill(selectedShowID == show.id ? Color.accentColor.opacity(0.18) : Color.white.opacity(0.04))
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .background(Color.black.opacity(0.16))
+    }
+
+    private func showHeader(_ show: RunOfShowDocument) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 6) {
+                    TextField(
+                        "Show Title",
+                        text: Binding(
+                            get: { show.title },
+                            set: { newValue in
+                                updateShow(show) { $0.title = newValue }
+                            }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 28, weight: .bold))
+
+                    Text("\(show.sortedItems.count) items • \(formatDuration(seconds: show.totalDurationSeconds)) total")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if canEdit {
+                    Button("Delete", role: .destructive) {
+                        showToDelete = show
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+
+            HStack(spacing: 12) {
+                DatePicker(
+                    "Start Time",
+                    selection: Binding(
+                        get: { show.scheduledStart },
+                        set: { value in
+                            updateShow(show) { mutable in
+                                mutable.scheduledStart = value
+                            }
+                        }
+                    ),
+                    displayedComponents: [.date, .hourAndMinute]
+                )
+                .disabled(!canEdit)
+
+                Toggle(
+                    "Auto Start",
+                    isOn: Binding(
+                        get: { show.autoStartLive },
+                        set: { value in
+                            updateShow(show) { mutable in
+                                mutable.autoStartLive = value
+                            }
+                        }
+                    )
+                )
+                .toggleStyle(.checkbox)
+                .disabled(!canEdit)
+
+                Spacer()
+
+                Button("Add Item") {
+                    addItem(to: show)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canEdit)
+            }
+        }
+    }
+
+    private func timelineGrid(for show: RunOfShowDocument) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 0) {
+                timelineHeaderCell("Time", width: 110)
+                timelineHeaderCell("Length", width: 90)
+                timelineHeaderCell("Title", width: 260)
+                timelineHeaderCell("Person", width: 180)
+                timelineHeaderCell("Notes", width: 320)
+                timelineHeaderCell("", width: 110)
+            }
+            .background(Color.white.opacity(0.05))
+
+            ForEach(Array(show.sortedItems.enumerated()), id: \.element.id) { index, item in
+                HStack(spacing: 0) {
+                    timelineValueCell(startTimeText(for: show, itemIndex: index), width: 110)
+                    timelineLengthCell(show: show, item: item)
+                    timelineEditableCell(title: "Title", text: item.title, width: 260) { newValue in
+                        updateItem(show, itemID: item.id) { $0.title = newValue }
+                    }
+                    timelineEditableCell(title: "Person", text: item.person, width: 180) { newValue in
+                        updateItem(show, itemID: item.id) { $0.person = newValue }
+                    }
+                    timelineEditableCell(title: "Notes", text: item.notes, width: 320) { newValue in
+                        updateItem(show, itemID: item.id) { $0.notes = newValue }
+                    }
+                    timelineActionsCell(show: show, item: item, index: index)
+                }
+                .background(index.isMultiple(of: 2) ? Color.white.opacity(0.02) : Color.clear)
+                .overlay(alignment: .bottom) {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.05))
+                        .frame(height: 1)
+                }
+            }
+        }
+        .background(Color.white.opacity(0.02))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+    }
+
+    private func livePanel(for show: RunOfShowDocument) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("Run of Show Live")
+                    .font(.title2.weight(.semibold))
+                Spacer()
+                Button(show.isLiveActive ? "Restart" : "Start") {
+                    startLive(show)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(show.sortedItems.isEmpty || !canEdit)
+
+                Button("Previous") {
+                    moveLive(show, direction: -1)
+                }
+                .buttonStyle(.bordered)
+                .disabled(!show.isLiveActive || !canEdit)
+
+                Button("Next") {
+                    moveLive(show, direction: 1)
+                }
+                .buttonStyle(.bordered)
+                .disabled(!show.isLiveActive || !canEdit)
+
+                Button("Reset") {
+                    resetLive(show)
+                }
+                .buttonStyle(.bordered)
+                .disabled((!show.isLiveActive && show.liveCurrentItemID == nil) || !canEdit)
+            }
+
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                liveSnapshotView(show: show, now: context.date)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(18)
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { now in
+            handleAutomaticLiveStart(for: show, now: now)
+        }
+    }
+
+    private func liveSnapshotView(show: RunOfShowDocument, now: Date) -> some View {
+        let items = show.sortedItems
+        let activeCurrentItemID = show.isLiveActive ? show.liveCurrentItemID : items.first?.id
+        let currentIndex = show.itemIndex(for: activeCurrentItemID)
+        let currentItem = currentIndex.flatMap { items.indices.contains($0) ? items[$0] : nil }
+        let nextItem = currentIndex.flatMap { index in
+            let nextIndex = index + 1
+            return items.indices.contains(nextIndex) ? items[nextIndex] : nil
+        }
+        let remainingSeconds = currentItem.map { item in
+            if show.isLiveActive {
+                return max(item.durationSeconds - Int(now.timeIntervalSince(show.liveItemStartedAt ?? now)), 0)
+            }
+            return item.durationSeconds
+        } ?? 0
+        let currentTitle = currentItem?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let currentNotes = currentItem?.notes.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let nextTitle = nextItem?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let currentSummary = currentItem.map { "\($0.formattedDuration) • \($0.person.isEmpty ? "No person assigned" : $0.person)" } ?? "Waiting to start"
+        let nextSummary = nextItem.map { "\($0.formattedDuration) • \($0.person.isEmpty ? "No person assigned" : $0.person)" } ?? "End of show"
+        let overrunSeconds = show.isLiveActive ? show.currentOverrunSeconds(at: now) : 0
+        let isOverrun = overrunSeconds > 0
+        let projectedEndTime = show.isLiveActive
+            ? show.projectedEndTime(at: now)
+            : show.scheduledStart.addingTimeInterval(TimeInterval(show.totalDurationSeconds))
+
+        return HStack(spacing: 0) {
+            liveSidebar(
+                show: show,
+                items: items,
+                currentItemID: currentItem?.id,
+                remainingSeconds: remainingSeconds,
+                overrunSeconds: overrunSeconds,
+                isOverrun: isOverrun,
+                projectedEndTime: projectedEndTime
+            )
+            liveMainContent(
+                projectedEndTime: projectedEndTime,
+                currentItem: currentItem,
+                currentTitle: currentTitle,
+                currentNotes: currentNotes,
+                currentSummary: currentSummary,
+                nextTitle: nextTitle,
+                nextSummary: nextSummary
+            )
+        }
+        .frame(maxWidth: .infinity, minHeight: 560, alignment: .topLeading)
+        .background(Color(red: 0.08, green: 0.09, blue: 0.11))
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private func liveSidebar(show: RunOfShowDocument, items: [RunOfShowItem], currentItemID: String?, remainingSeconds: Int, overrunSeconds: Int, isOverrun: Bool, projectedEndTime: Date) -> some View {
+        VStack(spacing: 0) {
+            VStack(spacing: 10) {
+                Text(isOverrun ? overrunClock(seconds: overrunSeconds) : formattedClock(seconds: remainingSeconds))
+                    .font(.system(size: 42, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                Text(show.isLiveActive ? "Show should end \(projectedEndTime.formatted(date: .omitted, time: .shortened))" : "live not started")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.82))
+                    .multilineTextAlignment(.center)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 22)
+            .background(isOverrun ? Color(red: 0.79, green: 0.17, blue: 0.2) : Color(red: 0.2, green: 0.68, blue: 0.36))
+
+            HStack(spacing: 8) {
+                Button("Prev") {
+                    moveLive(show, direction: -1)
+                }
+                .buttonStyle(.bordered)
+                .disabled(!show.isLiveActive || !canEdit)
+
+                Button("Next") {
+                    moveLive(show, direction: 1)
+                }
+                .buttonStyle(.bordered)
+                .disabled(!show.isLiveActive || !canEdit)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity)
+            .background(Color(red: 0.12, green: 0.13, blue: 0.16))
+
+            liveRundownList(show: show, items: items, currentItemID: currentItemID)
+            Spacer(minLength: 0)
+        }
+        .frame(width: 240)
+    }
+
+    private func liveRundownList(show: RunOfShowDocument, items: [RunOfShowItem], currentItemID: String?) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Time")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.white.opacity(0.65))
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+
+            ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                let itemStart = startTimeText(for: show, itemIndex: index)
+                let isCurrent = item.id == currentItemID
+
+                HStack(spacing: 10) {
+                    Text(itemStart)
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .foregroundStyle(isCurrent ? Color.orange : Color.white.opacity(0.5))
+                        .frame(width: 58, alignment: .leading)
+                    Text(item.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : item.title)
+                        .font(.system(size: 13, weight: isCurrent ? .semibold : .regular))
+                        .foregroundStyle(isCurrent ? Color.white : Color.white.opacity(0.7))
+                        .lineLimit(2)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(isCurrent ? Color.orange.opacity(0.18) : (index.isMultiple(of: 2) ? Color.white.opacity(0.03) : Color.clear))
+            }
+        }
+        .background(Color(red: 0.1, green: 0.11, blue: 0.14))
+    }
+
+    private func liveMainContent(
+        projectedEndTime: Date,
+        currentItem: RunOfShowItem?,
+        currentTitle: String,
+        currentNotes: String,
+        currentSummary: String,
+        nextTitle: String,
+        nextSummary: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .bottom, spacing: 14) {
+                Text("NOW")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(Color.white.opacity(0.7))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .background(Color.white.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(currentTitle.isEmpty ? "No active item" : currentTitle)
+                        .font(.system(size: 42, weight: .light))
+                        .foregroundStyle(.white)
+                    Text(currentSummary)
+                        .font(.subheadline)
+                        .foregroundStyle(Color.white.opacity(0.65))
+                }
+
+                Spacer()
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 22)
+            .padding(.bottom, 18)
+            .background(Color(red: 0.11, green: 0.12, blue: 0.15))
+            .overlay(alignment: .bottom) {
+                Rectangle()
+                    .fill(Color(red: 0.2, green: 0.68, blue: 0.36))
+                    .frame(height: 2)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("ITEM NOTES")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.white.opacity(0.65))
+                Text(currentNotes.isEmpty ? "No item notes" : currentNotes)
+                    .font(.system(size: 15))
+                    .foregroundStyle(Color.white.opacity(0.88))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    .background(Color.white.opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            .padding(24)
+            .background(Color(red: 0.11, green: 0.12, blue: 0.15))
+
+            Rectangle()
+                .fill(Color.white.opacity(0.06))
+                .frame(height: 1)
+
+            VStack(alignment: .leading, spacing: 14) {
+                Text("NEXT")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(Color.white.opacity(0.7))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .background(Color.white.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                Text(nextTitle.isEmpty ? "No next item" : nextTitle)
+                    .font(.system(size: 34, weight: .light))
+                    .foregroundStyle(Color.white.opacity(0.92))
+
+                Text(nextSummary)
+                    .font(.subheadline)
+                    .foregroundStyle(Color.white.opacity(0.65))
+
+                Spacer(minLength: 0)
+            }
+            .padding(24)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(Color(red: 0.09, green: 0.1, blue: 0.13))
+
+            HStack {
+                Text("Show ends at \(projectedEndTime.formatted(date: .omitted, time: .shortened))")
+                    .font(.footnote)
+                    .foregroundStyle(Color.white.opacity(0.65))
+                Spacer()
+                if let currentItem {
+                    Text("Current: \(currentItem.title)")
+                        .font(.footnote)
+                        .foregroundStyle(Color.white.opacity(0.65))
+                        .lineLimit(1)
+                }
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 12)
+            .background(Color(red: 0.11, green: 0.12, blue: 0.15))
+        }
+    }
+
+    private func timelineHeaderCell(_ title: String, width: CGFloat) -> some View {
+        Text(title)
+            .font(.caption.weight(.semibold))
+            .textCase(.uppercase)
+            .foregroundStyle(.secondary)
+            .frame(width: width, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+    }
+
+    private func timelineValueCell(_ value: String, width: CGFloat) -> some View {
+        Text(value)
+            .frame(width: width, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 12)
+    }
+
+    private func timelineEditableCell(title: String, text: String, width: CGFloat, setter: @escaping (String) -> Void) -> some View {
+        TextField(title, text: Binding(get: { text }, set: setter))
+            .textFieldStyle(.plain)
+            .frame(width: width, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 12)
+            .disabled(!canEdit)
+    }
+
+    private func timelineLengthCell(show: RunOfShowDocument, item: RunOfShowItem) -> some View {
+        HStack(spacing: 6) {
+            TextField(
+                "0",
+                text: Binding(
+                    get: { String(max(item.lengthMinutes, 0)) },
+                    set: { newValue in
+                        let digits = newValue.filter(\.isNumber)
+                        let parsed = Int(digits) ?? 0
+                        updateItemDuration(show, itemID: item.id, minutes: min(max(parsed, 0), 600), seconds: item.lengthSeconds)
+                    }
+                )
+            )
+            .textFieldStyle(.roundedBorder)
+            .frame(width: 34)
+            .multilineTextAlignment(.trailing)
+
+            Text(":")
+                .foregroundStyle(.secondary)
+
+            TextField(
+                "00",
+                text: Binding(
+                    get: { String(format: "%02d", min(max(item.lengthSeconds, 0), 59)) },
+                    set: { newValue in
+                        let digits = newValue.filter(\.isNumber)
+                        let parsed = Int(digits) ?? 0
+                        updateItemDuration(show, itemID: item.id, minutes: item.lengthMinutes, seconds: min(max(parsed, 0), 59))
+                    }
+                )
+            )
+            .textFieldStyle(.roundedBorder)
+            .frame(width: 34)
+            .multilineTextAlignment(.trailing)
+        }
+        .frame(width: 90, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .disabled(!canEdit)
+    }
+
+    private func timelineActionsCell(show: RunOfShowDocument, item: RunOfShowItem, index: Int) -> some View {
+        HStack(spacing: 6) {
+            Button {
+                moveItem(show, from: index, direction: -1)
+            } label: {
+                Image(systemName: "arrow.up")
+            }
+            .buttonStyle(.plain)
+            .disabled(index == 0 || !canEdit)
+
+            Button {
+                moveItem(show, from: index, direction: 1)
+            } label: {
+                Image(systemName: "arrow.down")
+            }
+            .buttonStyle(.plain)
+            .disabled(index == show.sortedItems.count - 1 || !canEdit)
+
+            Button(role: .destructive) {
+                deleteItem(show, itemID: item.id)
+            } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.plain)
+            .disabled(!canEdit)
+        }
+        .frame(width: 110)
+        .padding(.vertical, 12)
+    }
+
+    private func addShow() {
+        guard canEdit else { return }
+        let show = RunOfShowDocument(
+            title: "New Run of Show",
+            teamCode: store.teamCode ?? "",
+            scheduledStart: Date(),
+            items: [
+                RunOfShowItem(title: "Welcome", lengthMinutes: 5, lengthSeconds: 0, position: 0),
+                RunOfShowItem(title: "Song 1", lengthMinutes: 5, lengthSeconds: 0, position: 1)
+            ]
+        )
+        store.saveRunOfShow(show)
+        selectedShowID = show.id
+    }
+
+    private func addItem(to show: RunOfShowDocument) {
+        updateShow(show) { mutable in
+            mutable.items.append(
+                RunOfShowItem(
+                    title: "New Item",
+                    lengthMinutes: 5,
+                    lengthSeconds: 0,
+                    position: mutable.items.count
+                )
+            )
+        }
+    }
+
+    private func deleteItem(_ show: RunOfShowDocument, itemID: String) {
+        updateShow(show) { mutable in
+            mutable.items.removeAll { $0.id == itemID }
+        }
+    }
+
+    private func moveItem(_ show: RunOfShowDocument, from index: Int, direction: Int) {
+        updateShow(show) { mutable in
+            var items = mutable.sortedItems
+            let newIndex = index + direction
+            guard items.indices.contains(index), items.indices.contains(newIndex) else { return }
+            let moved = items.remove(at: index)
+            items.insert(moved, at: newIndex)
+            mutable.items = items.enumerated().map { offset, item in
+                var updated = item
+                updated.position = offset
+                return updated
+            }
+        }
+    }
+
+    private func startLive(_ show: RunOfShowDocument) {
+        runOfShowControls.clearAutoStartSuppression(for: show.id)
+        updateShow(show) { mutable in
+            let items = mutable.sortedItems
+            guard let first = items.first else { return }
+            let now = Date()
+            mutable.isLiveActive = true
+            mutable.liveCurrentItemID = first.id
+            mutable.liveShowStartedAt = now
+            mutable.liveItemStartedAt = now
+        }
+    }
+
+    private func moveLive(_ show: RunOfShowDocument, direction: Int) {
+        updateShow(show) { mutable in
+            let items = mutable.sortedItems
+            guard let currentIndex = mutable.itemIndex(for: mutable.liveCurrentItemID) else { return }
+            let newIndex = currentIndex + direction
+            guard items.indices.contains(newIndex) else { return }
+            mutable.isLiveActive = true
+            mutable.liveCurrentItemID = items[newIndex].id
+            mutable.liveItemStartedAt = Date()
+            if mutable.liveShowStartedAt == nil {
+                mutable.liveShowStartedAt = Date()
+            }
+        }
+    }
+
+    private func resetLive(_ show: RunOfShowDocument) {
+        runOfShowControls.suppressAutoStart(for: show.id)
+        updateShow(show) { mutable in
+            mutable.isLiveActive = false
+            mutable.liveCurrentItemID = nil
+            mutable.liveShowStartedAt = nil
+            mutable.liveItemStartedAt = nil
+        }
+    }
+
+    private func updateItem(_ show: RunOfShowDocument, itemID: String, change: (inout RunOfShowItem) -> Void) {
+        updateShow(show) { mutable in
+            guard let index = mutable.items.firstIndex(where: { $0.id == itemID }) else { return }
+            change(&mutable.items[index])
+        }
+    }
+
+    private func updateItemDuration(_ show: RunOfShowDocument, itemID: String, minutes: Int, seconds: Int) {
+        guard canEdit else { return }
+        var mutable = show
+        guard let index = mutable.items.firstIndex(where: { $0.id == itemID }) else { return }
+        mutable.items[index].lengthMinutes = max(minutes, 0)
+        mutable.items[index].lengthSeconds = min(max(seconds, 0), 59)
+        store.saveRunOfShow(mutable)
+    }
+
+    private func updateShow(_ show: RunOfShowDocument, change: (inout RunOfShowDocument) -> Void) {
+        guard canEdit else { return }
+        var mutable = show
+        change(&mutable)
+        DispatchQueue.main.async {
+            store.saveRunOfShow(mutable)
+        }
+    }
+
+    private func handleAutomaticLiveStart(for show: RunOfShowDocument, now: Date) {
+        guard canEdit,
+              show.autoStartLive,
+              !runOfShowControls.isAutoStartSuppressed(for: show.id),
+              !show.isLiveActive,
+              show.liveCurrentItemID == nil,
+              !show.sortedItems.isEmpty,
+              now >= show.scheduledStart else { return }
+        startLive(show)
+    }
+
+    private func startTimeText(for show: RunOfShowDocument, itemIndex: Int) -> String {
+        let offsetSeconds = show.sortedItems.prefix(itemIndex).reduce(0) { $0 + $1.durationSeconds }
+        let start = show.scheduledStart.addingTimeInterval(TimeInterval(offsetSeconds))
+        return start.formatted(date: .omitted, time: .shortened)
+    }
+
+    private func formattedClock(seconds: Int) -> String {
+        let minutes = max(seconds, 0) / 60
+        let remainingSeconds = max(seconds, 0) % 60
+        return String(format: "%02d:%02d", minutes, remainingSeconds)
+    }
+
+    private func formatDuration(seconds: Int) -> String {
+        let minutes = max(seconds, 0) / 60
+        let remainingSeconds = max(seconds, 0) % 60
+        return String(format: "%d:%02d", minutes, remainingSeconds)
+    }
+
+    private func overrunClock(seconds: Int) -> String {
+        let minutes = max(seconds, 0) / 60
+        let remainingSeconds = max(seconds, 0) % 60
+        return String(format: "-%02d:%02d", minutes, remainingSeconds)
+    }
+}
+
 private struct MacTrainingView: View {
     private enum TrainingViewMode: String, CaseIterable, Identifiable {
         case list
         case grid
+
+        var id: String { rawValue }
+    }
+
+    private enum AssignmentFilter: String, CaseIterable, Identifiable {
+        case all = "All Assignments"
+        case assigned = "Assigned"
+        case unassigned = "Unassigned"
+
+        var id: String { rawValue }
+    }
+
+    private enum CompletionFilter: String, CaseIterable, Identifiable {
+        case all = "All Status"
+        case incomplete = "Incomplete"
+        case completed = "Completed"
 
         var id: String { rawValue }
     }
@@ -1751,8 +4800,13 @@ private struct MacTrainingView: View {
     @State private var isUploadingVideo = false
     @State private var uploadProgress: Double = 0
     @State private var uploadError: String?
+    @State private var selectedCategory = "All"
+    @State private var assignmentFilter: AssignmentFilter = .all
+    @State private var completionFilter: CompletionFilter = .all
+    @State private var searchText = ""
 
-    private let categories = ["Audio", "Video", "Lighting", "Misc"]
+    private let lessonCategories = ["Audio", "Video", "Lighting", "Misc"]
+    private let filterCategories = ["All", "Audio", "Video", "Lighting", "Misc"]
     private let trainingColumns: [GridItem] = [
         GridItem(.flexible(minimum: 280, maximum: .infinity), spacing: 0, alignment: .leading),
         GridItem(.fixed(140), spacing: 0, alignment: .leading),
@@ -1770,8 +4824,43 @@ private struct MacTrainingView: View {
             lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
         }
     }
+    private var filteredLessons: [TrainingLesson] {
+        var lessons = sortedLessons
+
+        if selectedCategory != "All" {
+            lessons = lessons.filter { $0.category == selectedCategory }
+        }
+
+        switch assignmentFilter {
+        case .all:
+            break
+        case .assigned:
+            lessons = lessons.filter(isLessonAssigned)
+        case .unassigned:
+            lessons = lessons.filter { !isLessonAssigned($0) }
+        }
+
+        switch completionFilter {
+        case .all:
+            break
+        case .incomplete:
+            lessons = lessons.filter { !$0.isCompleted }
+        case .completed:
+            lessons = lessons.filter(\.isCompleted)
+        }
+
+        if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lessons = lessons.filter { lesson in
+                trainingSearchTokens(for: lesson).contains {
+                    $0.localizedCaseInsensitiveContains(searchText)
+                }
+            }
+        }
+
+        return lessons
+    }
     private var groupedLessons: [(group: String, items: [TrainingLesson])] {
-        let grouped = Dictionary(grouping: sortedLessons) { trainingGroupTitle(for: $0) }
+        let grouped = Dictionary(grouping: filteredLessons) { trainingGroupTitle(for: $0) }
         return grouped.keys.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }.map { key in
             (group: key, items: grouped[key] ?? [])
         }
@@ -1796,6 +4885,12 @@ private struct MacTrainingView: View {
             set: { trainingViewMode = $0 }
         )
     }
+    private var hasActiveFilters: Bool {
+        selectedCategory != "All"
+            || assignmentFilter != .all
+            || completionFilter != .all
+            || !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     var body: some View {
         Group {
@@ -1819,7 +4914,7 @@ private struct MacTrainingView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Training")
                                 .font(.system(size: 24, weight: .semibold))
-                            Text("\(sortedLessons.count) lessons")
+                            Text(trainingResultsText)
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                         }
@@ -1842,6 +4937,8 @@ private struct MacTrainingView: View {
                             .buttonStyle(.borderedProminent)
                         }
                     }
+
+                    trainingFilterBar
 
                     if trainingViewMode == .list {
                         trainingHeaderRow
@@ -1915,7 +5012,7 @@ private struct MacTrainingView: View {
                 Section("Details") {
                     TextField("Title", text: $title)
                     Picker("Category", selection: $category) {
-                        ForEach(categories, id: \.self) { Text($0).tag($0) }
+                        ForEach(lessonCategories, id: \.self) { Text($0).tag($0) }
                     }
                     TextField("Group", text: $groupName)
                     if canEdit {
@@ -1988,6 +5085,74 @@ private struct MacTrainingView: View {
             }
         }
         .frame(minWidth: 420, minHeight: 260)
+    }
+
+    private var trainingResultsText: String {
+        if hasActiveFilters {
+            return "\(filteredLessons.count) of \(sortedLessons.count) lessons"
+        }
+        return "\(sortedLessons.count) lessons"
+    }
+
+    private var trainingFilterBar: some View {
+        HStack(spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Search title, group, category, assignee", text: $searchText)
+                    .textFieldStyle(.plain)
+                if !searchText.isEmpty {
+                    Button {
+                        searchText = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.white.opacity(0.045))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color.white.opacity(0.06), lineWidth: 1)
+            )
+
+            Picker("Category", selection: $selectedCategory) {
+                ForEach(filterCategories, id: \.self) { value in
+                    Text(value).tag(value)
+                }
+            }
+            .frame(width: 150)
+
+            Picker("Assignment", selection: $assignmentFilter) {
+                ForEach(AssignmentFilter.allCases) { filter in
+                    Text(filter.rawValue).tag(filter)
+                }
+            }
+            .frame(width: 150)
+
+            Picker("Status", selection: $completionFilter) {
+                ForEach(CompletionFilter.allCases) { filter in
+                    Text(filter.rawValue).tag(filter)
+                }
+            }
+            .frame(width: 145)
+
+            if hasActiveFilters {
+                Button("Reset") {
+                    selectedCategory = "All"
+                    assignmentFilter = .all
+                    completionFilter = .all
+                    searchText = ""
+                }
+                .buttonStyle(.bordered)
+            }
+        }
     }
 
     private var trainingHeaderRow: some View {
@@ -2256,7 +5421,7 @@ private struct MacTrainingView: View {
 
     private func resetNewLessonForm() {
         title = ""
-        category = categories.first ?? "Audio"
+        category = lessonCategories.first ?? "Audio"
         groupName = ""
         selectedAssignedUserID = ""
         videoSource = "upload"
@@ -2418,6 +5583,23 @@ private struct MacTrainingView: View {
         if raw.isEmpty { return "No video" }
         if raw.contains("youtube.com") || raw.contains("youtu.be") { return "Video URL" }
         return "Uploaded File"
+    }
+
+    private func isLessonAssigned(_ lesson: TrainingLesson) -> Bool {
+        let assignedID = lesson.assignedToUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let assignedEmail = lesson.assignedToUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return !assignedID.isEmpty || !assignedEmail.isEmpty
+    }
+
+    private func trainingSearchTokens(for lesson: TrainingLesson) -> [String] {
+        [
+            lesson.title,
+            lesson.category,
+            trainingGroupTitle(for: lesson),
+            trainingAssigneeLabel(for: lesson),
+            trainingSourceLabel(for: lesson),
+            lesson.isCompleted ? "Completed" : "Incomplete"
+        ]
     }
 
     private func memberDisplayName(_ member: UserProfile) -> String {
@@ -2606,7 +5788,7 @@ private struct MacTrainingThumbnailView: View {
             ]
 
             for time in preferredTimes {
-                if let cgImage = try? generator.copyCGImage(at: time, actualTime: nil) {
+                if let cgImage = await generateThumbnailImage(with: generator, at: time) {
                     return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
                 }
             }
@@ -2616,6 +5798,14 @@ private struct MacTrainingThumbnailView: View {
         guard let image else { return }
         await MainActor.run {
             generatedThumbnail = image
+        }
+    }
+
+    private func generateThumbnailImage(with generator: AVAssetImageGenerator, at time: CMTime) async -> CGImage? {
+        await withCheckedContinuation { continuation in
+            generator.generateCGImageAsynchronously(for: time) { image, _, _ in
+                continuation.resume(returning: image)
+            }
         }
     }
 }
@@ -7807,6 +10997,7 @@ private struct MacIdeasView: View {
 }
 
 private struct MacCustomizeView: View {
+    let section: MacSettingsSection
     private enum FreshserviceImportKind: String, CaseIterable, Identifiable {
         case assets
         case tickets
@@ -7932,324 +11123,7 @@ private struct MacCustomizeView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                HStack(alignment: .top, spacing: 20) {
-                    GroupBox("Campuses") {
-                        VStack(alignment: .leading, spacing: 10) {
-                            HStack {
-                                TextField("Add campus", text: $newLocation)
-                                Button("Save") {
-                                    let trimmed = newLocation.trimmingCharacters(in: .whitespacesAndNewlines)
-                                    guard !trimmed.isEmpty else { return }
-                                    store.saveLocation(trimmed)
-                                    newLocation = ""
-                                }
-                            }
-                            Button {
-                                syncGearLocationsToCampuses()
-                            } label: {
-                                Label("Copy Locations from Assets", systemImage: "arrow.triangle.2.circlepath")
-                            }
-                            .buttonStyle(.bordered)
-
-                            List {
-                                ForEach(store.locations.sorted(), id: \.self) { location in
-                                    HStack {
-                                        Text(location)
-                                        Spacer()
-                                        Button(role: .destructive) {
-                                            store.deleteLocation(location)
-                                        } label: {
-                                            Image(systemName: "trash")
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                            }
-                            .frame(minHeight: 220)
-                            .scrollContentBackground(.hidden)
-                        }
-                    }
-
-                    GroupBox("Rooms") {
-                        VStack(alignment: .leading, spacing: 10) {
-                            HStack {
-                                TextField("Add room", text: $newRoom)
-                                Button("Save") {
-                                    let trimmed = newRoom.trimmingCharacters(in: .whitespacesAndNewlines)
-                                    guard !trimmed.isEmpty else { return }
-                                    store.saveRoom(trimmed)
-                                    newRoom = ""
-                                }
-                            }
-                            List {
-                                ForEach(store.rooms.sorted(), id: \.self) { room in
-                                    HStack {
-                                        Text(room)
-                                        Spacer()
-                                        Button(role: .destructive) {
-                                            store.deleteRoom(room)
-                                        } label: {
-                                            Image(systemName: "trash")
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                            }
-                            .frame(minHeight: 220)
-                            .scrollContentBackground(.hidden)
-                        }
-                    }
-                }
-
-                HStack(alignment: .top, spacing: 20) {
-                    GroupBox("Ticket Categories") {
-                        VStack(alignment: .leading, spacing: 10) {
-                            HStack {
-                                TextField("Add category", text: $newTicketCategory)
-                                Button("Save") {
-                                    let trimmed = newTicketCategory.trimmingCharacters(in: .whitespacesAndNewlines)
-                                    guard !trimmed.isEmpty else { return }
-                                    store.saveTicketCategory(trimmed)
-                                    newTicketCategory = ""
-                                }
-                            }
-                            List {
-                                ForEach(store.ticketCategories.sorted(), id: \.self) { category in
-                                    HStack {
-                                        Text(category)
-                                        Spacer()
-                                        Button(role: .destructive) {
-                                            store.deleteTicketCategory(category)
-                                        } label: {
-                                            Image(systemName: "trash")
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                            }
-                            .frame(minHeight: 220)
-                            .scrollContentBackground(.hidden)
-                        }
-                    }
-
-                    GroupBox("Ticket Subcategories") {
-                        VStack(alignment: .leading, spacing: 10) {
-                            HStack {
-                                TextField("Add subcategory", text: $newTicketSubcategory)
-                                Button("Save") {
-                                    let trimmed = newTicketSubcategory.trimmingCharacters(in: .whitespacesAndNewlines)
-                                    guard !trimmed.isEmpty else { return }
-                                    store.saveTicketSubcategory(trimmed)
-                                    newTicketSubcategory = ""
-                                }
-                            }
-                            List {
-                                ForEach(store.ticketSubcategories.sorted(), id: \.self) { subcategory in
-                                    HStack {
-                                        Text(subcategory)
-                                        Spacer()
-                                        Button(role: .destructive) {
-                                            store.deleteTicketSubcategory(subcategory)
-                                        } label: {
-                                            Image(systemName: "trash")
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                            }
-                            .frame(minHeight: 220)
-                            .scrollContentBackground(.hidden)
-                        }
-                    }
-                }
-
-                GroupBox("Import from Google Sheets") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Paste your Google Sheet share link and click Import.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-
-                        importRow(title: "Assets sheet link", text: $gearSheetLink) {
-                            importGearData()
-                        }
-                        importRow(title: "Audio patchsheet link", text: $audioPatchSheetLink) {
-                            importPatchData(category: "Audio", link: audioPatchSheetLink)
-                        }
-                        importRow(title: "Video patchsheet link", text: $videoPatchSheetLink) {
-                            importPatchData(category: "Video", link: videoPatchSheetLink)
-                        }
-                        importRow(title: "Lighting patchsheet link", text: $lightingPatchSheetLink) {
-                            importPatchData(category: "Lighting", link: lightingPatchSheetLink)
-                        }
-                    }
-                }
-
-                if canManageIntegrations {
-                    GroupBox("Integrations") {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("Connect Freshservice API")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-
-                            Toggle("Enable Freshservice", isOn: $freshserviceEnabled)
-
-                            Picker("Import Data", selection: $selectedImportKind) {
-                                ForEach(availableImportKinds) { kind in
-                                    Text(kind.title).tag(kind)
-                                }
-                            }
-
-                            Picker("Destination", selection: $selectedDestination) {
-                                ForEach(availableDestinations) { destination in
-                                    Text(destination.title).tag(destination)
-                                }
-                            }
-
-                            Picker("Sync Mode", selection: $freshserviceSyncMode) {
-                                ForEach(ProdConnectStore.FreshserviceSyncMode.allCases, id: \.self) { mode in
-                                    Text(mode.title).tag(mode)
-                                }
-                            }
-
-                            TextField("Freshservice URL", text: $freshserviceAPIURL)
-                                .textFieldStyle(.roundedBorder)
-
-                            SecureField("Freshservice API Key", text: $freshserviceAPIKey)
-                                .textFieldStyle(.roundedBorder)
-
-                            if selectedImportKind == .assets {
-                                Picker("Managed By Group", selection: $managedByGroupFilter) {
-                                    Text("All Groups").tag("")
-                                    ForEach(availableManagedByGroupOptions, id: \.self) { option in
-                                        Text(option).tag(option)
-                                    }
-                                }
-
-                                Button {
-                                    refreshManagedByGroupOptions()
-                                } label: {
-                                    if isLoadingManagedByGroups {
-                                        ProgressView()
-                                    } else {
-                                        Text("Refresh Groups")
-                                    }
-                                }
-                                .buttonStyle(.bordered)
-                                .disabled(
-                                    isSavingFreshserviceIntegration
-                                    || isTestingFreshserviceIntegration
-                                    || isImportingFreshserviceData
-                                    || isLoadingManagedByGroups
-                                    || freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                    || freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                )
-                            }
-
-                            HStack(spacing: 12) {
-                                Button {
-                                    saveFreshserviceIntegration()
-                                } label: {
-                                    if isSavingFreshserviceIntegration {
-                                        ProgressView()
-                                    } else {
-                                        Text("Save Connection")
-                                    }
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .disabled(isSavingFreshserviceIntegration || isTestingFreshserviceIntegration || isImportingFreshserviceData)
-
-                                Button {
-                                    testFreshserviceConnection()
-                                } label: {
-                                    if isTestingFreshserviceIntegration {
-                                        ProgressView()
-                                    } else {
-                                        Text("Test Connection")
-                                    }
-                                }
-                                .buttonStyle(.bordered)
-                                .disabled(
-                                    isSavingFreshserviceIntegration
-                                    || isTestingFreshserviceIntegration
-                                    || isImportingFreshserviceData
-                                    || freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                    || freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                )
-
-                                Button {
-                                    importFreshserviceData()
-                                } label: {
-                                    if isImportingFreshserviceData {
-                                        ProgressView()
-                                    } else {
-                                        Text("Import")
-                                    }
-                                }
-                                .buttonStyle(.bordered)
-                                .disabled(
-                                    isSavingFreshserviceIntegration
-                                    || isTestingFreshserviceIntegration
-                                    || isImportingFreshserviceData
-                                    || freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                    || freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                )
-                            }
-
-                            if !freshserviceStatusMessage.isEmpty {
-                                Text(freshserviceStatusMessage)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                }
-
-                if canManageExternalTicketForm {
-                    GroupBox("External Ticket Form") {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Toggle("Enable External Form", isOn: $externalTicketFormEnabled)
-
-                            if !externalTicketFormURLString.isEmpty {
-                                TextField("Public Link", text: .constant(externalTicketFormURLString))
-                                    .textFieldStyle(.roundedBorder)
-
-                                Button("Copy Public Link") {
-                                    NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString(externalTicketFormURLString, forType: .string)
-                                    externalTicketStatusMessage = "External ticket form link copied."
-                                }
-                                .buttonStyle(.bordered)
-                            }
-
-                            Button {
-                                saveCustomizeExternalTicketForm()
-                            } label: {
-                                if isSavingExternalTicketForm {
-                                    ProgressView()
-                                } else {
-                                    Text("Save External Form")
-                                }
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(isSavingExternalTicketForm)
-
-                            if !externalTicketStatusMessage.isEmpty {
-                                Text(externalTicketStatusMessage)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                }
-
-                GroupBox("Reset") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        resetButton("Delete All Assets", action: .deleteAllGear)
-                        resetButton("Delete Audio Patchsheet", action: .deleteAudioPatchsheet)
-                        resetButton("Delete Video Patchsheet", action: .deleteVideoPatchsheet)
-                        resetButton("Delete Lighting Patchsheet", action: .deleteLightingPatchsheet)
-                    }
-                }
+                sectionContent
 
                 if !resultMessage.isEmpty {
                     Text(resultMessage)
@@ -8260,7 +11134,6 @@ private struct MacCustomizeView: View {
         }
         .padding()
         .background(Color.clear)
-        .navigationTitle("Customize")
         .disabled(isBulkOperationInProgress)
         .onAppear(perform: loadFreshserviceIntegrationState)
         .onChange(of: store.freshserviceIntegration) { _, _ in
@@ -8301,6 +11174,357 @@ private struct MacCustomizeView: View {
         }
     }
 
+    @ViewBuilder
+    private var sectionContent: some View {
+        switch section {
+        case .importData:
+            importContent
+        case .locationsRooms:
+            locationsRoomsContent
+        case .tickets:
+            ticketsContent
+        case .integrations:
+            integrationsContent
+        case .ndi, .midi, .users:
+            EmptyView()
+        }
+    }
+
+    private var locationsRoomsContent: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 20) {
+                GroupBox("Campuses") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            TextField("Add campus", text: $newLocation)
+                            Button("Save") {
+                                let trimmed = newLocation.trimmingCharacters(in: .whitespacesAndNewlines)
+                                guard !trimmed.isEmpty else { return }
+                                store.saveLocation(trimmed)
+                                newLocation = ""
+                            }
+                        }
+                        Button {
+                            syncGearLocationsToCampuses()
+                        } label: {
+                            Label("Copy Locations from Assets", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                        .buttonStyle(.bordered)
+
+                        List {
+                            ForEach(store.locations.sorted(), id: \.self) { location in
+                                HStack {
+                                    Text(location)
+                                    Spacer()
+                                    Button(role: .destructive) {
+                                        store.deleteLocation(location)
+                                    } label: {
+                                        Image(systemName: "trash")
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                        .frame(minHeight: 220)
+                        .scrollContentBackground(.hidden)
+                    }
+                }
+
+                GroupBox("Rooms") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            TextField("Add room", text: $newRoom)
+                            Button("Save") {
+                                let trimmed = newRoom.trimmingCharacters(in: .whitespacesAndNewlines)
+                                guard !trimmed.isEmpty else { return }
+                                store.saveRoom(trimmed)
+                                newRoom = ""
+                            }
+                        }
+                        List {
+                            ForEach(store.rooms.sorted(), id: \.self) { room in
+                                HStack {
+                                    Text(room)
+                                    Spacer()
+                                    Button(role: .destructive) {
+                                        store.deleteRoom(room)
+                                    } label: {
+                                        Image(systemName: "trash")
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                        .frame(minHeight: 220)
+                        .scrollContentBackground(.hidden)
+                    }
+                }
+            }
+        }
+    }
+
+    private var ticketsContent: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 20) {
+                GroupBox("Ticket Categories") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            TextField("Add category", text: $newTicketCategory)
+                            Button("Save") {
+                                let trimmed = newTicketCategory.trimmingCharacters(in: .whitespacesAndNewlines)
+                                guard !trimmed.isEmpty else { return }
+                                store.saveTicketCategory(trimmed)
+                                newTicketCategory = ""
+                            }
+                        }
+                        List {
+                            ForEach(store.ticketCategories.sorted(), id: \.self) { category in
+                                HStack {
+                                    Text(category)
+                                    Spacer()
+                                    Button(role: .destructive) {
+                                        store.deleteTicketCategory(category)
+                                    } label: {
+                                        Image(systemName: "trash")
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                        .frame(minHeight: 220)
+                        .scrollContentBackground(.hidden)
+                    }
+                }
+
+                GroupBox("Ticket Subcategories") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            TextField("Add subcategory", text: $newTicketSubcategory)
+                            Button("Save") {
+                                let trimmed = newTicketSubcategory.trimmingCharacters(in: .whitespacesAndNewlines)
+                                guard !trimmed.isEmpty else { return }
+                                store.saveTicketSubcategory(trimmed)
+                                newTicketSubcategory = ""
+                            }
+                        }
+                        List {
+                            ForEach(store.ticketSubcategories.sorted(), id: \.self) { subcategory in
+                                HStack {
+                                    Text(subcategory)
+                                    Spacer()
+                                    Button(role: .destructive) {
+                                        store.deleteTicketSubcategory(subcategory)
+                                    } label: {
+                                        Image(systemName: "trash")
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                        .frame(minHeight: 220)
+                        .scrollContentBackground(.hidden)
+                    }
+                }
+            }
+        }
+    }
+
+    private var importContent: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            GroupBox("Import from Google Sheets") {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Paste your Google Sheet share link and click Import.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    importRow(title: "Assets sheet link", text: $gearSheetLink) {
+                        importGearData()
+                    }
+                    importRow(title: "Audio patchsheet link", text: $audioPatchSheetLink) {
+                        importPatchData(category: "Audio", link: audioPatchSheetLink)
+                    }
+                    importRow(title: "Video patchsheet link", text: $videoPatchSheetLink) {
+                        importPatchData(category: "Video", link: videoPatchSheetLink)
+                    }
+                    importRow(title: "Lighting patchsheet link", text: $lightingPatchSheetLink) {
+                        importPatchData(category: "Lighting", link: lightingPatchSheetLink)
+                    }
+                }
+            }
+
+            GroupBox("Reset") {
+                VStack(alignment: .leading, spacing: 10) {
+                    resetButton("Delete All Assets", action: .deleteAllGear)
+                    resetButton("Delete Audio Patchsheet", action: .deleteAudioPatchsheet)
+                    resetButton("Delete Video Patchsheet", action: .deleteVideoPatchsheet)
+                    resetButton("Delete Lighting Patchsheet", action: .deleteLightingPatchsheet)
+                }
+            }
+        }
+    }
+
+    private var integrationsContent: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            if canManageIntegrations {
+                GroupBox("Freshservice") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Connect Freshservice API")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        Toggle("Enable Freshservice", isOn: $freshserviceEnabled)
+
+                        Picker("Import Data", selection: $selectedImportKind) {
+                            ForEach(availableImportKinds) { kind in
+                                Text(kind.title).tag(kind)
+                            }
+                        }
+
+                        Picker("Destination", selection: $selectedDestination) {
+                            ForEach(availableDestinations) { destination in
+                                Text(destination.title).tag(destination)
+                            }
+                        }
+
+                        Picker("Sync Mode", selection: $freshserviceSyncMode) {
+                            ForEach(ProdConnectStore.FreshserviceSyncMode.allCases, id: \.self) { mode in
+                                Text(mode.title).tag(mode)
+                            }
+                        }
+
+                        TextField("Freshservice URL", text: $freshserviceAPIURL)
+                            .textFieldStyle(.roundedBorder)
+
+                        SecureField("Freshservice API Key", text: $freshserviceAPIKey)
+                            .textFieldStyle(.roundedBorder)
+
+                        if selectedImportKind == .assets {
+                            Picker("Managed By Group", selection: $managedByGroupFilter) {
+                                Text("All Groups").tag("")
+                                ForEach(availableManagedByGroupOptions, id: \.self) { option in
+                                    Text(option).tag(option)
+                                }
+                            }
+
+                            Button {
+                                refreshManagedByGroupOptions()
+                            } label: {
+                                if isLoadingManagedByGroups {
+                                    ProgressView()
+                                } else {
+                                    Text("Refresh Groups")
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(
+                                isSavingFreshserviceIntegration
+                                || isTestingFreshserviceIntegration
+                                || isImportingFreshserviceData
+                                || isLoadingManagedByGroups
+                                || freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                || freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            )
+                        }
+
+                        HStack(spacing: 12) {
+                            Button {
+                                saveFreshserviceIntegration()
+                            } label: {
+                                if isSavingFreshserviceIntegration {
+                                    ProgressView()
+                                } else {
+                                    Text("Save Connection")
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(isSavingFreshserviceIntegration || isTestingFreshserviceIntegration || isImportingFreshserviceData)
+
+                            Button {
+                                testFreshserviceConnection()
+                            } label: {
+                                if isTestingFreshserviceIntegration {
+                                    ProgressView()
+                                } else {
+                                    Text("Test Connection")
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(
+                                isSavingFreshserviceIntegration
+                                || isTestingFreshserviceIntegration
+                                || isImportingFreshserviceData
+                                || freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                || freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            )
+
+                            Button {
+                                importFreshserviceData()
+                            } label: {
+                                if isImportingFreshserviceData {
+                                    ProgressView()
+                                } else {
+                                    Text("Import")
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(
+                                isSavingFreshserviceIntegration
+                                || isTestingFreshserviceIntegration
+                                || isImportingFreshserviceData
+                                || freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                || freshserviceAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            )
+                        }
+
+                        if !freshserviceStatusMessage.isEmpty {
+                            Text(freshserviceStatusMessage)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+
+            if canManageExternalTicketForm {
+                GroupBox("External Ticket Form") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Toggle("Enable External Form", isOn: $externalTicketFormEnabled)
+
+                        if !externalTicketFormURLString.isEmpty {
+                            TextField("Public Link", text: .constant(externalTicketFormURLString))
+                                .textFieldStyle(.roundedBorder)
+
+                            Button("Copy Public Link") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(externalTicketFormURLString, forType: .string)
+                                externalTicketStatusMessage = "External ticket form link copied."
+                            }
+                            .buttonStyle(.bordered)
+                        }
+
+                        Button {
+                            saveCustomizeExternalTicketForm()
+                        } label: {
+                            if isSavingExternalTicketForm {
+                                ProgressView()
+                            } else {
+                                Text("Save External Form")
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(isSavingExternalTicketForm)
+
+                        if !externalTicketStatusMessage.isEmpty {
+                            Text(externalTicketStatusMessage)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private var canManageIntegrations: Bool {
         let isPrivilegedUser = store.user?.isAdmin == true || store.user?.isOwner == true
         return isPrivilegedUser && (store.user?.hasChatAndTrainingFeatures ?? false)
@@ -8326,6 +11550,7 @@ private struct MacCustomizeView: View {
         }
         .buttonStyle(.borderless)
     }
+
 
     private func performReset(_ action: ResetAction) {
         beginBulkOperation("Deleting, please wait")
@@ -9259,6 +12484,10 @@ private struct MacUserDetailView: View {
                     .onChange(of: user.canEditTraining) { _, value in
                         updatePermission(key: "canEditTraining", value: value)
                     }
+                Toggle("Can edit run of show", isOn: $user.canEditRunOfShow)
+                    .onChange(of: user.canEditRunOfShow) { _, value in
+                        updatePermission(key: "canEditRunOfShow", value: value)
+                    }
                 Toggle("Can edit assets", isOn: $user.canEditGear)
                     .onChange(of: user.canEditGear) { _, value in
                         updatePermission(key: "canEditGear", value: value)
@@ -9290,6 +12519,10 @@ private struct MacUserDetailView: View {
                     Toggle("Training", isOn: $user.canSeeTraining)
                         .onChange(of: user.canSeeTraining) { _, value in
                             updatePermission(key: "canSeeTraining", value: value)
+                        }
+                    Toggle("Run of Show", isOn: $user.canSeeRunOfShow)
+                        .onChange(of: user.canSeeRunOfShow) { _, value in
+                            updatePermission(key: "canSeeRunOfShow", value: value)
                         }
                     Toggle("Assets", isOn: $user.canSeeGear)
                         .onChange(of: user.canSeeGear) { _, value in
@@ -9459,6 +12692,8 @@ private struct MacUserDetailView: View {
                     self.user.canEditPatchsheet = value
                 case "canEditTraining":
                     self.user.canEditTraining = value
+                case "canEditRunOfShow":
+                    self.user.canEditRunOfShow = value
                 case "canEditGear":
                     self.user.canEditGear = value
                 case "canEditIdeas":
@@ -9473,6 +12708,8 @@ private struct MacUserDetailView: View {
                     self.user.canSeePatchsheet = value
                 case "canSeeTraining":
                     self.user.canSeeTraining = value
+                case "canSeeRunOfShow":
+                    self.user.canSeeRunOfShow = value
                 case "canSeeGear":
                     self.user.canSeeGear = value
                 case "canSeeIdeas":

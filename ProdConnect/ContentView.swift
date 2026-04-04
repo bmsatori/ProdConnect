@@ -1599,8 +1599,12 @@ struct ContentView: View {
                             ownerUpdates["isAdmin"] = true
                         }
                         if !ownerUpdates.isEmpty {
-                            self.db.collection("users").document(profile.id).setData(ownerUpdates, merge: true) { error in
-                                if let error = error { print("Firestore update error:", error) }
+                            Task {
+                                do {
+                                    try await self.db.collection("users").document(profile.id).setData(ownerUpdates, merge: true)
+                                } catch {
+                                    print("Firestore update error:", error)
+                                }
                             }
                         }
                     }
@@ -3270,10 +3274,12 @@ class IAPManager: ObservableObject {
             user.isAdmin = false
             store.user = user
 
-            store.db.collection("users").document(user.id).setData([
-                "isAdmin": false
-            ], merge: true) { error in
-                if let error = error { print("Firestore update error:", error) }
+            do {
+                try await store.db.collection("users").document(user.id).setData([
+                    "isAdmin": false
+                ], merge: true)
+            } catch {
+                print("Firestore update error:", error)
             }
 
             store.listenToTeamData()
@@ -3322,28 +3328,32 @@ class IAPManager: ObservableObject {
 
             user.teamCode = teamCode
 
-            store.db.collection("teams").document(teamCode).setData([
-                "code": teamCode,
-                "createdAt": FieldValue.serverTimestamp(),
-                "createdBy": user.email,
-                "isActive": true
-            ], merge: true) { error in
-                if let error = error { print("Team registration error:", error) }
+            do {
+                try await store.db.collection("teams").document(teamCode).setData([
+                    "code": teamCode,
+                    "createdAt": FieldValue.serverTimestamp(),
+                    "createdBy": user.email,
+                    "isActive": true
+                ], merge: true)
+            } catch {
+                print("Team registration error:", error)
             }
         }
 
         store.user = user
 
-        store.db.collection("users").document(user.id).setData([
-            "subscriptionTier": user.subscriptionTier,
-            "isAdmin": true,
-            "teamCode": user.teamCode ?? "",
-            "canEditTraining": user.canEditTraining,
-            "canSeeChat": user.canSeeChat,
-            "canSeeTraining": user.canSeeTraining,
-            "canSeeTickets": user.canSeeTickets
-        ], merge: true) { error in
-            if let error = error { print("Firestore update error:", error) }
+        do {
+            try await store.db.collection("users").document(user.id).setData([
+                "subscriptionTier": user.subscriptionTier,
+                "isAdmin": true,
+                "teamCode": user.teamCode ?? "",
+                "canEditTraining": user.canEditTraining,
+                "canSeeChat": user.canSeeChat,
+                "canSeeTraining": user.canSeeTraining,
+                "canSeeTickets": user.canSeeTickets
+            ], merge: true)
+        } catch {
+            print("Firestore update error:", error)
         }
 
         await MainActor.run {
@@ -3370,11 +3380,13 @@ class IAPManager: ObservableObject {
             print("Can see training: \(store.canSeeTrainingTab)")
         }
         
-        store.db.collection("users").document(user.id).setData([
-            "subscriptionTier": tier
-        ], merge: true) { error in
-            if let error = error { print("Firestore update error:", error) }
-            else { print("Firestore updated to: \(tier)") }
+        do {
+            try await store.db.collection("users").document(user.id).setData([
+                "subscriptionTier": tier
+            ], merge: true)
+            print("Firestore updated to: \(tier)")
+        } catch {
+            print("Firestore update error:", error)
         }
     }
     
@@ -3398,12 +3410,14 @@ class IAPManager: ObservableObject {
             print("Can see training: \(store.canSeeTrainingTab)")
         }
         
-        store.db.collection("users").document(user.id).setData([
-            "isAdmin": user.isAdmin,
-            "subscriptionTier": user.subscriptionTier
-        ], merge: true) { error in
-            if let error = error { print("Firestore update error:", error) }
-            else { print("Admin status updated to: \(user.isAdmin)") }
+        do {
+            try await store.db.collection("users").document(user.id).setData([
+                "isAdmin": user.isAdmin,
+                "subscriptionTier": user.subscriptionTier
+            ], merge: true)
+            print("Admin status updated to: \(user.isAdmin)")
+        } catch {
+            print("Firestore update error:", error)
         }
     }
     
@@ -3418,14 +3432,16 @@ class IAPManager: ObservableObject {
         user.canSeeTickets = false
         store.user = user
 
-        store.db.collection("users").document(user.id).setData([
-            "subscriptionTier": "free",
-            "canEditTraining": false,
-            "canSeeChat": false,
-            "canSeeTraining": false,
-            "canSeeTickets": false
-        ], merge: true) { error in
-            if let error = error { print("Firestore update error:", error) }
+        do {
+            try await store.db.collection("users").document(user.id).setData([
+                "subscriptionTier": "free",
+                "canEditTraining": false,
+                "canSeeChat": false,
+                "canSeeTraining": false,
+                "canSeeTickets": false
+            ], merge: true)
+        } catch {
+            print("Firestore update error:", error)
         }
     }
 
@@ -3492,10 +3508,12 @@ class IAPManager: ObservableObject {
                 if !user.isOwner {
                     user.isOwner = true
                     store.user = user
-                    store.db.collection("users").document(user.id)
-                        .setData(["isOwner": true], merge: true) { error in
-                            if let error = error { print("Firestore update error:", error) }
-                        }
+                    do {
+                        try await store.db.collection("users").document(user.id)
+                            .setData(["isOwner": true], merge: true)
+                    } catch {
+                        print("Firestore update error:", error)
+                    }
                 }
                 return true
             }
@@ -3503,10 +3521,12 @@ class IAPManager: ObservableObject {
             if user.isOwner {
                 user.isOwner = false
                 store.user = user
-                store.db.collection("users").document(user.id)
-                    .setData(["isOwner": false], merge: true) { error in
-                        if let error = error { print("Firestore update error:", error) }
-                    }
+                do {
+                    try await store.db.collection("users").document(user.id)
+                        .setData(["isOwner": false], merge: true)
+                } catch {
+                    print("Firestore update error:", error)
+                }
             }
             return false
         } catch {
@@ -3541,20 +3561,24 @@ class IAPManager: ObservableObject {
             store.user = updated
         }
 
-        store.db.collection("users").document(updated.id).setData([
-            "isOwner": true,
-            "isAdmin": true
-        ], merge: true) { error in
-            if let error = error { print("Firestore update error:", error) }
+        do {
+            try await store.db.collection("users").document(updated.id).setData([
+                "isOwner": true,
+                "isAdmin": true
+            ], merge: true)
+        } catch {
+            print("Firestore update error:", error)
         }
 
-        store.db.collection("teams").document(teamCode).setData([
-            "ownerId": updated.id,
-            "ownerEmail": updated.email,
-            "code": teamCode,
-            "isActive": true
-        ], merge: true) { error in
-            if let error = error { print("Team owner update error:", error) }
+        do {
+            try await store.db.collection("teams").document(teamCode).setData([
+                "ownerId": updated.id,
+                "ownerEmail": updated.email,
+                "code": teamCode,
+                "isActive": true
+            ], merge: true)
+        } catch {
+            print("Team owner update error:", error)
         }
     }
 
@@ -5089,6 +5113,7 @@ struct EditAccountView: View {
         let passwordChanged = !trimmedPassword.isEmpty
         let nameChanged = !trimmedName.isEmpty && trimmedName != (store.user?.displayName ?? "")
         let needsReauth = emailChanged || passwordChanged
+        var emailVerificationPending = false
 
         if needsReauth && currentPassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             errorMessage = "Current password is required to change email or password."
@@ -5112,16 +5137,10 @@ struct EditAccountView: View {
 
         func updateEmailIfNeeded(completion: @escaping (Result<Void, Error>) -> Void) {
             guard emailChanged else { completion(.success(())); return }
-            currentUser.updateEmail(to: trimmedEmail) { error in
+            currentUser.sendEmailVerification(beforeUpdatingEmail: trimmedEmail) { error in
                 if let error = error { completion(.failure(error)); return }
-                store.db.collection("users").document(currentUser.uid).updateData(["email": trimmedEmail]) { err in
-                    if let err = err { completion(.failure(err)); return }
-                    DispatchQueue.main.async {
-                        store.user?.email = trimmedEmail
-                        OneSignal.login(trimmedEmail)
-                        completion(.success(()))
-                    }
-                }
+                emailVerificationPending = true
+                completion(.success(()))
             }
         }
 
@@ -5168,7 +5187,9 @@ struct EditAccountView: View {
         func finishWithSuccess() {
             DispatchQueue.main.async {
                 isSaving = false
-                successMessage = "Your account was updated."
+                successMessage = emailVerificationPending
+                    ? "Your changes were saved. Check your new email to verify the address change."
+                    : "Your account was updated."
             }
         }
 
@@ -6556,6 +6577,10 @@ struct UserDetailView: View {
                     .onChange(of: user.canEditTraining) { newValue in
                         updatePermission(key: "canEditTraining", value: newValue)
                     }
+                Toggle("Can edit run of show", isOn: $user.canEditRunOfShow)
+                    .onChange(of: user.canEditRunOfShow) { newValue in
+                        updatePermission(key: "canEditRunOfShow", value: newValue)
+                    }
                 Toggle("Can edit assets", isOn: $user.canEditGear)
                     .onChange(of: user.canEditGear) { newValue in
                         updatePermission(key: "canEditGear", value: newValue)
@@ -6587,6 +6612,10 @@ struct UserDetailView: View {
                     Toggle("Training", isOn: $user.canSeeTraining)
                         .onChange(of: user.canSeeTraining) { newValue in
                             updatePermission(key: "canSeeTraining", value: newValue)
+                        }
+                    Toggle("Run of Show", isOn: $user.canSeeRunOfShow)
+                        .onChange(of: user.canSeeRunOfShow) { newValue in
+                            updatePermission(key: "canSeeRunOfShow", value: newValue)
                         }
                     Toggle("Assets", isOn: $user.canSeeGear)
                         .onChange(of: user.canSeeGear) { newValue in
@@ -6673,7 +6702,7 @@ struct UserDetailView: View {
             "isOwner": false
         ], forDocument: currentOwnerRef, merge: true)
 
-        var newOwnerUpdates: [String: Any] = [
+        let newOwnerUpdates: [String: Any] = [
             "isOwner": true,
             "isAdmin": true
         ]
@@ -6755,6 +6784,8 @@ struct UserDetailView: View {
                             store.teamMembers[idx].canEditPatchsheet = value
                         case "canEditTraining":
                             store.teamMembers[idx].canEditTraining = value
+                        case "canEditRunOfShow":
+                            store.teamMembers[idx].canEditRunOfShow = value
                         case "canEditGear":
                             store.teamMembers[idx].canEditGear = value
                         case "canEditIdeas":
@@ -6769,6 +6800,8 @@ struct UserDetailView: View {
                             store.teamMembers[idx].canSeePatchsheet = value
                         case "canSeeTraining":
                             store.teamMembers[idx].canSeeTraining = value
+                        case "canSeeRunOfShow":
+                            store.teamMembers[idx].canSeeRunOfShow = value
                         case "canSeeGear":
                             store.teamMembers[idx].canSeeGear = value
                         case "canSeeIdeas":
@@ -6865,6 +6898,12 @@ struct EditPatchView: View {
                             TextField("Output", text: $patch.output)
                                 .disabled(!canEdit)
                         }
+                    }
+
+                    editorField("Notes") {
+                        TextField("Notes", text: $patch.notes, axis: .vertical)
+                            .lineLimit(2...6)
+                            .disabled(!canEdit)
                     }
 
                     if store.locations.isEmpty {
@@ -7007,11 +7046,28 @@ struct EditPatchView: View {
 
 // ...existing code...
 struct TrainingListView: View {
+    private enum AssignmentFilter: String, CaseIterable, Identifiable {
+        case all = "All"
+        case assigned = "Assigned"
+        case unassigned = "Unassigned"
+
+        var id: String { rawValue }
+    }
+
+    private enum CompletionFilter: String, CaseIterable, Identifiable {
+        case all = "All Status"
+        case incomplete = "Incomplete"
+        case completed = "Completed"
+
+        var id: String { rawValue }
+    }
+
     @EnvironmentObject var store: ProdConnectStore
     @State private var showAdd = false
     @State private var showAddVideo = false
     @State private var selectedFilter = "All"
-    @State private var assignmentFilter = "All"
+    @State private var assignmentFilter: AssignmentFilter = .all
+    @State private var completionFilter: CompletionFilter = .all
     @State private var searchText = ""
     var canEdit: Bool { store.user?.isAdmin == true || store.user?.canEditTraining == true }
 
@@ -7026,14 +7082,30 @@ struct TrainingListView: View {
             lessons = lessons.filter { $0.category == selectedFilter }
         }
 
-        if assignmentFilter == "Assigned" {
-            lessons = lessons.filter { lesson in
-                !(lesson.assignedToUserID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-            }
+        switch assignmentFilter {
+        case .all:
+            break
+        case .assigned:
+            lessons = lessons.filter(isLessonAssigned)
+        case .unassigned:
+            lessons = lessons.filter { !isLessonAssigned($0) }
         }
-        
+
+        switch completionFilter {
+        case .all:
+            break
+        case .incomplete:
+            lessons = lessons.filter { !$0.isCompleted }
+        case .completed:
+            lessons = lessons.filter(\.isCompleted)
+        }
+
         if !searchText.isEmpty {
-            lessons = lessons.filter { $0.title.localizedCaseInsensitiveContains(searchText) || $0.category.localizedCaseInsensitiveContains(searchText) }
+            lessons = lessons.filter { lesson in
+                trainingSearchTokens(for: lesson).contains {
+                    $0.localizedCaseInsensitiveContains(searchText)
+                }
+            }
         }
         
         return lessons
@@ -7078,6 +7150,29 @@ struct TrainingListView: View {
         return assignedEmail.isEmpty ? "Assigned" : "Assigned: \(assignedEmail)"
     }
 
+    private func isLessonAssigned(_ lesson: TrainingLesson) -> Bool {
+        let assignedID = lesson.assignedToUserID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let assignedEmail = lesson.assignedToUserEmail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return !assignedID.isEmpty || !assignedEmail.isEmpty
+    }
+
+    private func trainingSearchTokens(for lesson: TrainingLesson) -> [String] {
+        var tokens = [
+            lesson.title,
+            lesson.category,
+            trainingGroupTitle(for: lesson)
+        ]
+        if let assignmentLabel = assignmentLabel(for: lesson) {
+            tokens.append(assignmentLabel)
+        }
+        if lesson.isCompleted {
+            tokens.append("Completed")
+        } else {
+            tokens.append("Incomplete")
+        }
+        return tokens
+    }
+
     var body: some View {
         NavigationStack {
             VStack {
@@ -7090,8 +7185,17 @@ struct TrainingListView: View {
                 .padding(.horizontal)
 
                 Picker("Assignment", selection: $assignmentFilter) {
-                    Text("All").tag("All")
-                    Text("Assigned").tag("Assigned")
+                    ForEach(AssignmentFilter.allCases) { filter in
+                        Text(filter.rawValue).tag(filter)
+                    }
+                }
+                .pickerStyle(SegmentedPickerStyle())
+                .padding(.horizontal)
+
+                Picker("Status", selection: $completionFilter) {
+                    ForEach(CompletionFilter.allCases) { filter in
+                        Text(filter.rawValue).tag(filter)
+                    }
                 }
                 .pickerStyle(SegmentedPickerStyle())
                 .padding(.horizontal)
@@ -10188,7 +10292,6 @@ struct ChecklistRunView: View {
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
-                    }
 
                         if showsAssignmentFeatures {
                             taskMetadataRow(item)
@@ -10760,195 +10863,9 @@ private struct ChecklistTaskDetailView: View {
 
     var body: some View {
         Group {
-            if let item {
-                Form {
-                    Section {
-                        Button {
-                            toggleComplete()
-                        } label: {
-                            Label(item.isDone ? "Completed" : "Mark Complete", systemImage: item.isDone ? "checkmark.circle.fill" : "checkmark.circle")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(item.isDone ? .borderedProminent : .bordered)
-                        .tint(item.isDone ? .green : .secondary)
-                    }
-
-                    Section("Task") {
-                        if canEdit {
-                            TextField("Task title", text: itemTextBinding)
-                        } else {
-                            Text(displayChecklistText(item.text))
-                        }
-                    }
-
-                    Section("Comment") {
-                        if canEdit {
-                            VStack(alignment: .leading, spacing: 10) {
-                                TextEditor(text: itemNotesBinding)
-                                    .frame(minHeight: 180)
-                                if let _ = currentMentionContext(in: item?.notes ?? "") {
-                                    mentionSuggestionsList
-                                }
-                            }
-                        } else {
-                            Text(item.notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "No comment" : item.notes)
-                                .foregroundColor(item.notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .secondary : .primary)
-                        }
-                    }
-
-                    Section("Details") {
-                        if canAssignTasks {
-                            Picker("Assignee", selection: assignmentSelection) {
-                                Text("Unassigned").tag("")
-                                ForEach(assignableMembers) { member in
-                                    Text(displayName(member)).tag(member.id)
-                                }
-                            }
-                        } else {
-                            LabeledContent("Assignee", value: assignmentLabel(for: item) ?? "Unassigned")
-                        }
-
-                        if canManageChecklistDueDate {
-                            Toggle("Set due date", isOn: itemHasDueDateBinding)
-                            if itemDueDateExists {
-                                DatePicker("Task Due", selection: itemDueDateBinding, displayedComponents: [.date, .hourAndMinute])
-                            }
-                        } else {
-                            LabeledContent("Due date", value: item.dueDate.map { dueDateLabel(for: $0) } ?? "No due date")
-                        }
-                    }
-
-                    Section("Subtasks") {
-                        if let itemIndex {
-                            if template.items[itemIndex].subtasks.isEmpty {
-                                Text("No subtasks")
-                                    .foregroundColor(.secondary)
-                            } else {
-                                ForEach(Array(template.items[itemIndex].subtasks.indices), id: \.self) { subtaskIndex in
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        HStack(spacing: 10) {
-                                            Button {
-                                                toggleSubtask(at: subtaskIndex)
-                                            } label: {
-                                                Image(systemName: template.items[itemIndex].subtasks[subtaskIndex].isDone ? "checkmark.circle.fill" : "checkmark.circle")
-                                                    .foregroundColor(template.items[itemIndex].subtasks[subtaskIndex].isDone ? .green : .secondary)
-                                            }
-                                            .buttonStyle(.plain)
-
-                                            if canEdit {
-                                                TextField("Subtask", text: subtaskTextBinding(for: subtaskIndex))
-                                            } else {
-                                                Text(template.items[itemIndex].subtasks[subtaskIndex].text)
-                                                    .foregroundColor(.primary)
-                                            }
-
-                                            if canEdit {
-                                                Button(role: .destructive) {
-                                                    removeSubtask(at: subtaskIndex)
-                                                } label: {
-                                                    Image(systemName: "trash")
-                                                }
-                                                .buttonStyle(.plain)
-                                            }
-                                        }
-
-                                        if template.items[itemIndex].subtasks[subtaskIndex].isDone,
-                                           let completedAt = template.items[itemIndex].subtasks[subtaskIndex].completedAt {
-                                            let completedBy = template.items[itemIndex].subtasks[subtaskIndex].completedBy?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                                            Text(
-                                                completedBy.isEmpty
-                                                ? "Completed on \(completedAt.formatted(date: .abbreviated, time: .shortened))"
-                                                : "Completed by \(completedBy) on \(completedAt.formatted(date: .abbreviated, time: .shortened))"
-                                            )
-                                            .font(.caption2)
-                                            .foregroundColor(.secondary)
-                                        }
-                                    }
-                                }
-                            }
-
-                            if canEdit {
-                                HStack {
-                                    TextField("Add subtask", text: $newSubtaskTitle)
-                                        .onSubmit {
-                                            addSubtask()
-                                        }
-                                    Button("Add") {
-                                        addSubtask()
-                                    }
-                                    .disabled(newSubtaskTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                                }
-                            }
-                        }
-                    }
-
-                    Section("Attachments") {
-                        if let itemIndex {
-                            if template.items[itemIndex].attachments.isEmpty {
-                                Text("No attachments")
-                                    .foregroundColor(.secondary)
-                            } else {
-                                ForEach(template.items[itemIndex].attachments) { attachment in
-                                    HStack {
-                                        if let url = URL(string: attachment.url.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                                            Link(destination: url) {
-                                                Label(attachment.name, systemImage: attachmentSystemImage(for: attachment.kind))
-                                            }
-                                        } else {
-                                            Label(attachment.name, systemImage: attachmentSystemImage(for: attachment.kind))
-                                                .foregroundColor(.secondary)
-                                        }
-                                        Spacer()
-                                        if canEdit {
-                                            Button(role: .destructive) {
-                                                removeAttachment(id: attachment.id)
-                                            } label: {
-                                                Image(systemName: "trash")
-                                            }
-                                            .buttonStyle(.plain)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if canEdit {
-                            PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
-                                Label("Add Photo", systemImage: "photo")
-                            }
-                            Button {
-                                showingFileImporter = true
-                            } label: {
-                                Label("Add File", systemImage: "paperclip")
-                            }
-                            if isUploadingAttachment {
-                                ProgressView("Uploading attachment…")
-                            }
-                            if let attachmentError, !attachmentError.isEmpty {
-                                Text(attachmentError)
-                                    .font(.caption)
-                                    .foregroundColor(.red)
-                            }
-                        }
-                    }
-
-                    if showsAssignmentFeatures {
-                        Section("Status") {
-                            taskMetadataRow(item)
-                        }
-                    }
-
-                    if item.isDone, let completedAt = item.completedAt {
-                        Section("Completion") {
-                            if let by = item.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines), !by.isEmpty {
-                                Text("Checked by \(by)")
-                            }
-                            Text("Completed on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                }
-                .navigationTitle(displayChecklistText(item.text))
+            if let currentItem = item {
+                taskDetailForm(for: currentItem)
+                .navigationTitle(displayChecklistText(currentItem.text))
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .navigationBarTrailing) {
@@ -10957,7 +10874,7 @@ private struct ChecklistTaskDetailView: View {
                         }
                     }
                 }
-                .onChange(of: selectedPhotoItem) { _, newValue in
+                .onChange(of: selectedPhotoItem) { newValue in
                     guard let newValue else { return }
                     Task {
                         await uploadPhotoAttachment(from: newValue)
@@ -10974,7 +10891,244 @@ private struct ChecklistTaskDetailView: View {
                     handleFileImport(result)
                 }
             } else {
-                ContentUnavailableView("Task Not Found", systemImage: "checkmark.circle")
+                VStack(spacing: 12) {
+                    Image(systemName: "checkmark.circle")
+                        .font(.system(size: 36))
+                        .foregroundColor(.secondary)
+                    Text("Task Not Found")
+                        .font(.headline)
+                        .foregroundColor(.primary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+
+    private func taskDetailForm(for item: ChecklistItem) -> some View {
+        Form {
+            completionSection(for: item)
+            taskSection(for: item)
+            commentSection(for: item)
+            detailsSection(for: item)
+            subtasksSection
+            attachmentsSection
+
+            if showsAssignmentFeatures {
+                Section("Status") {
+                    taskMetadataRow(item)
+                }
+            }
+
+            if item.isDone, let completedAt = item.completedAt {
+                Section("Completion") {
+                    if let by = item.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines), !by.isEmpty {
+                        Text("Checked by \(by)")
+                    }
+                    Text("Completed on \(completedAt.formatted(date: .abbreviated, time: .shortened))")
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+
+    private func completionSection(for item: ChecklistItem) -> some View {
+        Section {
+            if item.isDone {
+                Button {
+                    toggleComplete()
+                } label: {
+                    Label("Completed", systemImage: "checkmark.circle.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(BorderedProminentButtonStyle())
+                .tint(.green)
+            } else {
+                Button {
+                    toggleComplete()
+                } label: {
+                    Label("Mark Complete", systemImage: "checkmark.circle")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(BorderedButtonStyle())
+                .tint(.secondary)
+            }
+        }
+    }
+
+    private func taskSection(for item: ChecklistItem) -> some View {
+        Section("Task") {
+            if canEdit {
+                TextField("Task title", text: itemTextBinding)
+            } else {
+                Text(displayChecklistText(item.text))
+            }
+        }
+    }
+
+    private func commentSection(for item: ChecklistItem) -> some View {
+        Section("Comment") {
+            if canEdit {
+                VStack(alignment: .leading, spacing: 10) {
+                    TextEditor(text: itemNotesBinding)
+                        .frame(minHeight: 180)
+                    if currentMentionContext(in: item.notes) != nil {
+                        mentionSuggestionsList
+                    }
+                }
+            } else {
+                let trimmedNotes = item.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+                Text(trimmedNotes.isEmpty ? "No comment" : item.notes)
+                    .foregroundColor(trimmedNotes.isEmpty ? .secondary : .primary)
+            }
+        }
+    }
+
+    private func detailsSection(for item: ChecklistItem) -> some View {
+        Section("Details") {
+            if canAssignTasks {
+                Picker("Assignee", selection: assignmentSelection) {
+                    Text("Unassigned").tag("")
+                    ForEach(assignableMembers) { member in
+                        Text(displayName(member)).tag(member.id)
+                    }
+                }
+            } else {
+                LabeledContent("Assignee", value: assignmentLabel(for: item) ?? "Unassigned")
+            }
+
+            if canManageChecklistDueDate {
+                Toggle("Set due date", isOn: itemHasDueDateBinding)
+                if itemDueDateExists {
+                    DatePicker("Task Due", selection: itemDueDateBinding, displayedComponents: [.date, .hourAndMinute])
+                }
+            } else {
+                LabeledContent("Due date", value: item.dueDate.map { dueDateLabel(for: $0) } ?? "No due date")
+            }
+        }
+    }
+
+    private var subtasksSection: some View {
+        Section("Subtasks") {
+            if let itemIndex {
+                if template.items[itemIndex].subtasks.isEmpty {
+                    Text("No subtasks")
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(Array(template.items[itemIndex].subtasks.indices), id: \.self) { subtaskIndex in
+                        subtaskRow(itemIndex: itemIndex, subtaskIndex: subtaskIndex)
+                    }
+                }
+
+                if canEdit {
+                    HStack {
+                        TextField("Add subtask", text: $newSubtaskTitle)
+                            .onSubmit {
+                                addSubtask()
+                            }
+                        Button("Add") {
+                            addSubtask()
+                        }
+                        .disabled(newSubtaskTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
+            }
+        }
+    }
+
+    private func subtaskRow(itemIndex: Int, subtaskIndex: Int) -> some View {
+        let subtask = template.items[itemIndex].subtasks[subtaskIndex]
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 10) {
+                Button {
+                    toggleSubtask(at: subtaskIndex)
+                } label: {
+                    Image(systemName: subtask.isDone ? "checkmark.circle.fill" : "checkmark.circle")
+                        .foregroundColor(subtask.isDone ? .green : .secondary)
+                }
+                .buttonStyle(.plain)
+
+                if canEdit {
+                    TextField("Subtask", text: subtaskTextBinding(for: subtaskIndex))
+                } else {
+                    Text(subtask.text)
+                        .foregroundColor(.primary)
+                }
+
+                if canEdit {
+                    Button(role: .destructive) {
+                        removeSubtask(at: subtaskIndex)
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            if subtask.isDone, let completedAt = subtask.completedAt {
+                let completedBy = subtask.completedBy?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                Text(
+                    completedBy.isEmpty
+                    ? "Completed on \(completedAt.formatted(date: .abbreviated, time: .shortened))"
+                    : "Completed by \(completedBy) on \(completedAt.formatted(date: .abbreviated, time: .shortened))"
+                )
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            }
+        }
+    }
+
+    private var attachmentsSection: some View {
+        Section("Attachments") {
+            if let itemIndex {
+                if template.items[itemIndex].attachments.isEmpty {
+                    Text("No attachments")
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(template.items[itemIndex].attachments) { attachment in
+                        attachmentRow(attachment)
+                    }
+                }
+            }
+
+            if canEdit {
+                PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
+                    Label("Add Photo", systemImage: "photo")
+                }
+                Button {
+                    showingFileImporter = true
+                } label: {
+                    Label("Add File", systemImage: "paperclip")
+                }
+                if isUploadingAttachment {
+                    ProgressView("Uploading attachment…")
+                }
+                if let attachmentError, !attachmentError.isEmpty {
+                    Text(attachmentError)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                }
+            }
+        }
+    }
+
+    private func attachmentRow(_ attachment: ChecklistTaskAttachment) -> some View {
+        HStack {
+            if let url = URL(string: attachment.url.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                Link(destination: url) {
+                    Label(attachment.name, systemImage: attachmentSystemImage(for: attachment.kind))
+                }
+            } else {
+                Label(attachment.name, systemImage: attachmentSystemImage(for: attachment.kind))
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+            if canEdit {
+                Button(role: .destructive) {
+                    removeAttachment(id: attachment.id)
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.plain)
             }
         }
     }
@@ -11090,7 +11244,7 @@ private struct ChecklistTaskDetailView: View {
         template.items[itemIndex].subtasks[index].isDone.toggle()
         if template.items[itemIndex].subtasks[index].isDone {
             template.items[itemIndex].subtasks[index].completedAt = Date()
-            template.items[itemIndex].subtasks[index].completedBy = completionUserLabel
+            template.items[itemIndex].subtasks[index].completedBy = completionUserLabel()
         } else {
             template.items[itemIndex].subtasks[index].completedAt = nil
             template.items[itemIndex].subtasks[index].completedBy = nil
@@ -13723,6 +13877,7 @@ private struct IntegrationsView: View {
 private enum MainAppSection: String, CaseIterable, Identifiable {
     case chat
     case patchsheet
+    case runOfShow
     case training
     case assets
     case integrations
@@ -13740,6 +13895,7 @@ private enum MainAppSection: String, CaseIterable, Identifiable {
         switch self {
         case .chat: return "Chat"
         case .patchsheet: return "Patchsheet"
+        case .runOfShow: return "Run of Show"
         case .training: return "Training"
         case .assets: return "Assets"
         case .integrations: return "Integrations"
@@ -13757,6 +13913,7 @@ private enum MainAppSection: String, CaseIterable, Identifiable {
         switch self {
         case .chat: return "message"
         case .patchsheet: return "square.grid.3x2"
+        case .runOfShow: return "list.bullet.rectangle.portrait"
         case .training: return "graduationcap"
         case .assets: return "shippingbox"
         case .integrations: return "link"
@@ -13772,7 +13929,7 @@ private enum MainAppSection: String, CaseIterable, Identifiable {
 }
 
 private let preferredMainTabSectionsStorageKey = "preferredMainTabSections"
-private let defaultPreferredMainTabSections: [MainAppSection] = [.chat, .patchsheet, .training, .assets]
+private let defaultPreferredMainTabSections: [MainAppSection] = [.chat, .patchsheet, .runOfShow, .training]
 
 private func externalTicketFormSlug(from organizationName: String) -> String {
     let trimmed = organizationName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -13806,6 +13963,9 @@ private func availableMainAppSections(for store: ProdConnectStore) -> [MainAppSe
     }
     if isPrivilegedUser || store.user?.canSeePatchsheet == true {
         sections.append(.patchsheet)
+    }
+    if store.canSeeRunOfShow {
+        sections.append(.runOfShow)
     }
     if (store.user?.hasChatAndTrainingFeatures ?? false) && (isPrivilegedUser || store.user?.canSeeTraining == true) {
         sections.append(.training)
@@ -13887,6 +14047,8 @@ private func mainAppSectionDestination(_ section: MainAppSection) -> some View {
         ChatListView()
     case .patchsheet:
         MainTabView.PatchsheetView()
+    case .runOfShow:
+        RunOfShowTabView()
     case .training:
         TrainingListView()
     case .assets:
@@ -13907,6 +14069,607 @@ private func mainAppSectionDestination(_ section: MainAppSection) -> some View {
         AccountView()
     case .users:
         UsersView()
+    }
+}
+
+private struct RunOfShowTabView: View {
+    private enum DisplayMode: String, CaseIterable, Identifiable {
+        case timeline = "Timeline"
+        case live = "Live"
+
+        var id: String { rawValue }
+    }
+
+    @EnvironmentObject private var store: ProdConnectStore
+    @State private var selectedShowID: String?
+    @State private var mode: DisplayMode = .timeline
+    @State private var showToDelete: RunOfShowDocument?
+    @State private var showTitleDraft = ""
+
+    private var canEdit: Bool {
+        store.canEditRunOfShow
+    }
+
+    private var shows: [RunOfShowDocument] {
+        store.runOfShows.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private var selectedShow: RunOfShowDocument? {
+        guard let selectedShowID else { return shows.first }
+        return shows.first(where: { $0.id == selectedShowID }) ?? shows.first
+    }
+
+    var body: some View {
+        NavigationStack {
+            content
+                .navigationTitle("Run of Show")
+                .toolbar { toolbarContent }
+                .onAppear {
+                    if selectedShowID == nil {
+                        selectedShowID = shows.first?.id
+                    }
+                    syncShowTitleDraft()
+                }
+                .onChange(of: shows.map(\.id)) { ids in
+                    if let selectedShowID, ids.contains(selectedShowID) {
+                        syncShowTitleDraft()
+                        return
+                    }
+                    self.selectedShowID = ids.first
+                    syncShowTitleDraft()
+                }
+                .alert("Delete Run of Show?", isPresented: Binding(
+                    get: { showToDelete != nil },
+                    set: { if !$0 { showToDelete = nil } }
+                )) {
+                    Button("Cancel", role: .cancel) {}
+                    Button("Delete", role: .destructive) {
+                        guard let showToDelete else { return }
+                        store.deleteRunOfShow(showToDelete)
+                        if selectedShowID == showToDelete.id {
+                            selectedShowID = shows.first(where: { $0.id != showToDelete.id })?.id
+                        }
+                        self.showToDelete = nil
+                    }
+                } message: {
+                    Text("This permanently deletes the selected run of show.")
+                }
+        }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if let show = selectedShow {
+            showContent(show)
+        } else {
+            emptyState
+        }
+    }
+
+    private func showContent(_ show: RunOfShowDocument) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                header(show)
+                modePicker
+                activeModeView(for: show)
+            }
+            .padding()
+        }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "list.bullet.rectangle.portrait")
+                .font(.system(size: 42, weight: .regular))
+                .foregroundStyle(.secondary)
+            Text("No Run of Show")
+                .font(.headline)
+            Text("Create a show to start building your service timeline.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
+    }
+
+    private var modePicker: some View {
+        Picker("Mode", selection: $mode) {
+            ForEach(DisplayMode.allCases) { mode in
+                Text(mode.rawValue).tag(mode)
+            }
+        }
+        .pickerStyle(.segmented)
+    }
+
+    @ViewBuilder
+    private func activeModeView(for show: RunOfShowDocument) -> some View {
+        if mode == .timeline {
+            timelineView(show)
+        } else {
+            liveView(show)
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        ToolbarItemGroup(placement: .navigationBarTrailing) {
+            Menu {
+                ForEach(shows) { show in
+                    Button(show.title.isEmpty ? "Untitled Show" : show.title) {
+                        selectedShowID = show.id
+                    }
+                }
+            } label: {
+                Label("Shows", systemImage: "list.bullet")
+            }
+
+            if canEdit {
+                Button {
+                    addShow()
+                } label: {
+                    Label("Add Show", systemImage: "plus")
+                }
+            }
+        }
+    }
+
+    private func header(_ show: RunOfShowDocument) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            TextField(
+                "Show Title",
+                text: $showTitleDraft
+            )
+            .font(.title.bold())
+            .disabled(!canEdit)
+            .onSubmit {
+                commitShowTitle(for: show)
+            }
+            .onDisappear {
+                commitShowTitle(for: show)
+            }
+
+            HStack {
+                DatePicker(
+                    "Start",
+                    selection: Binding(
+                        get: { show.scheduledStart },
+                        set: { newValue in
+                            updateShow(show) { $0.scheduledStart = newValue }
+                        }
+                    ),
+                    displayedComponents: [.date, .hourAndMinute]
+                )
+                .disabled(!canEdit)
+
+                Spacer()
+
+                if canEdit {
+                    Button("Delete", role: .destructive) {
+                        showToDelete = show
+                    }
+                }
+            }
+
+            Text("\(show.sortedItems.count) items • \(formatDuration(seconds: show.totalDurationSeconds)) total")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func timelineView(_ show: RunOfShowDocument) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if canEdit {
+                Button {
+                    addItem(to: show)
+                } label: {
+                    Label("Add Item", systemImage: "plus")
+                }
+                .buttonStyle(.borderedProminent)
+            }
+
+            ScrollView(.horizontal, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack(spacing: 0) {
+                        timelineHeader("Time", width: 90)
+                        timelineHeader("Length", width: 90)
+                        timelineHeader("Title", width: 220)
+                        timelineHeader("Person", width: 150)
+                        timelineHeader("Notes", width: 260)
+                        timelineHeader("", width: 88)
+                    }
+                    .background(Color.secondary.opacity(0.12))
+
+                    ForEach(Array(show.sortedItems.enumerated()), id: \.element.id) { index, item in
+                        HStack(spacing: 0) {
+                            timelineCell(startTimeText(for: show, itemIndex: index), width: 90)
+                            HStack(spacing: 6) {
+                                TextField(
+                                    "0",
+                                    text: Binding(
+                                        get: { String(max(item.lengthMinutes, 0)) },
+                                        set: { newValue in
+                                            let digits = newValue.filter(\.isNumber)
+                                            let parsed = Int(digits) ?? 0
+                                            updateItemDuration(show, itemID: item.id, minutes: min(max(parsed, 0), 600), seconds: item.lengthSeconds)
+                                        }
+                                    )
+                                )
+                                .keyboardType(.numberPad)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 34)
+                                .multilineTextAlignment(.trailing)
+                                Text(":")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                TextField(
+                                    "00",
+                                    text: Binding(
+                                        get: { String(format: "%02d", min(max(item.lengthSeconds, 0), 59)) },
+                                        set: { newValue in
+                                            let digits = newValue.filter(\.isNumber)
+                                            let parsed = Int(digits) ?? 0
+                                            updateItemDuration(show, itemID: item.id, minutes: item.lengthMinutes, seconds: min(max(parsed, 0), 59))
+                                        }
+                                    )
+                                )
+                                .keyboardType(.numberPad)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 34)
+                                .multilineTextAlignment(.trailing)
+                                Text("min")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(width: 90, alignment: .leading)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 10)
+                            .disabled(!canEdit)
+
+                            inlineField("Title", text: item.title, width: 220) { newValue in
+                                updateItem(show, itemID: item.id) { $0.title = newValue }
+                            }
+                            inlineField("Person", text: item.person, width: 150) { newValue in
+                                updateItem(show, itemID: item.id) { $0.person = newValue }
+                            }
+                            inlineField("Notes", text: item.notes, width: 260) { newValue in
+                                updateItem(show, itemID: item.id) { $0.notes = newValue }
+                            }
+
+                            HStack(spacing: 8) {
+                                Button {
+                                    moveItem(show, from: index, direction: -1)
+                                } label: {
+                                    Image(systemName: "arrow.up")
+                                }
+                                .disabled(index == 0 || !canEdit)
+
+                                Button(role: .destructive) {
+                                    deleteItem(show, itemID: item.id)
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .disabled(!canEdit)
+                            }
+                            .frame(width: 88)
+                        }
+                        .background(
+                            RoundedRectangle(cornerRadius: 0, style: .continuous)
+                                .fill(index.isMultiple(of: 2) ? Color(.secondarySystemBackground) : Color(.systemBackground))
+                        )
+                    }
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+    }
+
+    private func liveView(_ show: RunOfShowDocument) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Button(show.isLiveActive ? "Restart" : "Start") {
+                    startLive(show)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(show.sortedItems.isEmpty || !canEdit)
+
+                Button("Previous") {
+                    moveLive(show, direction: -1)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!show.isLiveActive || !canEdit)
+
+                Button("Next") {
+                    moveLive(show, direction: 1)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!show.isLiveActive || !canEdit)
+
+                Button("Reset") {
+                    resetLive(show)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled((!show.isLiveActive && show.liveCurrentItemID == nil) || !canEdit)
+            }
+
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                liveSnapshot(show: show, now: context.date)
+            }
+        }
+        .padding()
+    }
+
+    private func liveSnapshot(show: RunOfShowDocument, now: Date) -> some View {
+        let items = show.sortedItems
+        let activeCurrentItemID = show.isLiveActive ? show.liveCurrentItemID : items.first?.id
+        let currentIndex = show.itemIndex(for: activeCurrentItemID)
+        let currentItem = currentIndex.flatMap { items.indices.contains($0) ? items[$0] : nil }
+        let nextItem = currentIndex.flatMap { index in
+            let nextIndex = index + 1
+            return items.indices.contains(nextIndex) ? items[nextIndex] : nil
+        }
+        let remaining = currentItem.map { item in
+            show.isLiveActive ? show.currentRemainingSeconds(at: now) : item.durationSeconds
+        } ?? 0
+        let endTime = show.isLiveActive
+            ? show.projectedEndTime(at: now)
+            : show.scheduledStart.addingTimeInterval(TimeInterval(show.totalDurationSeconds))
+        let currentTitle = currentItem?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let currentNotes = currentItem?.notes.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let nextTitle = nextItem?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        return VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                VStack(spacing: 8) {
+                    Text(formattedClock(seconds: remaining))
+                        .font(.system(size: 36, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
+                    Text(show.isLiveActive ? "ends \(endTime.formatted(date: .omitted, time: .shortened))" : "live not started")
+                        .font(.caption)
+                        .foregroundStyle(Color.white.opacity(0.82))
+                }
+                .frame(width: 128)
+                .padding(.vertical, 18)
+                .background(Color(red: 0.38, green: 0.77, blue: 0.2))
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("NOW")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(Color.black.opacity(0.06))
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    Text(currentTitle.isEmpty ? "No active item" : currentTitle)
+                        .font(.system(size: 28, weight: .light))
+                        .foregroundStyle(Color.black.opacity(0.8))
+                        .lineLimit(2)
+                    Text(currentItem.map { "\($0.formattedDuration) • \($0.person.isEmpty ? "No person assigned" : $0.person)" } ?? "Waiting to start")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(18)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.white)
+            }
+
+            VStack(alignment: .leading, spacing: 12) {
+                Text("ITEM NOTES")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text(currentNotes.isEmpty ? "No item notes" : currentNotes)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    .background(Color.black.opacity(0.03))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            .padding(18)
+            .background(Color.white)
+
+            VStack(alignment: .leading, spacing: 12) {
+                Text("NEXT")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(Color.black.opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                Text(nextTitle.isEmpty ? "No next item" : nextTitle)
+                    .font(.system(size: 24, weight: .light))
+                    .foregroundStyle(Color.black.opacity(0.76))
+                    .lineLimit(2)
+                Text(nextItem.map { "\($0.formattedDuration) • \($0.person.isEmpty ? "No person assigned" : $0.person)" } ?? "End of show")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(red: 0.985, green: 0.985, blue: 0.985))
+
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(items.prefix(6).enumerated()), id: \.element.id) { index, item in
+                    HStack(spacing: 10) {
+                        Text(startTimeText(for: show, itemIndex: index))
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(item.id == currentItem?.id ? Color.orange : Color.secondary)
+                            .frame(width: 62, alignment: .leading)
+                        Text(item.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : item.title)
+                            .font(.subheadline.weight(item.id == currentItem?.id ? .semibold : .regular))
+                            .foregroundStyle(item.id == currentItem?.id ? Color.primary : Color.secondary)
+                            .lineLimit(2)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(item.id == currentItem?.id ? Color.orange.opacity(0.14) : (index.isMultiple(of: 2) ? Color.black.opacity(0.02) : Color.clear))
+                }
+            }
+            .background(Color(red: 0.96, green: 0.96, blue: 0.96))
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(Color.black.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private func timelineHeader(_ title: String, width: CGFloat) -> some View {
+        Text(title)
+            .font(.caption.weight(.semibold))
+            .textCase(.uppercase)
+            .foregroundStyle(.secondary)
+            .frame(width: width, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 10)
+    }
+
+    private func timelineCell(_ value: String, width: CGFloat) -> some View {
+        Text(value)
+            .frame(width: width, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 12)
+    }
+
+    private func inlineField(_ placeholder: String, text: String, width: CGFloat, setter: @escaping (String) -> Void) -> some View {
+        TextField(placeholder, text: Binding(get: { text }, set: setter))
+            .frame(width: width, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 12)
+            .disabled(!canEdit)
+    }
+
+    private func addShow() {
+        guard canEdit else { return }
+        let show = RunOfShowDocument(
+            title: "New Run of Show",
+            teamCode: store.teamCode ?? "",
+            scheduledStart: Date(),
+            items: [
+                RunOfShowItem(title: "Welcome", lengthMinutes: 5, lengthSeconds: 0, position: 0),
+                RunOfShowItem(title: "Song 1", lengthMinutes: 5, lengthSeconds: 0, position: 1)
+            ]
+        )
+        store.saveRunOfShow(show)
+        selectedShowID = show.id
+    }
+
+    private func addItem(to show: RunOfShowDocument) {
+        updateShow(show) { mutable in
+            mutable.items.append(RunOfShowItem(title: "New Item", lengthMinutes: 5, lengthSeconds: 0, position: mutable.items.count))
+        }
+    }
+
+    private func deleteItem(_ show: RunOfShowDocument, itemID: String) {
+        updateShow(show) { mutable in
+            mutable.items.removeAll { $0.id == itemID }
+        }
+    }
+
+    private func moveItem(_ show: RunOfShowDocument, from index: Int, direction: Int) {
+        updateShow(show) { mutable in
+            var items = mutable.sortedItems
+            let newIndex = index + direction
+            guard items.indices.contains(index), items.indices.contains(newIndex) else { return }
+            let moved = items.remove(at: index)
+            items.insert(moved, at: newIndex)
+            mutable.items = items.enumerated().map { offset, item in
+                var updated = item
+                updated.position = offset
+                return updated
+            }
+        }
+    }
+
+    private func startLive(_ show: RunOfShowDocument) {
+        updateShow(show) { mutable in
+            guard let first = mutable.sortedItems.first else { return }
+            let now = Date()
+            mutable.isLiveActive = true
+            mutable.liveCurrentItemID = first.id
+            mutable.liveShowStartedAt = now
+            mutable.liveItemStartedAt = now
+        }
+    }
+
+    private func moveLive(_ show: RunOfShowDocument, direction: Int) {
+        updateShow(show) { mutable in
+            let items = mutable.sortedItems
+            guard let currentIndex = mutable.itemIndex(for: mutable.liveCurrentItemID) else { return }
+            let newIndex = currentIndex + direction
+            guard items.indices.contains(newIndex) else { return }
+            mutable.isLiveActive = true
+            mutable.liveCurrentItemID = items[newIndex].id
+            mutable.liveItemStartedAt = Date()
+            if mutable.liveShowStartedAt == nil {
+                mutable.liveShowStartedAt = Date()
+            }
+        }
+    }
+
+    private func resetLive(_ show: RunOfShowDocument) {
+        updateShow(show) { mutable in
+            mutable.isLiveActive = false
+            mutable.liveCurrentItemID = nil
+            mutable.liveShowStartedAt = nil
+            mutable.liveItemStartedAt = nil
+        }
+    }
+
+    private func updateItem(_ show: RunOfShowDocument, itemID: String, change: (inout RunOfShowItem) -> Void) {
+        updateShow(show) { mutable in
+            guard let index = mutable.items.firstIndex(where: { $0.id == itemID }) else { return }
+            change(&mutable.items[index])
+        }
+    }
+
+    private func updateItemDuration(_ show: RunOfShowDocument, itemID: String, minutes: Int, seconds: Int) {
+        guard canEdit else { return }
+        var mutable = show
+        guard let index = mutable.items.firstIndex(where: { $0.id == itemID }) else { return }
+        mutable.items[index].lengthMinutes = max(minutes, 0)
+        mutable.items[index].lengthSeconds = min(max(seconds, 0), 59)
+        store.saveRunOfShow(mutable)
+    }
+
+    private func updateShow(_ show: RunOfShowDocument, change: (inout RunOfShowDocument) -> Void) {
+        guard canEdit else { return }
+        var mutable = show
+        change(&mutable)
+        DispatchQueue.main.async {
+            store.saveRunOfShow(mutable)
+        }
+    }
+
+    private func syncShowTitleDraft() {
+        let nextTitle = selectedShow?.title ?? ""
+        if showTitleDraft != nextTitle {
+            showTitleDraft = nextTitle
+        }
+    }
+
+    private func commitShowTitle(for show: RunOfShowDocument) {
+        guard canEdit else { return }
+        let normalizedTitle = showTitleDraft
+        guard normalizedTitle != show.title else { return }
+        updateShow(show) { $0.title = normalizedTitle }
+    }
+
+    private func startTimeText(for show: RunOfShowDocument, itemIndex: Int) -> String {
+        let offsetSeconds = show.sortedItems.prefix(itemIndex).reduce(0) { $0 + $1.durationSeconds }
+        let start = show.scheduledStart.addingTimeInterval(TimeInterval(offsetSeconds))
+        return start.formatted(date: .omitted, time: .shortened)
+    }
+
+    private func formattedClock(seconds: Int) -> String {
+        let minutes = max(seconds, 0) / 60
+        let remainingSeconds = max(seconds, 0) % 60
+        return String(format: "%02d:%02d", minutes, remainingSeconds)
+    }
+
+    private func formatDuration(seconds: Int) -> String {
+        let minutes = max(seconds, 0) / 60
+        let remainingSeconds = max(seconds, 0) % 60
+        return String(format: "%d:%02d", minutes, remainingSeconds)
     }
 }
 
@@ -13968,6 +14731,18 @@ private struct MainTabView: View {
             return selectedCampus
         }
 
+        private var selectedCategory: String {
+            categories[selectedTab]
+        }
+
+        private var showsLightingUniverseColumn: Bool {
+            selectedCategory == "Lighting"
+        }
+
+        private var patchsheetTableWidth: CGFloat {
+            showsLightingUniverseColumn ? 770 : 680
+        }
+
         var body: some View {
             NavigationView {
                 VStack(spacing: 0) {
@@ -14013,76 +14788,55 @@ private struct MainTabView: View {
                         }
                         Button("Cancel", role: .cancel) {}
                     }
-                    List(filteredPatches) { patch in
-                        NavigationLink(destination: EditPatchView(patch: patch).environmentObject(store)) {
-                            VStack(alignment: .leading) {
-                                Text(patch.name).font(.headline)
-                                HStack {
-                                    Text("Input: \(patch.input)")
-                                    Text("Output: \(patch.output)")
-                                }.font(.caption)
-                                if !patch.campus.isEmpty {
-                                    Text("Campus: \(patch.campus)").font(.caption2)
+                    ScrollView([.horizontal, .vertical]) {
+                        VStack(alignment: .leading, spacing: 0) {
+                            patchsheetHeaderRow
+                            ForEach(filteredPatches) { patch in
+                                NavigationLink(destination: EditPatchView(patch: patch).environmentObject(store)) {
+                                    patchsheetRow(for: patch)
                                 }
-                                if !patch.room.isEmpty {
-                                    Text("Room: \(patch.room)").font(.caption2)
-                                }
-                                if patch.category == "Lighting", let universe = patch.universe, !universe.isEmpty {
-                                    Text("Universe: \(universe)").font(.caption2)
-                                }
+                                .buttonStyle(.plain)
                             }
                         }
+                        .frame(width: patchsheetTableWidth, alignment: .leading)
+                        .padding(.horizontal)
+                        .padding(.top, 8)
+                        .padding(.bottom, 12)
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     Spacer()
                     VStack(spacing: 8) {
-                        TextField(categories[selectedTab] == "Lighting" ? "Fixture" : "Name", text: $field1)
+                        TextField(selectedCategory == "Lighting" ? "Fixture" : "Name", text: $field1)
                             .textFieldStyle(RoundedBorderTextFieldStyle())
+                            .submitLabel(.next)
 
                         HStack(spacing: 8) {
                             TextField(
-                                categories[selectedTab] == "Video" ? "Source" : (categories[selectedTab] == "Lighting" ? "DMX Channel" : "Input"),
+                                selectedCategory == "Video" ? "Source" : (selectedCategory == "Lighting" ? "DMX Channel" : "Input"),
                                 text: $field2
                             )
+                            .submitLabel(selectedCategory == "Lighting" ? .next : .done)
                             TextField(
-                                categories[selectedTab] == "Video" ? "Destination" : (categories[selectedTab] == "Lighting" ? "Channel Count" : "Output"),
+                                selectedCategory == "Video" ? "Destination" : (selectedCategory == "Lighting" ? "Channel Count" : "Output"),
                                 text: $field3
                             )
+                            .submitLabel(selectedCategory == "Lighting" ? .next : .done)
                         }
                         .textFieldStyle(RoundedBorderTextFieldStyle())
                         
-                        if categories[selectedTab] == "Lighting" {
+                        if selectedCategory == "Lighting" {
                             TextField("Universe", text: $field4)
                                 .textFieldStyle(RoundedBorderTextFieldStyle())
+                                .submitLabel(.done)
                         }
+                    }
+                    .onSubmit {
+                        submitNewPatch()
                     }
                     .padding(.horizontal)
                     .padding(.bottom, 8)
                     Button {
-                        let trimmedChannelCount = field3.trimmingCharacters(in: .whitespacesAndNewlines)
-                        let parsedChannelCount = Int(trimmedChannelCount)
-                        let isLighting = categories[selectedTab] == "Lighting"
-                        let patch = PatchRow(
-                            name: field1,
-                            input: field2,
-                            output: field3,
-                            teamCode: store.teamCode ?? "",
-                            category: categories[selectedTab],
-                            campus: effectiveCampusFilter,
-                            room: "",
-                            channelCount: isLighting ? parsedChannelCount : nil,
-                            universe: isLighting ? field4.trimmingCharacters(in: .whitespacesAndNewlines) : nil
-                        )
-                        store.savePatch(patch) { result in
-                            switch result {
-                            case .success:
-                                field1 = ""
-                                field2 = ""
-                                field3 = ""
-                                field4 = ""
-                            case .failure(let error):
-                                saveErrorMessage = error.localizedDescription
-                            }
-                        }
+                        submitNewPatch()
                     } label: {
                         Label("Add Patch", systemImage: "plus.rectangle.on.rectangle")
                             .fontWeight(.semibold)
@@ -14105,13 +14859,98 @@ private struct MainTabView: View {
                 }
             }
         }
+
+        private var patchsheetHeaderRow: some View {
+            HStack(spacing: 0) {
+                patchsheetHeaderCell("Name", width: 190, alignment: .leading)
+                patchsheetHeaderCell("Input", width: 140, alignment: .leading)
+                patchsheetHeaderCell("Output", width: 140, alignment: .leading)
+                if showsLightingUniverseColumn {
+                    patchsheetHeaderCell("Universe", width: 90, alignment: .leading)
+                }
+                patchsheetHeaderCell("Notes", width: 210, alignment: .leading)
+            }
+            .background(Color.secondary.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+
+        private func patchsheetHeaderCell(_ title: String, width: CGFloat, alignment: Alignment) -> some View {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .frame(width: width, alignment: alignment)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+        }
+
+        private func patchsheetRow(for patch: PatchRow) -> some View {
+            HStack(spacing: 0) {
+                patchsheetValueCell(patch.name, width: 190, alignment: .leading, emphasized: true)
+                patchsheetValueCell(patch.input, width: 140, alignment: .leading)
+                patchsheetValueCell(patch.output, width: 140, alignment: .leading)
+                if showsLightingUniverseColumn {
+                    patchsheetValueCell(patch.universe ?? "", width: 90, alignment: .leading)
+                }
+                patchsheetValueCell(patch.notes, width: 210, alignment: .leading)
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color(.secondarySystemBackground))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+            )
+        }
+
+        private func patchsheetValueCell(_ text: String, width: CGFloat, alignment: Alignment, emphasized: Bool = false) -> some View {
+            Text(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? " " : text)
+                .font(emphasized ? .body.weight(.semibold) : .body)
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(width: width, alignment: alignment)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 12)
+        }
+
         private var addPatchEnabled: Bool {
-            if categories[selectedTab] == "Audio" {
+            if selectedCategory == "Audio" {
                 return !field1.isEmpty && (!field2.isEmpty || !field3.isEmpty)
-            } else if categories[selectedTab] == "Video" {
+            } else if selectedCategory == "Video" {
                 return !field1.isEmpty && (!field2.isEmpty || !field3.isEmpty)
             } else {
                 return !field1.isEmpty && (!field2.isEmpty || !field3.isEmpty)
+            }
+        }
+
+        private func submitNewPatch() {
+            guard addPatchEnabled else { return }
+            let trimmedChannelCount = field3.trimmingCharacters(in: .whitespacesAndNewlines)
+            let parsedChannelCount = Int(trimmedChannelCount)
+            let isLighting = selectedCategory == "Lighting"
+            let patch = PatchRow(
+                name: field1,
+                input: field2,
+                output: field3,
+                teamCode: store.teamCode ?? "",
+                category: selectedCategory,
+                campus: effectiveCampusFilter,
+                room: "",
+                channelCount: isLighting ? parsedChannelCount : nil,
+                universe: isLighting ? field4.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+            )
+            store.savePatch(patch) { result in
+                switch result {
+                case .success:
+                    field1 = ""
+                    field2 = ""
+                    field3 = ""
+                    field4 = ""
+                case .failure(let error):
+                    saveErrorMessage = error.localizedDescription
+                }
             }
         }
             // Fix Chat Add Channel button

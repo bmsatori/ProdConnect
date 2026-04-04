@@ -27,7 +27,23 @@
 		3C10000C2F40000100000001 /* FirebaseStorage in Frameworks */ = {isa = PBXBuildFile; productRef = 2B13ADA32F3EDD61000099A9 /* FirebaseStorage */; };
 		3C10000D2F40000100000001 /* FirebaseFirestore in Frameworks */ = {isa = PBXBuildFile; productRef = 2B13ADA52F3EDD77000099A9 /* FirebaseFirestore */; };
 		3C1000372F40000100000001 /* ProdConnectMac/Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 3C1000382F40000100000001 /* ProdConnectMac/Assets.xcassets */; };
+		3C2000012F40000100000001 /* ProdConnectMac/NDI/libndi.dylib in Embed NDI Runtime */ = {isa = PBXBuildFile; fileRef = 3C2000112F40000100000001 /* ProdConnectMac/NDI/libndi.dylib */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		3C2000022F40000100000001 /* ProdConnectMac/NDI/libndi_licenses.txt in Resources */ = {isa = PBXBuildFile; fileRef = 3C2000122F40000100000001 /* ProdConnectMac/NDI/libndi_licenses.txt */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		3C2000202F40000100000001 /* Embed NDI Runtime */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				3C2000012F40000100000001 /* ProdConnectMac/NDI/libndi.dylib in Embed NDI Runtime */,
+			);
+			name = "Embed NDI Runtime";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		2B897B502F5286D7002C581F /* StoreKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = StoreKit.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.2.sdk/System/Library/Frameworks/StoreKit.framework; sourceTree = DEVELOPER_DIR; };
@@ -44,6 +60,8 @@
 		3C1000192F40000100000001 /* ProdConnect/GoogleService-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "ProdConnect/GoogleService-Info.plist"; sourceTree = SOURCE_ROOT; };
 		3C10001A2F40000100000001 /* ProdConnectMac/ProdConnectMac.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = ProdConnectMac/ProdConnectMac.entitlements; sourceTree = SOURCE_ROOT; };
 		3C1000382F40000100000001 /* ProdConnectMac/Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = ProdConnectMac/Assets.xcassets; sourceTree = SOURCE_ROOT; };
+		3C2000112F40000100000001 /* ProdConnectMac/NDI/libndi.dylib */ = {isa = PBXFileReference; lastKnownFileType = "compiled.mach-o.dylib"; path = ProdConnectMac/NDI/libndi.dylib; sourceTree = SOURCE_ROOT; };
+		3C2000122F40000100000001 /* ProdConnectMac/NDI/libndi_licenses.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = ProdConnectMac/NDI/libndi_licenses.txt; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -137,12 +155,22 @@
 			name = "ProdConnect Shared";
 			sourceTree = "<group>";
 		};
+		3C2000102F40000100000001 /* NDI */ = {
+			isa = PBXGroup;
+			children = (
+				3C2000112F40000100000001 /* ProdConnectMac/NDI/libndi.dylib */,
+				3C2000122F40000100000001 /* ProdConnectMac/NDI/libndi_licenses.txt */,
+			);
+			path = NDI;
+			sourceTree = "<group>";
+		};
 		3C1000212F40000100000001 /* ProdConnectMac */ = {
 			isa = PBXGroup;
 			children = (
 				3C1000152F40000100000001 /* ProdConnectMac/ProdConnectMacApp.swift */,
 				3C1000162F40000100000001 /* ProdConnectMac/MacAppDelegate.swift */,
 				3C1000172F40000100000001 /* ProdConnectMac/MacRootView.swift */,
+				3C2000102F40000100000001 /* NDI */,
 				3C1000382F40000100000001 /* ProdConnectMac/Assets.xcassets */,
 				3C10001A2F40000100000001 /* ProdConnectMac/ProdConnectMac.entitlements */,
 			);
@@ -186,6 +214,7 @@
 			buildPhases = (
 				3C1000312F40000100000001 /* Sources */,
 				3C1000322F40000100000001 /* Frameworks */,
+				3C2000202F40000100000001 /* Embed NDI Runtime */,
 				3C1000332F40000100000001 /* Resources */,
 			);
 			buildRules = (
@@ -260,6 +289,7 @@
 			files = (
 				3C1000372F40000100000001 /* ProdConnectMac/Assets.xcassets in Resources */,
 				3C1000092F40000100000001 /* ProdConnect/GoogleService-Info.plist in Resources */,
+				3C2000022F40000100000001 /* ProdConnectMac/NDI/libndi_licenses.txt in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -420,8 +450,9 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = ProdConnect/ProdConnect.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 18;
-				ENABLE_PREVIEWS = YES;
+					CURRENT_PROJECT_VERSION = 18;
+					ENABLE_MODULE_VERIFIER = NO;
+					ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Camera is used to scan gear serial numbers.";
@@ -458,8 +489,9 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = ProdConnect/ProdConnect.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 18;
-				ENABLE_PREVIEWS = YES;
+					CURRENT_PROJECT_VERSION = 18;
+					ENABLE_MODULE_VERIFIER = NO;
+					ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Camera is used to scan gear serial numbers.";
@@ -502,6 +534,10 @@
 				INFOPLIST_KEY_CFBundleDisplayName = ProdConnect;
 				INFOPLIST_KEY_CFBundleName = ProdConnect;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.business";
+				INFOPLIST_KEY_NSBonjourServices = (
+					"_ndi._tcp",
+				);
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "ProdConnect uses the local network to publish NDI outputs.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -534,6 +570,10 @@
 				INFOPLIST_KEY_CFBundleDisplayName = ProdConnect;
 				INFOPLIST_KEY_CFBundleName = ProdConnect;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.business";
+				INFOPLIST_KEY_NSBonjourServices = (
+					"_ndi._tcp",
+				);
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "ProdConnect uses the local network to publish NDI outputs.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",

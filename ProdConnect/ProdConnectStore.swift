@@ -19,6 +19,10 @@ import AppKit
 
 @MainActor
 final class ProdConnectStore: ObservableObject {
+    private struct DecodableTypeBox<T: Decodable>: @unchecked Sendable {
+        let type: T.Type
+    }
+
     enum GearSaveError: LocalizedError {
         case duplicateSerial(serial: String, existingName: String)
 
@@ -234,6 +238,7 @@ final class ProdConnectStore: ObservableObject {
     private var lessonsListener: ListenerRegistration?
     private var gearListener: ListenerRegistration?
     private var patchsheetListener: ListenerRegistration?
+    private var runOfShowsListener: ListenerRegistration?
     private var locationsListener: ListenerRegistration?
     private var roomsListener: ListenerRegistration?
     private var checklistGroupsListener: ListenerRegistration?
@@ -249,15 +254,20 @@ final class ProdConnectStore: ObservableObject {
     private var ticketAssignedToCurrentUserIDs: Set<String> = []
     private var hasPrimedTicketSubmissionState = false
     private var seenTicketIDs: Set<String> = []
+    private var pendingGearTicketRefreshWorkItem: DispatchWorkItem?
+    private var pendingFirestoreRecoveryWorkItem: DispatchWorkItem?
     private let userDefaults = UserDefaults.standard
     private let cachedUserProfileKey = "prodconnect_cached_user_profile"
     private let cachedUserProfileIDKey = "prodconnect_cached_user_profile_id"
+    private let cachedLastTeamCodePrefix = "prodconnect_cached_last_team_code"
     private let localChecklistGroupsKeyPrefix = "prodconnect.localChecklistGroups"
     private let localTicketCategoriesKeyPrefix = "prodconnect.localTicketCategories"
     private let localTicketSubcategoriesKeyPrefix = "prodconnect.localTicketSubcategories"
+    private let teamCollectionCacheDirectoryName = "TeamCollectionCache"
 
     @Published var gear: [GearItem] = []
     @Published var patchsheet: [PatchRow] = []
+    @Published var runOfShows: [RunOfShowDocument] = []
     @Published var user: UserProfile?
     @Published var lessons: [TrainingLesson] = []
     @Published var checklists: [ChecklistTemplate] = []
@@ -404,6 +414,14 @@ final class ProdConnectStore: ObservableObject {
     var canSeeTrainingTab: Bool {
         guard let user else { return false }
         return user.hasChatAndTrainingFeatures && (user.isAdmin || user.isOwner || user.canSeeTraining)
+    }
+    var canSeeRunOfShow: Bool {
+        guard let user else { return false }
+        return user.hasPaidSubscription && (user.isAdmin || user.isOwner || user.canSeeRunOfShow)
+    }
+    var canEditRunOfShow: Bool {
+        guard let user else { return false }
+        return user.hasPaidSubscription && (user.isAdmin || user.isOwner || user.canEditRunOfShow)
     }
     var canEditGear: Bool {
         guard let user else { return false }
@@ -627,7 +645,7 @@ final class ProdConnectStore: ObservableObject {
         }
     }
 
-    private func jsonSafeValue(_ value: Any) -> Any {
+    nonisolated private static func makeJSONSafeValue(_ value: Any) -> Any {
         switch value {
         case let timestamp as Timestamp:
             // Match JSONEncoder's default Date encoding (.deferredToDate).
@@ -635,9 +653,9 @@ final class ProdConnectStore: ObservableObject {
         case let date as Date:
             return date.timeIntervalSinceReferenceDate
         case let dict as [String: Any]:
-            return dict.mapValues { jsonSafeValue($0) }
+            return dict.mapValues { makeJSONSafeValue($0) }
         case let array as [Any]:
-            return array.map { jsonSafeValue($0) }
+            return array.map { makeJSONSafeValue($0) }
         default:
             return value
         }
@@ -647,6 +665,7 @@ final class ProdConnectStore: ObservableObject {
         guard let data = try? JSONEncoder().encode(profile) else { return }
         userDefaults.set(data, forKey: cachedUserProfileKey)
         userDefaults.set(profile.id, forKey: cachedUserProfileIDKey)
+        cacheLastKnownTeamCode(profile.teamCode, for: profile.id)
     }
 
     private func loadCachedUserProfile(for userID: String) -> UserProfile? {
@@ -660,9 +679,123 @@ final class ProdConnectStore: ObservableObject {
         userDefaults.removeObject(forKey: cachedUserProfileIDKey)
     }
 
-    private func decodeDocument<T: Decodable>(_ data: [String: Any], as type: T.Type) -> T? {
+    private func lastTeamCodeKey(for userID: String) -> String {
+        "\(cachedLastTeamCodePrefix)_\(userID)"
+    }
+
+    private func cacheLastKnownTeamCode(_ rawCode: String?, for userID: String) {
+        guard let normalized = Self.normalizedTeamCode(rawCode) else { return }
+        userDefaults.set(normalized, forKey: lastTeamCodeKey(for: userID))
+    }
+
+    private func loadLastKnownTeamCode(for userID: String) -> String? {
+        Self.normalizedTeamCode(userDefaults.string(forKey: lastTeamCodeKey(for: userID)))
+    }
+
+    private func teamCollectionCacheDirectoryURL() -> URL? {
+        let fileManager = FileManager.default
+        guard let baseURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let directoryURL = baseURL
+            .appendingPathComponent("ProdConnect", isDirectory: true)
+            .appendingPathComponent(teamCollectionCacheDirectoryName, isDirectory: true)
         do {
-            let safeData = jsonSafeValue(data)
+            try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+            return directoryURL
+        } catch {
+            print("Team collection cache directory error:", error.localizedDescription)
+            return nil
+        }
+    }
+
+    private func teamCollectionCacheURL(collection: String, teamCode: String) -> URL? {
+        guard let directoryURL = teamCollectionCacheDirectoryURL() else { return nil }
+        let normalizedTeamCode = Self.normalizedTeamCode(teamCode) ?? teamCode
+        let sanitizedCollection = collection.replacingOccurrences(of: "/", with: "_")
+        return directoryURL.appendingPathComponent("\(normalizedTeamCode)_\(sanitizedCollection).json")
+    }
+
+    private func loadTeamCollectionCache<T: Decodable>(
+        as type: T.Type,
+        collection: String,
+        teamCode: String
+    ) -> [T] {
+        guard let url = teamCollectionCacheURL(collection: collection, teamCode: teamCode),
+              let data = try? Data(contentsOf: url),
+              let values = try? JSONDecoder().decode([T].self, from: data) else {
+            return []
+        }
+        return values
+    }
+
+    private func persistTeamCollectionCache<T: Encodable>(
+        _ values: [T],
+        collection: String,
+        teamCode: String
+    ) {
+        guard let url = teamCollectionCacheURL(collection: collection, teamCode: teamCode) else { return }
+        let snapshot = values
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                let data = try JSONEncoder().encode(snapshot)
+                try data.write(to: url, options: .atomic)
+            } catch {
+                print("Team collection cache write error (\(collection)):", error.localizedDescription)
+            }
+        }
+    }
+
+    private func shouldIgnoreEmptyCacheSnapshot<T>(
+        values: [T],
+        currentValues: [T],
+        isFromCache: Bool
+    ) -> Bool {
+        isFromCache && values.isEmpty && !currentValues.isEmpty
+    }
+
+    @MainActor
+    private func hydrateTeamCollectionsFromDisk(for teamCode: String) {
+        if teamMembers.isEmpty {
+            teamMembers = loadTeamCollectionCache(as: UserProfile.self, collection: "users", teamCode: teamCode)
+        }
+        if checklists.isEmpty {
+            checklists = loadTeamCollectionCache(as: ChecklistTemplate.self, collection: "checklists", teamCode: teamCode)
+                .filter { $0.archivedAt == nil }
+                .sorted { lhs, rhs in
+                    if lhs.position != rhs.position { return lhs.position < rhs.position }
+                    return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+                }
+        }
+        if ideas.isEmpty {
+            ideas = loadTeamCollectionCache(as: IdeaCard.self, collection: "ideas", teamCode: teamCode)
+        }
+        if gear.isEmpty {
+            gear = loadTeamCollectionCache(as: GearItem.self, collection: "gear", teamCode: teamCode)
+        }
+        if tickets.isEmpty {
+            tickets = loadTeamCollectionCache(as: SupportTicket.self, collection: "tickets", teamCode: teamCode)
+        }
+        if channels.isEmpty {
+            channels = loadTeamCollectionCache(as: ChatChannel.self, collection: "channels", teamCode: teamCode)
+                .sorted { $0.position < $1.position }
+        }
+        if lessons.isEmpty {
+            lessons = loadTeamCollectionCache(as: TrainingLesson.self, collection: "lessons", teamCode: teamCode)
+        }
+        if patchsheet.isEmpty {
+            patchsheet = loadTeamCollectionCache(as: PatchRow.self, collection: "patchsheet", teamCode: teamCode)
+                .sorted(by: PatchRow.autoSort)
+        }
+        if runOfShows.isEmpty {
+            runOfShows = loadTeamCollectionCache(as: RunOfShowDocument.self, collection: "runOfShows", teamCode: teamCode)
+                .sorted { $0.updatedAt > $1.updatedAt }
+        }
+    }
+
+    nonisolated private static func decodeDocument<T: Decodable>(_ data: [String: Any], as type: T.Type) -> T? {
+        do {
+            let safeData = makeJSONSafeValue(data)
             guard JSONSerialization.isValidJSONObject(safeData) else { return nil }
             let json = try JSONSerialization.data(withJSONObject: safeData, options: [])
             return try JSONDecoder().decode(type, from: json)
@@ -692,6 +825,142 @@ final class ProdConnectStore: ObservableObject {
             )
         }
         return dict
+    }
+
+    private func fetchDocumentsOnce<T: Decodable>(
+        query: Query,
+        as type: T.Type,
+        label: String,
+        completion: @escaping ([T]) -> Void
+    ) {
+        let boxedType = DecodableTypeBox(type: type)
+        query.getDocuments { snapshot, error in
+            if let error {
+                print("\(label) one-shot fetch error:", error.localizedDescription)
+                return
+            }
+            guard let docs = snapshot?.documents else { return }
+            Task { @MainActor in
+                let values: [T] = docs.compactMap { doc in
+                    var data = doc.data()
+                    data["id"] = doc.documentID
+                    return Self.decodeDocument(data, as: boxedType.type)
+                }
+                completion(values)
+            }
+        }
+    }
+
+    private func fetchDocumentsFromServerOnce<T: Decodable>(
+        query: Query,
+        as type: T.Type,
+        label: String,
+        completion: @escaping ([T]) -> Void
+    ) {
+        let boxedType = DecodableTypeBox(type: type)
+        query.getDocuments(source: .server) { snapshot, error in
+            if let error {
+                print("\(label) server fetch error:", error.localizedDescription)
+                return
+            }
+            guard let docs = snapshot?.documents else { return }
+            Task { @MainActor in
+                let values: [T] = docs.compactMap { doc in
+                    var data = doc.data()
+                    data["id"] = doc.documentID
+                    return Self.decodeDocument(data, as: boxedType.type)
+                }
+                completion(values)
+            }
+        }
+    }
+
+    @MainActor
+    private func applyLoadedTickets(_ values: [SupportTicket], teamCode: String? = nil) {
+        let previousTickets = tickets
+        tickets = values
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let affectedGearIDs = self.affectedGearIDs(previousTickets: previousTickets, latestTickets: values)
+            self.processTicketSubmissionNotifications(with: values)
+            self.processTicketAssignmentNotifications(with: values)
+            self.processDueReminderNotifications(tickets: values, checklists: self.checklists)
+            if let teamCode {
+                print("Ticket listener loaded \(values.count) tickets for team \(teamCode). Visible tickets now: \(self.visibleTickets.count). Current user: \(self.user?.email ?? "unknown")")
+            }
+            self.scheduleGearTicketRefresh(for: affectedGearIDs)
+        }
+    }
+
+    @MainActor
+    private func scheduleGearTicketRefresh(for gearIDs: Set<String>?) {
+        pendingGearTicketRefreshWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                self.refreshGearTicketState(for: gearIDs, persistRemote: false)
+            }
+        }
+
+        pendingGearTicketRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75, execute: workItem)
+    }
+
+    @MainActor
+    private func scheduleFirestoreRecovery(for teamCode: String) {
+        pendingFirestoreRecoveryWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                guard self.activeTeamListenersCode == teamCode else { return }
+                guard self.gear.isEmpty || self.patchsheet.isEmpty || self.lessons.isEmpty || self.runOfShows.isEmpty else { return }
+
+                do {
+                    try await self.db.enableNetwork()
+                    print("Firestore network recovery requested for team \(teamCode).")
+                } catch {
+                    print("Firestore network recovery error:", error.localizedDescription)
+                }
+
+                let gearQuery = self.queryForUsersTeamCode(collection: "gear", code: teamCode)
+                self.fetchDocumentsFromServerOnce(query: gearQuery, as: GearItem.self, label: "Gear") { values in
+                    guard !values.isEmpty else { return }
+                    self.gear = values
+                    self.persistTeamCollectionCache(values, collection: "gear", teamCode: teamCode)
+                    print("Gear recovery loaded \(values.count) assets for team \(teamCode).")
+                }
+
+                let patchsheetQuery = self.queryForUsersTeamCode(collection: "patchsheet", code: teamCode)
+                self.fetchDocumentsFromServerOnce(query: patchsheetQuery, as: PatchRow.self, label: "Patchsheet") { values in
+                    guard !values.isEmpty else { return }
+                    self.patchsheet = values.sorted(by: PatchRow.autoSort)
+                    self.persistTeamCollectionCache(values, collection: "patchsheet", teamCode: teamCode)
+                    print("Patchsheet recovery loaded \(values.count) rows for team \(teamCode).")
+                }
+
+                let lessonsQuery = self.queryForUsersTeamCode(collection: "lessons", code: teamCode)
+                self.fetchDocumentsFromServerOnce(query: lessonsQuery, as: TrainingLesson.self, label: "Lessons") { values in
+                    guard !values.isEmpty else { return }
+                    self.lessons = values
+                    self.persistTeamCollectionCache(values, collection: "lessons", teamCode: teamCode)
+                    print("Lessons recovery loaded \(values.count) lessons for team \(teamCode).")
+                }
+
+                let runOfShowsQuery = self.queryForUsersTeamCode(collection: "runOfShows", code: teamCode)
+                self.fetchDocumentsFromServerOnce(query: runOfShowsQuery, as: RunOfShowDocument.self, label: "Run of Show") { values in
+                    guard !values.isEmpty else { return }
+                    self.runOfShows = values.sorted { $0.updatedAt > $1.updatedAt }
+                    self.persistTeamCollectionCache(values, collection: "runOfShows", teamCode: teamCode)
+                    print("Run of Show recovery loaded \(values.count) shows for team \(teamCode).")
+                }
+            }
+        }
+
+        pendingFirestoreRecoveryWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: workItem)
     }
 
     private func affectedGearIDs(
@@ -744,6 +1013,11 @@ final class ProdConnectStore: ObservableObject {
     }
 
     private func queryForUsersTeamCode(collection: String, code: String) -> Query {
+        let variants = teamCodeVariants(for: code)
+        if variants.count > 1 {
+            return db.collection(collection).whereField("teamCode", in: variants)
+        }
+
         let normalizedCode = code.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         return db.collection(collection).whereField("teamCode", isEqualTo: normalizedCode)
     }
@@ -951,10 +1225,12 @@ final class ProdConnectStore: ObservableObject {
 
             let uid = authUser.uid
             let signedInEmail = authUser.email ?? email
+            let fallbackTeamCode = self.loadLastKnownTeamCode(for: uid)
             let fallbackProfile = UserProfile(
                 id: uid,
                 displayName: signedInEmail.components(separatedBy: "@").first ?? "User",
-                email: signedInEmail
+                email: signedInEmail,
+                teamCode: fallbackTeamCode
             )
             let initialProfile = self.loadCachedUserProfile(for: uid) ?? fallbackProfile
 
@@ -971,6 +1247,12 @@ final class ProdConnectStore: ObservableObject {
             self.db.collection("users").document(uid).getDocument { snapshot, fetchError in
                 if let fetchError {
                     print("Sign-in profile fetch failed:", fetchError.localizedDescription)
+                    Task { @MainActor in
+                        if self.teamCode == nil, let fallbackTeamCode {
+                            self.teamCode = fallbackTeamCode
+                            self.listenToTeamData()
+                        }
+                    }
                     return
                 }
 
@@ -1134,6 +1416,7 @@ final class ProdConnectStore: ObservableObject {
         resetNotificationState()
         gear = []
         patchsheet = []
+        runOfShows = []
         lessons = []
         checklists = []
         ideas = []
@@ -1168,6 +1451,7 @@ final class ProdConnectStore: ObservableObject {
         lessonsListener?.remove()
         gearListener?.remove()
         patchsheetListener?.remove()
+        runOfShowsListener?.remove()
         locationsListener?.remove()
         roomsListener?.remove()
         checklistGroupsListener?.remove()
@@ -1183,6 +1467,7 @@ final class ProdConnectStore: ObservableObject {
         lessonsListener = nil
         gearListener = nil
         patchsheetListener = nil
+        runOfShowsListener = nil
         locationsListener = nil
         roomsListener = nil
         checklistGroupsListener = nil
@@ -1195,10 +1480,12 @@ final class ProdConnectStore: ObservableObject {
     private func restoreSession(for authUser: FirebaseAuth.User) {
         let authUID = authUser.uid
         let authEmail = authUser.email ?? ""
+        let fallbackTeamCode = loadLastKnownTeamCode(for: authUID)
         let fallbackProfile = UserProfile(
             id: authUID,
             displayName: authEmail.components(separatedBy: "@").first ?? "User",
-            email: authEmail
+            email: authEmail,
+            teamCode: fallbackTeamCode
         )
         let initialProfile = loadCachedUserProfile(for: authUID) ?? fallbackProfile
 
@@ -1216,6 +1503,12 @@ final class ProdConnectStore: ObservableObject {
         db.collection("users").document(authUID).getDocument { snapshot, fetchError in
             if let fetchError {
                 print("Session restore profile fetch failed:", fetchError.localizedDescription)
+                Task { @MainActor in
+                    if self.teamCode == nil, let fallbackTeamCode {
+                        self.teamCode = fallbackTeamCode
+                        self.listenToTeamData()
+                    }
+                }
                 return
             }
 
@@ -1382,6 +1675,8 @@ final class ProdConnectStore: ObservableObject {
         canPersistChecklistGroupOrder = true
         ticketCategories = loadLocalTicketCategories(for: code)
         ticketSubcategories = loadLocalTicketSubcategories(for: code)
+        hydrateTeamCollectionsFromDisk(for: code)
+        scheduleFirestoreRecovery(for: code)
 
         teamDocumentListener = db.collection("teams")
             .document(code)
@@ -1392,29 +1687,49 @@ final class ProdConnectStore: ObservableObject {
                 }
             }
 
-        teamMembersListener = queryForUsersTeamCode(collection: "users", code: code)
+        let teamMembersQuery = queryForUsersTeamCode(collection: "users", code: code)
+        teamMembersListener = teamMembersQuery
             .addSnapshotListener { snapshot, _ in
                 guard let docs = snapshot?.documents else { return }
                 let members: [UserProfile] = docs.compactMap { doc in
                     var data = doc.data()
                     data["id"] = doc.documentID
-                    return self.decodeDocument(data, as: UserProfile.self)
+                    return Self.decodeDocument(data, as: UserProfile.self)
                 }
                 DispatchQueue.main.async {
+                    if self.shouldIgnoreEmptyCacheSnapshot(
+                        values: members,
+                        currentValues: self.teamMembers,
+                        isFromCache: snapshot?.metadata.isFromCache == true
+                    ) {
+                        return
+                    }
                     self.teamMembers = members
+                    self.persistTeamCollectionCache(members, collection: "users", teamCode: code)
                 }
             }
+        fetchDocumentsOnce(query: teamMembersQuery, as: UserProfile.self, label: "Team members") { members in
+            self.teamMembers = members
+            self.persistTeamCollectionCache(members, collection: "users", teamCode: code)
+        }
 
-        checklistsListener = db.collection("checklists")
-            .whereField("teamCode", isEqualTo: code)
+        let checklistsQuery = queryForUsersTeamCode(collection: "checklists", code: code)
+        checklistsListener = checklistsQuery
             .addSnapshotListener { snapshot, _ in
                 guard let docs = snapshot?.documents else { return }
                 let values: [ChecklistTemplate] = docs.compactMap { doc in
                     var data = doc.data()
                     data["id"] = doc.documentID
-                    return self.decodeDocument(data, as: ChecklistTemplate.self)
+                    return Self.decodeDocument(data, as: ChecklistTemplate.self)
                 }
                 DispatchQueue.main.async {
+                    if self.shouldIgnoreEmptyCacheSnapshot(
+                        values: values,
+                        currentValues: self.checklists,
+                        isFromCache: snapshot?.metadata.isFromCache == true
+                    ) {
+                        return
+                    }
                     self.processDueReminderNotifications(tickets: self.tickets, checklists: values)
                     self.checklists = values
                         .filter { $0.archivedAt == nil }
@@ -1422,24 +1737,78 @@ final class ProdConnectStore: ObservableObject {
                         if lhs.position != rhs.position { return lhs.position < rhs.position }
                         return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
                     }
+                    self.persistTeamCollectionCache(values, collection: "checklists", teamCode: code)
                 }
             }
+        fetchDocumentsOnce(query: checklistsQuery, as: ChecklistTemplate.self, label: "Checklists") { values in
+            self.processDueReminderNotifications(tickets: self.tickets, checklists: values)
+            self.checklists = values
+                .filter { $0.archivedAt == nil }
+                .sorted { lhs, rhs in
+                    if lhs.position != rhs.position { return lhs.position < rhs.position }
+                    return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+                }
+            self.persistTeamCollectionCache(values, collection: "checklists", teamCode: code)
+        }
 
-        ideasListener = db.collection("ideas")
-            .whereField("teamCode", isEqualTo: code)
+        let ideasQuery = queryForUsersTeamCode(collection: "ideas", code: code)
+        ideasListener = ideasQuery
             .addSnapshotListener { snapshot, _ in
                 guard let docs = snapshot?.documents else { return }
                 let values: [IdeaCard] = docs.compactMap { doc in
                     var data = doc.data()
                     data["id"] = doc.documentID
-                    return self.decodeDocument(data, as: IdeaCard.self)
+                    return Self.decodeDocument(data, as: IdeaCard.self)
                 }
                 DispatchQueue.main.async {
+                    if self.shouldIgnoreEmptyCacheSnapshot(
+                        values: values,
+                        currentValues: self.ideas,
+                        isFromCache: snapshot?.metadata.isFromCache == true
+                    ) {
+                        return
+                    }
                     self.ideas = values
+                    self.persistTeamCollectionCache(values, collection: "ideas", teamCode: code)
                 }
             }
+        fetchDocumentsOnce(query: ideasQuery, as: IdeaCard.self, label: "Ideas") { values in
+            self.ideas = values
+            self.persistTeamCollectionCache(values, collection: "ideas", teamCode: code)
+        }
 
-        ticketsListener = queryForUsersTeamCode(collection: "tickets", code: code)
+        let gearQuery = queryForUsersTeamCode(collection: "gear", code: code)
+        gearListener = gearQuery
+            .addSnapshotListener { snapshot, _ in
+                guard let docs = snapshot?.documents else { return }
+                let values: [GearItem] = docs.compactMap { doc in
+                    var data = doc.data()
+                    data["id"] = doc.documentID
+                    return Self.decodeDocument(data, as: GearItem.self)
+                }
+                DispatchQueue.main.async {
+                    if self.shouldIgnoreEmptyCacheSnapshot(
+                        values: values,
+                        currentValues: self.gear,
+                        isFromCache: snapshot?.metadata.isFromCache == true
+                    ) {
+                        return
+                    }
+                    self.gear = values
+                    print("Gear listener loaded \(values.count) assets for team \(code).")
+                    self.persistTeamCollectionCache(values, collection: "gear", teamCode: code)
+                }
+            }
+        fetchDocumentsOnce(query: gearQuery, as: GearItem.self, label: "Gear") { values in
+            if !self.shouldIgnoreEmptyCacheSnapshot(values: values, currentValues: self.gear, isFromCache: false) {
+                self.gear = values
+            }
+            print("Gear one-shot loaded \(values.count) assets for team \(code).")
+            self.persistTeamCollectionCache(values, collection: "gear", teamCode: code)
+        }
+
+        let ticketsQuery = queryForUsersTeamCode(collection: "tickets", code: code)
+        ticketsListener = ticketsQuery
             .addSnapshotListener { snapshot, error in
                 if let error {
                     print("Ticket listener error for team \(code): \(error.localizedDescription)")
@@ -1449,75 +1818,132 @@ final class ProdConnectStore: ObservableObject {
                 let values: [SupportTicket] = docs.compactMap { doc in
                     var data = doc.data()
                     data["id"] = doc.documentID
-                    return self.decodeDocument(data, as: SupportTicket.self)
+                    return Self.decodeDocument(data, as: SupportTicket.self)
                 }
                 DispatchQueue.main.async {
-                    let affectedGearIDs = self.affectedGearIDs(previousTickets: self.tickets, latestTickets: values)
-                    self.processTicketSubmissionNotifications(with: values)
-                    self.processTicketAssignmentNotifications(with: values)
-                    self.processDueReminderNotifications(tickets: values, checklists: self.checklists)
-                    self.tickets = values
-                    print("Ticket listener loaded \(values.count) tickets for team \(code). Visible tickets now: \(self.visibleTickets.count). Current user: \(self.user?.email ?? "unknown")")
-                    self.refreshGearTicketState(for: affectedGearIDs)
+                    if self.shouldIgnoreEmptyCacheSnapshot(
+                        values: values,
+                        currentValues: self.tickets,
+                        isFromCache: snapshot?.metadata.isFromCache == true
+                    ) {
+                        return
+                    }
+                    self.applyLoadedTickets(values, teamCode: code)
+                    self.persistTeamCollectionCache(values, collection: "tickets", teamCode: code)
                 }
             }
+        fetchDocumentsOnce(query: ticketsQuery, as: SupportTicket.self, label: "Tickets") { values in
+            self.applyLoadedTickets(values)
+            self.persistTeamCollectionCache(values, collection: "tickets", teamCode: code)
+        }
 
-        channelsListener = queryForUsersTeamCode(collection: "channels", code: code)
+        let channelsQuery = queryForUsersTeamCode(collection: "channels", code: code)
+        channelsListener = channelsQuery
             .addSnapshotListener { snapshot, _ in
                 guard let docs = snapshot?.documents else { return }
                 let values: [ChatChannel] = docs.compactMap { doc in
                     var data = doc.data()
                     data["id"] = doc.documentID
-                    return self.decodeDocument(data, as: ChatChannel.self)
+                    return Self.decodeDocument(data, as: ChatChannel.self)
                 }
                 DispatchQueue.main.async {
+                    if self.shouldIgnoreEmptyCacheSnapshot(
+                        values: values,
+                        currentValues: self.channels,
+                        isFromCache: snapshot?.metadata.isFromCache == true
+                    ) {
+                        return
+                    }
                     let sorted = values.sorted { $0.position < $1.position }
                     self.processIncomingChatNotifications(previous: self.channels, latest: sorted)
                     self.channels = sorted
+                    self.persistTeamCollectionCache(values, collection: "channels", teamCode: code)
                 }
             }
+        fetchDocumentsOnce(query: channelsQuery, as: ChatChannel.self, label: "Channels") { values in
+            let sorted = values.sorted { $0.position < $1.position }
+            self.processIncomingChatNotifications(previous: self.channels, latest: sorted)
+            self.channels = sorted
+            self.persistTeamCollectionCache(values, collection: "channels", teamCode: code)
+        }
 
-        lessonsListener = db.collection("lessons")
-            .whereField("teamCode", isEqualTo: code)
+        let lessonsQuery = queryForUsersTeamCode(collection: "lessons", code: code)
+        lessonsListener = lessonsQuery
             .addSnapshotListener { snapshot, _ in
                 guard let docs = snapshot?.documents else { return }
                 let values: [TrainingLesson] = docs.compactMap { doc in
                     var data = doc.data()
                     data["id"] = doc.documentID
-                    return self.decodeDocument(data, as: TrainingLesson.self)
+                    return Self.decodeDocument(data, as: TrainingLesson.self)
                 }
                 DispatchQueue.main.async {
+                    if self.shouldIgnoreEmptyCacheSnapshot(
+                        values: values,
+                        currentValues: self.lessons,
+                        isFromCache: snapshot?.metadata.isFromCache == true
+                    ) {
+                        return
+                    }
                     self.lessons = values
+                    self.persistTeamCollectionCache(values, collection: "lessons", teamCode: code)
                 }
             }
+        fetchDocumentsOnce(query: lessonsQuery, as: TrainingLesson.self, label: "Lessons") { values in
+            self.lessons = values
+            self.persistTeamCollectionCache(values, collection: "lessons", teamCode: code)
+        }
 
-        gearListener = db.collection("gear")
-            .whereField("teamCode", isEqualTo: code)
-            .addSnapshotListener { snapshot, _ in
-                guard let docs = snapshot?.documents else { return }
-                let values: [GearItem] = docs.compactMap { doc in
-                    var data = doc.data()
-                    data["id"] = doc.documentID
-                    return self.decodeDocument(data, as: GearItem.self)
-                }
-                DispatchQueue.main.async {
-                    self.gear = values
-                }
-            }
-
-        patchsheetListener = db.collection("patchsheet")
-            .whereField("teamCode", isEqualTo: code)
+        let patchsheetQuery = queryForUsersTeamCode(collection: "patchsheet", code: code)
+        patchsheetListener = patchsheetQuery
             .addSnapshotListener { snapshot, _ in
                 guard let docs = snapshot?.documents else { return }
                 let values: [PatchRow] = docs.compactMap { doc in
                     var data = doc.data()
                     data["id"] = doc.documentID
-                    return self.decodeDocument(data, as: PatchRow.self)
+                    return Self.decodeDocument(data, as: PatchRow.self)
                 }
                 DispatchQueue.main.async {
+                    if self.shouldIgnoreEmptyCacheSnapshot(
+                        values: values,
+                        currentValues: self.patchsheet,
+                        isFromCache: snapshot?.metadata.isFromCache == true
+                    ) {
+                        return
+                    }
                     self.patchsheet = values.sorted(by: PatchRow.autoSort)
+                    self.persistTeamCollectionCache(values, collection: "patchsheet", teamCode: code)
                 }
             }
+        fetchDocumentsOnce(query: patchsheetQuery, as: PatchRow.self, label: "Patchsheet") { values in
+            self.patchsheet = values.sorted(by: PatchRow.autoSort)
+            self.persistTeamCollectionCache(values, collection: "patchsheet", teamCode: code)
+        }
+
+        let runOfShowsQuery = queryForUsersTeamCode(collection: "runOfShows", code: code)
+        runOfShowsListener = runOfShowsQuery
+            .addSnapshotListener { snapshot, _ in
+                guard let docs = snapshot?.documents else { return }
+                let values: [RunOfShowDocument] = docs.compactMap { doc in
+                    var data = doc.data()
+                    data["id"] = doc.documentID
+                    return Self.decodeDocument(data, as: RunOfShowDocument.self)
+                }
+                DispatchQueue.main.async {
+                    if self.shouldIgnoreEmptyCacheSnapshot(
+                        values: values,
+                        currentValues: self.runOfShows,
+                        isFromCache: snapshot?.metadata.isFromCache == true
+                    ) {
+                        return
+                    }
+                    self.runOfShows = values.sorted { $0.updatedAt > $1.updatedAt }
+                    self.persistTeamCollectionCache(values, collection: "runOfShows", teamCode: code)
+                }
+            }
+        fetchDocumentsOnce(query: runOfShowsQuery, as: RunOfShowDocument.self, label: "Run of Show") { values in
+            self.runOfShows = values.sorted { $0.updatedAt > $1.updatedAt }
+            self.persistTeamCollectionCache(values, collection: "runOfShows", teamCode: code)
+        }
 
         locationsListener = db.collection("teams")
             .document(code)
@@ -1918,7 +2344,7 @@ final class ProdConnectStore: ObservableObject {
                 let members: [UserProfile] = docs.compactMap { doc in
                     var data = doc.data()
                     data["id"] = doc.documentID
-                    return self.decodeDocument(data, as: UserProfile.self)
+                    return Self.decodeDocument(data, as: UserProfile.self)
                 }
                 DispatchQueue.main.async {
                     self.teamMembers = members
@@ -1991,6 +2417,46 @@ final class ProdConnectStore: ObservableObject {
             lessons.append(item)
         }
     }
+    func saveRunOfShow(_ show: RunOfShowDocument, completion: ((Result<Void, Error>) -> Void)? = nil) {
+        var updatedShow = show
+        updatedShow.teamCode = (teamCode ?? show.teamCode).trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        updatedShow.updatedAt = Date()
+        updatedShow.items = updatedShow.sortedItems.enumerated().map { index, item in
+            var updatedItem = item
+            updatedItem.position = index
+            updatedItem.lengthMinutes = max(updatedItem.lengthMinutes, 0)
+            updatedItem.lengthSeconds = min(max(updatedItem.lengthSeconds, 0), 59)
+            updatedItem.title = updatedItem.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            updatedItem.person = updatedItem.person.trimmingCharacters(in: .whitespacesAndNewlines)
+            updatedItem.notes = updatedItem.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+            return updatedItem
+        }
+
+        if let index = runOfShows.firstIndex(where: { $0.id == updatedShow.id }) {
+            runOfShows[index] = updatedShow
+        } else {
+            runOfShows.append(updatedShow)
+        }
+        runOfShows.sort { $0.updatedAt > $1.updatedAt }
+        if let activeTeamCode = Self.normalizedTeamCode(updatedShow.teamCode) {
+            persistTeamCollectionCache(runOfShows, collection: "runOfShows", teamCode: activeTeamCode)
+        }
+
+        do {
+            let data = try encodedDictionary(for: updatedShow)
+            db.collection("runOfShows").document(updatedShow.id).setData(data, merge: true) { error in
+                Task { @MainActor in
+                    if let error {
+                        completion?(.failure(error))
+                        return
+                    }
+                    completion?(.success(()))
+                }
+            }
+        } catch {
+            completion?(.failure(error))
+        }
+    }
     func deleteLesson(_ item: TrainingLesson) {
         if let url = item.urlString?.trimmingCharacters(in: .whitespacesAndNewlines),
            !url.isEmpty,
@@ -2000,6 +2466,21 @@ final class ProdConnectStore: ObservableObject {
         }
         db.collection("lessons").document(item.id).delete()
         lessons.removeAll { $0.id == item.id }
+    }
+    func deleteRunOfShow(_ show: RunOfShowDocument, completion: ((Result<Void, Error>) -> Void)? = nil) {
+        db.collection("runOfShows").document(show.id).delete { error in
+            Task { @MainActor in
+                if let error {
+                    completion?(.failure(error))
+                    return
+                }
+                self.runOfShows.removeAll { $0.id == show.id }
+                if let activeTeamCode = Self.normalizedTeamCode(self.teamCode ?? show.teamCode) {
+                    self.persistTeamCollectionCache(self.runOfShows, collection: "runOfShows", teamCode: activeTeamCode)
+                }
+                completion?(.success(()))
+            }
+        }
     }
     func saveChecklist(_ item: ChecklistTemplate) {
         var checklist = item
@@ -2162,7 +2643,7 @@ final class ProdConnectStore: ObservableObject {
         } else {
             tickets.append(ticket)
         }
-        refreshGearTicketState(for: affectedGearIDs)
+        refreshGearTicketState(for: affectedGearIDs, persistRemote: true)
 
         let ticketToPersist = ticket
         let shouldPersistRoom = !ticket.room.isEmpty && existingTicket?.room != ticket.room
@@ -2171,9 +2652,10 @@ final class ProdConnectStore: ObservableObject {
         if !ticket.subcategory.isEmpty { saveTicketSubcategory(ticket.subcategory) }
         do {
             let data = try encodedDictionary(for: ticketToPersist)
+            let assignmentPayloadToPersist = assignmentPayload
             DispatchQueue.global(qos: .userInitiated).async {
                 ticketRef.setData(data, merge: true)
-                ticketRef.setData(assignmentPayload, merge: true)
+                ticketRef.setData(assignmentPayloadToPersist, merge: true)
                 if shouldPersistRoom {
                     roomsCollectionRef.document(roomToPersist).setData([:])
                 }
@@ -2297,7 +2779,7 @@ final class ProdConnectStore: ObservableObject {
         })
         db.collection("tickets").document(item.id).delete()
         tickets.removeAll { $0.id == item.id }
-        refreshGearTicketState(for: affectedGearIDs)
+        refreshGearTicketState(for: affectedGearIDs, persistRemote: true)
     }
     func saveChannel(_ item: ChatChannel) {
         save(item, collection: "channels", id: item.id)
@@ -2690,7 +3172,7 @@ final class ProdConnectStore: ObservableObject {
                             let values: [GearItem] = docs.compactMap { doc in
                                 var data = doc.data()
                                 data["id"] = doc.documentID
-                                return self.decodeDocument(data, as: GearItem.self)
+                                return Self.decodeDocument(data, as: GearItem.self)
                             }
                             DispatchQueue.main.async {
                                 self.gear = values
@@ -2942,9 +3424,17 @@ final class ProdConnectStore: ObservableObject {
         commitChunk(index: 0)
     }
 
-    private func refreshGearTicketState(for gearIDs: Set<String>? = nil) {
+    private func refreshGearTicketState(for gearIDs: Set<String>? = nil, persistRemote: Bool = false) {
         guard !gear.isEmpty else { return }
         if let gearIDs, gearIDs.isEmpty { return }
+
+        let ticketsByGearID = Dictionary(grouping: tickets.compactMap { ticket -> (String, SupportTicket)? in
+            guard let linkedGearID = ticket.linkedGearID?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !linkedGearID.isEmpty else { return nil }
+            return (linkedGearID, ticket)
+        }, by: \.0).mapValues { pairs in
+            pairs.map(\.1).sorted { $0.updatedAt > $1.updatedAt }
+        }
 
         var updatedGear = gear
         var hasChanges = false
@@ -2953,9 +3443,7 @@ final class ProdConnectStore: ObservableObject {
             if let gearIDs, !gearIDs.isEmpty, !gearIDs.contains(item.id) {
                 continue
             }
-            let linkedTickets = tickets
-                .filter { $0.linkedGearID == item.id }
-                .sorted { $0.updatedAt > $1.updatedAt }
+            let linkedTickets = ticketsByGearID[item.id] ?? []
 
             let newActiveIDs = linkedTickets
                 .filter { $0.status != .resolved }
@@ -2977,7 +3465,9 @@ final class ProdConnectStore: ObservableObject {
                 item.activeTicketIDs = newActiveIDs
                 item.ticketHistory = newHistory
                 updatedGear[index] = item
-                save(item, collection: "gear", id: item.id)
+                if persistRemote {
+                    save(item, collection: "gear", id: item.id)
+                }
                 hasChanges = true
             }
         }

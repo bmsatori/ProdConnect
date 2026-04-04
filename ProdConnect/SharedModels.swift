@@ -5,13 +5,78 @@ struct PatchRow: Identifiable, Codable {
     var name: String
     var input: String
     var output: String
+    var notes: String
     var teamCode: String
     var category: String
     var campus: String
     var room: String
     var channelCount: Int?
     var universe: String?
+    var ndiEnabled: Bool = false
     var position: Int = 0
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case input
+        case output
+        case notes
+        case teamCode
+        case category
+        case campus
+        case room
+        case channelCount
+        case universe
+        case ndiEnabled
+        case position
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        name: String,
+        input: String,
+        output: String,
+        notes: String = "",
+        teamCode: String,
+        category: String,
+        campus: String,
+        room: String,
+        channelCount: Int? = nil,
+        universe: String? = nil,
+        ndiEnabled: Bool = false,
+        position: Int = 0
+    ) {
+        self.id = id
+        self.name = name
+        self.input = input
+        self.output = output
+        self.notes = notes
+        self.teamCode = teamCode
+        self.category = category
+        self.campus = campus
+        self.room = room
+        self.channelCount = channelCount
+        self.universe = universe
+        self.ndiEnabled = ndiEnabled
+        self.position = position
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        name = try container.decode(String.self, forKey: .name)
+        input = try container.decode(String.self, forKey: .input)
+        output = try container.decode(String.self, forKey: .output)
+        notes = try container.decodeIfPresent(String.self, forKey: .notes) ?? ""
+        teamCode = try container.decode(String.self, forKey: .teamCode)
+        category = try container.decode(String.self, forKey: .category)
+        campus = try container.decodeIfPresent(String.self, forKey: .campus) ?? ""
+        room = try container.decodeIfPresent(String.self, forKey: .room) ?? ""
+        channelCount = try container.decodeIfPresent(Int.self, forKey: .channelCount)
+        universe = try container.decodeIfPresent(String.self, forKey: .universe)
+        ndiEnabled = try container.decodeIfPresent(Bool.self, forKey: .ndiEnabled) ?? false
+        position = try container.decodeIfPresent(Int.self, forKey: .position) ?? 0
+    }
 }
 
 extension PatchRow {
@@ -73,6 +138,7 @@ struct UserProfile: Identifiable, Codable {
     var assignedCampus: String = ""
     var canEditPatchsheet: Bool = false
     var canEditTraining: Bool = false
+    var canEditRunOfShow: Bool = false
     var canEditGear: Bool = false
     var canEditIdeas: Bool = false
     var canEditChecklists: Bool = false
@@ -80,6 +146,7 @@ struct UserProfile: Identifiable, Codable {
     var canSeeChat: Bool = true
     var canSeePatchsheet: Bool = true
     var canSeeTraining: Bool = true
+    var canSeeRunOfShow: Bool = true
     var canSeeGear: Bool = true
     var canSeeIdeas: Bool = true
     var canSeeChecklists: Bool = true
@@ -96,6 +163,7 @@ struct UserProfile: Identifiable, Codable {
         case assignedCampus
         case canEditPatchsheet
         case canEditTraining
+        case canEditRunOfShow
         case canEditGear
         case canEditIdeas
         case canEditChecklists
@@ -103,6 +171,7 @@ struct UserProfile: Identifiable, Codable {
         case canSeeChat
         case canSeePatchsheet
         case canSeeTraining
+        case canSeeRunOfShow
         case canSeeGear
         case canSeeIdeas
         case canSeeChecklists
@@ -120,6 +189,7 @@ struct UserProfile: Identifiable, Codable {
         assignedCampus: String = "",
         canEditPatchsheet: Bool = false,
         canEditTraining: Bool = false,
+        canEditRunOfShow: Bool = false,
         canEditGear: Bool = false,
         canEditIdeas: Bool = false,
         canEditChecklists: Bool = false,
@@ -127,6 +197,7 @@ struct UserProfile: Identifiable, Codable {
         canSeeChat: Bool = true,
         canSeePatchsheet: Bool = true,
         canSeeTraining: Bool = true,
+        canSeeRunOfShow: Bool = true,
         canSeeGear: Bool = true,
         canSeeIdeas: Bool = true,
         canSeeChecklists: Bool = true,
@@ -142,6 +213,7 @@ struct UserProfile: Identifiable, Codable {
         self.assignedCampus = assignedCampus
         self.canEditPatchsheet = canEditPatchsheet
         self.canEditTraining = canEditTraining
+        self.canEditRunOfShow = canEditRunOfShow
         self.canEditGear = canEditGear
         self.canEditIdeas = canEditIdeas
         self.canEditChecklists = canEditChecklists
@@ -149,6 +221,7 @@ struct UserProfile: Identifiable, Codable {
         self.canSeeChat = canSeeChat
         self.canSeePatchsheet = canSeePatchsheet
         self.canSeeTraining = canSeeTraining
+        self.canSeeRunOfShow = canSeeRunOfShow
         self.canSeeGear = canSeeGear
         self.canSeeIdeas = canSeeIdeas
         self.canSeeChecklists = canSeeChecklists
@@ -181,6 +254,7 @@ struct UserProfile: Identifiable, Codable {
         assignedCampus = try container.decodeIfPresent(String.self, forKey: .assignedCampus) ?? ""
         canEditPatchsheet = try container.decodeIfPresent(Bool.self, forKey: .canEditPatchsheet) ?? false
         canEditTraining = try container.decodeIfPresent(Bool.self, forKey: .canEditTraining) ?? false
+        canEditRunOfShow = try container.decodeIfPresent(Bool.self, forKey: .canEditRunOfShow) ?? false
         canEditGear = try container.decodeIfPresent(Bool.self, forKey: .canEditGear) ?? false
         canEditIdeas = try container.decodeIfPresent(Bool.self, forKey: .canEditIdeas) ?? false
         canEditChecklists = try container.decodeIfPresent(Bool.self, forKey: .canEditChecklists) ?? false
@@ -188,6 +262,7 @@ struct UserProfile: Identifiable, Codable {
         canSeeChat = try container.decodeIfPresent(Bool.self, forKey: .canSeeChat) ?? true
         canSeePatchsheet = try container.decodeIfPresent(Bool.self, forKey: .canSeePatchsheet) ?? true
         canSeeTraining = try container.decodeIfPresent(Bool.self, forKey: .canSeeTraining) ?? true
+        canSeeRunOfShow = try container.decodeIfPresent(Bool.self, forKey: .canSeeRunOfShow) ?? true
         canSeeGear = try container.decodeIfPresent(Bool.self, forKey: .canSeeGear) ?? true
         canSeeIdeas = try container.decodeIfPresent(Bool.self, forKey: .canSeeIdeas) ?? true
         canSeeChecklists = try container.decodeIfPresent(Bool.self, forKey: .canSeeChecklists) ?? true
@@ -281,6 +356,188 @@ struct TrainingLesson: Identifiable, Codable {
     var isCompleted: Bool = false
     var assignedToUserID: String? = nil
     var assignedToUserEmail: String? = nil
+}
+
+struct RunOfShowItem: Identifiable, Codable, Equatable {
+    var id: String = UUID().uuidString
+    var title: String
+    var lengthMinutes: Int
+    var lengthSeconds: Int
+    var person: String
+    var notes: String
+    var position: Int = 0
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case lengthMinutes
+        case lengthSeconds
+        case person
+        case notes
+        case position
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        title: String,
+        lengthMinutes: Int = 5,
+        lengthSeconds: Int = 0,
+        person: String = "",
+        notes: String = "",
+        position: Int = 0
+    ) {
+        self.id = id
+        self.title = title
+        self.lengthMinutes = lengthMinutes
+        self.lengthSeconds = lengthSeconds
+        self.person = person
+        self.notes = notes
+        self.position = position
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
+        lengthMinutes = try container.decodeIfPresent(Int.self, forKey: .lengthMinutes) ?? 5
+        lengthSeconds = try container.decodeIfPresent(Int.self, forKey: .lengthSeconds) ?? 0
+        person = try container.decodeIfPresent(String.self, forKey: .person) ?? ""
+        notes = try container.decodeIfPresent(String.self, forKey: .notes) ?? ""
+        position = try container.decodeIfPresent(Int.self, forKey: .position) ?? 0
+    }
+}
+
+struct RunOfShowDocument: Identifiable, Codable, Equatable {
+    var id: String = UUID().uuidString
+    var title: String
+    var teamCode: String
+    var scheduledStart: Date
+    var items: [RunOfShowItem]
+    var autoStartLive: Bool = false
+    var isLiveActive: Bool = false
+    var liveCurrentItemID: String?
+    var liveShowStartedAt: Date?
+    var liveItemStartedAt: Date?
+    var updatedAt: Date = Date()
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case teamCode
+        case scheduledStart
+        case items
+        case autoStartLive
+        case isLiveActive
+        case liveCurrentItemID
+        case liveShowStartedAt
+        case liveItemStartedAt
+        case updatedAt
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        title: String,
+        teamCode: String,
+        scheduledStart: Date = Date(),
+        items: [RunOfShowItem] = [],
+        autoStartLive: Bool = false,
+        isLiveActive: Bool = false,
+        liveCurrentItemID: String? = nil,
+        liveShowStartedAt: Date? = nil,
+        liveItemStartedAt: Date? = nil,
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.title = title
+        self.teamCode = teamCode
+        self.scheduledStart = scheduledStart
+        self.items = items
+        self.autoStartLive = autoStartLive
+        self.isLiveActive = isLiveActive
+        self.liveCurrentItemID = liveCurrentItemID
+        self.liveShowStartedAt = liveShowStartedAt
+        self.liveItemStartedAt = liveItemStartedAt
+        self.updatedAt = updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? "Run of Show"
+        teamCode = try container.decodeIfPresent(String.self, forKey: .teamCode) ?? ""
+        scheduledStart = try container.decodeIfPresent(Date.self, forKey: .scheduledStart) ?? Date()
+        items = (try container.decodeIfPresent([RunOfShowItem].self, forKey: .items) ?? []).sorted {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+        }
+        autoStartLive = try container.decodeIfPresent(Bool.self, forKey: .autoStartLive) ?? false
+        isLiveActive = try container.decodeIfPresent(Bool.self, forKey: .isLiveActive) ?? false
+        liveCurrentItemID = try container.decodeIfPresent(String.self, forKey: .liveCurrentItemID)
+        liveShowStartedAt = try container.decodeIfPresent(Date.self, forKey: .liveShowStartedAt)
+        liveItemStartedAt = try container.decodeIfPresent(Date.self, forKey: .liveItemStartedAt)
+        updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? Date()
+    }
+}
+
+extension RunOfShowDocument {
+    var sortedItems: [RunOfShowItem] {
+        items.sorted {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+        }
+    }
+
+    var totalLengthMinutes: Int {
+        totalDurationSeconds / 60
+    }
+
+    var totalDurationSeconds: Int {
+        sortedItems.reduce(0) { $0 + $1.durationSeconds }
+    }
+
+    func itemIndex(for itemID: String?) -> Int? {
+        guard let itemID else { return nil }
+        return sortedItems.firstIndex(where: { $0.id == itemID })
+    }
+
+    func currentElapsedSeconds(at now: Date) -> Int {
+        guard isLiveActive else { return 0 }
+        guard let currentIndex = itemIndex(for: liveCurrentItemID),
+              sortedItems.indices.contains(currentIndex) else { return 0 }
+        return max(Int(now.timeIntervalSince(liveItemStartedAt ?? now)), 0)
+    }
+
+    func currentRemainingSeconds(at now: Date) -> Int {
+        guard isLiveActive else { return 0 }
+        guard let currentIndex = itemIndex(for: liveCurrentItemID),
+              sortedItems.indices.contains(currentIndex) else { return 0 }
+        let currentItem = sortedItems[currentIndex]
+        return max(currentItem.durationSeconds - currentElapsedSeconds(at: now), 0)
+    }
+
+    func currentOverrunSeconds(at now: Date) -> Int {
+        guard isLiveActive else { return 0 }
+        guard let currentIndex = itemIndex(for: liveCurrentItemID),
+              sortedItems.indices.contains(currentIndex) else { return 0 }
+        let currentItem = sortedItems[currentIndex]
+        return max(currentElapsedSeconds(at: now) - currentItem.durationSeconds, 0)
+    }
+
+    func projectedEndTime(at now: Date) -> Date {
+        let baseStart = liveShowStartedAt ?? scheduledStart
+        let totalScheduledSeconds = totalDurationSeconds
+        return baseStart.addingTimeInterval(TimeInterval(totalScheduledSeconds + currentOverrunSeconds(at: now)))
+    }
+}
+
+extension RunOfShowItem {
+    var durationSeconds: Int {
+        max(lengthMinutes, 0) * 60 + min(max(lengthSeconds, 0), 59)
+    }
+
+    var formattedDuration: String {
+        String(format: "%d:%02d", max(lengthMinutes, 0), min(max(lengthSeconds, 0), 59))
+    }
 }
 
 struct ChecklistSubtask: Identifiable, Codable {

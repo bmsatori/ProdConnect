@@ -141,5 +141,10 @@ service cloud.firestore {
       allow read, write: if belongsToUserTeam();
       allow create: if isSignedIn() && request.resource.data.teamCode == getUserTeamCode();
     }
+
+    match /runOfShows/{showId} {
+      allow read, write: if belongsToUserTeam();
+      allow create: if isSignedIn() && request.resource.data.teamCode == getUserTeamCode();
+    }
   }
 }
