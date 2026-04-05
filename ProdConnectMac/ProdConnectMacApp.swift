@@ -56,9 +56,13 @@ struct ProdConnectMacApp: App {
         configureMacProcessSignalsIfNeeded()
         configureMacFirebaseIfNeeded()
         let sharedStore = ProdConnectStore.shared
+        let ndiController = MacNDISettingsController(store: sharedStore)
         _store = StateObject(wrappedValue: sharedStore)
-        _ndiSettings = StateObject(wrappedValue: MacNDISettingsController(store: sharedStore))
+        _ndiSettings = StateObject(wrappedValue: ndiController)
         _runOfShowControls = StateObject(wrappedValue: MacRunOfShowControlController(store: sharedStore))
+        appDelegate.onWillTerminate = {
+            ndiController.disableAllOutputsOnShutdown()
+        }
     }
 
     var body: some Scene {

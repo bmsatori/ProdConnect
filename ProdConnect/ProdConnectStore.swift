@@ -423,6 +423,84 @@ final class ProdConnectStore: ObservableObject {
         guard let user else { return false }
         return user.hasPaidSubscription && (user.isAdmin || user.isOwner || user.canEditRunOfShow)
     }
+
+    private func canonicalSubscriptionTier(_ rawValue: String?) -> String {
+        switch rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "free" {
+        case "premium_ticketing", "premium w/ticketing", "premium with ticketing":
+            return "premium_ticketing"
+        case "basic_ticketing", "basic w/ticketing", "basic with ticketing":
+            return "basic_ticketing"
+        case "premium":
+            return "premium"
+        case "basic":
+            return "basic"
+        default:
+            return "free"
+        }
+    }
+
+    private func subscriptionTierRank(for tier: String?) -> Int {
+        switch canonicalSubscriptionTier(tier) {
+        case "premium_ticketing":
+            return 4
+        case "premium":
+            return 3
+        case "basic_ticketing":
+            return 2
+        case "basic":
+            return 1
+        default:
+            return 0
+        }
+    }
+
+    private func effectiveSubscriptionTier(userTier: String?, teamTier: String?) -> String {
+        let normalizedUserTier = canonicalSubscriptionTier(userTier)
+        let normalizedTeamTier = canonicalSubscriptionTier(teamTier)
+        return subscriptionTierRank(for: normalizedTeamTier) > subscriptionTierRank(for: normalizedUserTier)
+            ? normalizedTeamTier
+            : normalizedUserTier
+    }
+
+    private func isMatchingTeamCode(_ candidate: String?, code: String) -> Bool {
+        guard let candidate = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !candidate.isEmpty else { return false }
+        return candidate.lowercased() == code.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private func decodeTeamMembers(from documents: [QueryDocumentSnapshot], code: String) -> [UserProfile] {
+        documents.compactMap { doc in
+            var data = doc.data()
+            data["id"] = doc.documentID
+            guard isMatchingTeamCode(data["teamCode"] as? String, code: code) else { return nil }
+            return Self.decodeDocument(data, as: UserProfile.self)
+        }
+    }
+
+    private func fetchEffectiveSubscriptionTier(
+        userTier: String?,
+        teamCode: String?,
+        completion: @escaping (String) -> Void
+    ) {
+        let normalizedUserTier = canonicalSubscriptionTier(userTier)
+        guard let normalizedTeamCode = Self.normalizedTeamCode(teamCode), !normalizedTeamCode.isEmpty else {
+            completion(normalizedUserTier)
+            return
+        }
+
+        db.collection("teams").document(normalizedTeamCode).getDocument { snapshot, _ in
+            let teamTier = snapshot?.data()?["subscriptionTier"] as? String
+            completion(self.effectiveSubscriptionTier(userTier: normalizedUserTier, teamTier: teamTier))
+        }
+    }
+
+    private func repairUserSubscriptionTierIfNeeded(userID: String, tier: String, originalTier: String?) {
+        let normalizedOriginalTier = canonicalSubscriptionTier(originalTier)
+        let normalizedTier = canonicalSubscriptionTier(tier)
+        guard normalizedTier != normalizedOriginalTier else { return }
+        db.collection("users").document(userID).setData([
+            "subscriptionTier": normalizedTier
+        ], merge: true)
+    }
     var canEditGear: Bool {
         guard let user else { return false }
         return user.isAdmin || user.isOwner || user.canEditGear
@@ -1259,6 +1337,7 @@ final class ProdConnectStore: ObservableObject {
                 let profile: UserProfile
                 if let data = snapshot?.data() {
                     let normalizedProfileTeamCode = Self.normalizedTeamCode(data["teamCode"] as? String)
+                    let originalSubscriptionTier = data["subscriptionTier"] as? String ?? "free"
                     profile = UserProfile(
                         id: uid,
                         displayName: (data["displayName"] as? String) ?? signedInEmail.components(separatedBy: "@").first ?? "User",
@@ -1266,7 +1345,7 @@ final class ProdConnectStore: ObservableObject {
                         teamCode: normalizedProfileTeamCode,
                         isAdmin: data["isAdmin"] as? Bool ?? false,
                         isOwner: data["isOwner"] as? Bool ?? false,
-                        subscriptionTier: data["subscriptionTier"] as? String ?? "free",
+                        subscriptionTier: originalSubscriptionTier,
                         assignedCampus: data["assignedCampus"] as? String ?? "",
                         canEditPatchsheet: data["canEditPatchsheet"] as? Bool ?? false,
                         canEditTraining: data["canEditTraining"] as? Bool ?? false,
@@ -1282,6 +1361,24 @@ final class ProdConnectStore: ObservableObject {
                         canSeeChecklists: data["canSeeChecklists"] as? Bool ?? true,
                         canSeeTickets: data["canSeeTickets"] as? Bool ?? true
                     )
+                    self.fetchEffectiveSubscriptionTier(userTier: originalSubscriptionTier, teamCode: normalizedProfileTeamCode) { resolvedTier in
+                        var resolvedProfile = profile
+                        resolvedProfile.subscriptionTier = resolvedTier
+                        self.repairUserSubscriptionTierIfNeeded(
+                            userID: uid,
+                            tier: resolvedTier,
+                            originalTier: originalSubscriptionTier
+                        )
+                        Task { @MainActor in
+                            self.user = resolvedProfile
+                            self.teamCode = resolvedProfile.teamCode
+                            self.isAdmin = resolvedProfile.isAdmin
+                            self.cacheUserProfile(resolvedProfile)
+                            self.loadNotificationState(for: resolvedProfile.id)
+                            self.listenToTeamData()
+                        }
+                    }
+                    return
                 } else {
                     Task { @MainActor in
                         self.repairMissingUserProfile(for: authUser) { repairedProfile in
@@ -1515,6 +1612,7 @@ final class ProdConnectStore: ObservableObject {
             let profile: UserProfile
             if let data = snapshot?.data() {
                 let normalizedProfileTeamCode = Self.normalizedTeamCode(data["teamCode"] as? String)
+                let originalSubscriptionTier = data["subscriptionTier"] as? String ?? "free"
                 profile = UserProfile(
                     id: authUID,
                     displayName: (data["displayName"] as? String) ?? authEmail.components(separatedBy: "@").first ?? "User",
@@ -1522,7 +1620,7 @@ final class ProdConnectStore: ObservableObject {
                     teamCode: normalizedProfileTeamCode,
                     isAdmin: data["isAdmin"] as? Bool ?? false,
                     isOwner: data["isOwner"] as? Bool ?? false,
-                    subscriptionTier: data["subscriptionTier"] as? String ?? "free",
+                    subscriptionTier: originalSubscriptionTier,
                     assignedCampus: data["assignedCampus"] as? String ?? "",
                     canEditPatchsheet: data["canEditPatchsheet"] as? Bool ?? false,
                     canEditTraining: data["canEditTraining"] as? Bool ?? false,
@@ -1538,6 +1636,27 @@ final class ProdConnectStore: ObservableObject {
                     canSeeChecklists: data["canSeeChecklists"] as? Bool ?? true,
                     canSeeTickets: data["canSeeTickets"] as? Bool ?? true
                 )
+                self.fetchEffectiveSubscriptionTier(userTier: originalSubscriptionTier, teamCode: normalizedProfileTeamCode) { resolvedTier in
+                    var resolvedProfile = profile
+                    resolvedProfile.subscriptionTier = resolvedTier
+                    self.repairUserSubscriptionTierIfNeeded(
+                        userID: authUID,
+                        tier: resolvedTier,
+                        originalTier: originalSubscriptionTier
+                    )
+                    Task { @MainActor in
+                        self.user = resolvedProfile
+                        self.teamCode = resolvedProfile.teamCode
+                        self.isAdmin = resolvedProfile.isAdmin
+                        self.cacheUserProfile(resolvedProfile)
+                        self.loadNotificationState(for: resolvedProfile.id)
+                        if !resolvedProfile.email.isEmpty {
+                            self.pushLogin(resolvedProfile.email)
+                        }
+                        self.listenToTeamData()
+                    }
+                }
+                return
             } else {
                 Task { @MainActor in
                     self.repairMissingUserProfile(for: authUser) { repairedProfile in
@@ -1682,20 +1801,38 @@ final class ProdConnectStore: ObservableObject {
             .document(code)
             .addSnapshotListener { snapshot, _ in
                 let organizationName = snapshot?.data()?["organizationName"] as? String ?? ""
+                let teamSubscriptionTier = snapshot?.data()?["subscriptionTier"] as? String
                 DispatchQueue.main.async {
                     self.organizationName = organizationName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard var currentUser = self.user else { return }
+                    let originalTier = currentUser.subscriptionTier
+                    let resolvedTier = self.effectiveSubscriptionTier(
+                        userTier: originalTier,
+                        teamTier: teamSubscriptionTier
+                    )
+                    guard self.canonicalSubscriptionTier(originalTier) != resolvedTier else { return }
+                    currentUser.subscriptionTier = resolvedTier
+                    self.user = currentUser
+                    self.cacheUserProfile(currentUser)
+                    self.repairUserSubscriptionTierIfNeeded(
+                        userID: currentUser.id,
+                        tier: resolvedTier,
+                        originalTier: originalTier
+                    )
                 }
             }
 
-        let teamMembersQuery = queryForUsersTeamCode(collection: "users", code: code)
+        let useAdminTeamMemberFallback = user?.isAdmin == true
+        let teamMembersQuery = useAdminTeamMemberFallback
+            ? db.collection("users")
+            : queryForUsersTeamCode(collection: "users", code: code)
         teamMembersListener = teamMembersQuery
-            .addSnapshotListener { snapshot, _ in
-                guard let docs = snapshot?.documents else { return }
-                let members: [UserProfile] = docs.compactMap { doc in
-                    var data = doc.data()
-                    data["id"] = doc.documentID
-                    return Self.decodeDocument(data, as: UserProfile.self)
+            .addSnapshotListener { snapshot, error in
+                if let error {
+                    print("Team members listener error:", error.localizedDescription)
                 }
+                guard let docs = snapshot?.documents else { return }
+                let members = self.decodeTeamMembers(from: docs, code: code)
                 DispatchQueue.main.async {
                     if self.shouldIgnoreEmptyCacheSnapshot(
                         values: members,
@@ -1708,9 +1845,24 @@ final class ProdConnectStore: ObservableObject {
                     self.persistTeamCollectionCache(members, collection: "users", teamCode: code)
                 }
             }
-        fetchDocumentsOnce(query: teamMembersQuery, as: UserProfile.self, label: "Team members") { members in
-            self.teamMembers = members
-            self.persistTeamCollectionCache(members, collection: "users", teamCode: code)
+        if useAdminTeamMemberFallback {
+            teamMembersQuery.getDocuments { snapshot, error in
+                if let error {
+                    print("Team members one-shot fetch error:", error.localizedDescription)
+                }
+                let members = self.decodeTeamMembers(from: snapshot?.documents ?? [], code: code)
+                DispatchQueue.main.async {
+                    if !members.isEmpty || self.teamMembers.isEmpty {
+                        self.teamMembers = members
+                        self.persistTeamCollectionCache(members, collection: "users", teamCode: code)
+                    }
+                }
+            }
+        } else {
+            fetchDocumentsOnce(query: teamMembersQuery, as: UserProfile.self, label: "Team members") { members in
+                self.teamMembers = members
+                self.persistTeamCollectionCache(members, collection: "users", teamCode: code)
+            }
         }
 
         let checklistsQuery = queryForUsersTeamCode(collection: "checklists", code: code)
@@ -2338,14 +2490,14 @@ final class ProdConnectStore: ObservableObject {
             return
         }
         teamMembersListener?.remove()
-        teamMembersListener = queryForUsersTeamCode(collection: "users", code: code)
+        let useAdminTeamMemberFallback = user?.isAdmin == true
+        let teamMembersQuery = useAdminTeamMemberFallback
+            ? db.collection("users")
+            : queryForUsersTeamCode(collection: "users", code: code)
+        teamMembersListener = teamMembersQuery
             .addSnapshotListener { snapshot, _ in
                 guard let docs = snapshot?.documents else { return }
-                let members: [UserProfile] = docs.compactMap { doc in
-                    var data = doc.data()
-                    data["id"] = doc.documentID
-                    return Self.decodeDocument(data, as: UserProfile.self)
-                }
+                let members = self.decodeTeamMembers(from: docs, code: code)
                 DispatchQueue.main.async {
                     self.teamMembers = members
                 }

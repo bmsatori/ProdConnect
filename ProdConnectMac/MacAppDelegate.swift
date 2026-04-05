@@ -2,7 +2,10 @@ import AppKit
 import FirebaseCore
 import UserNotifications
 
+@MainActor
 final class MacAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    var onWillTerminate: (() -> Void)?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureMacFirebaseIfNeeded()
         let center = UNUserNotificationCenter.current()
@@ -14,6 +17,10 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationC
             }
             print("Mac notification authorization granted:", granted)
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        onWillTerminate?()
     }
 
     func userNotificationCenter(

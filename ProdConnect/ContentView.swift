@@ -14739,6 +14739,26 @@ private struct MainTabView: View {
             selectedCategory == "Lighting"
         }
 
+        private var nameColumnTitle: String {
+            selectedCategory == "Lighting" ? "Fixture" : "Name"
+        }
+
+        private var inputColumnTitle: String {
+            switch selectedCategory {
+            case "Video": return "Source"
+            case "Lighting": return "DMX Channel"
+            default: return "Input"
+            }
+        }
+
+        private var outputColumnTitle: String {
+            switch selectedCategory {
+            case "Video": return "Destination"
+            case "Lighting": return "Channel Count"
+            default: return "Output"
+            }
+        }
+
         private var patchsheetTableWidth: CGFloat {
             showsLightingUniverseColumn ? 770 : 680
         }
@@ -14862,9 +14882,9 @@ private struct MainTabView: View {
 
         private var patchsheetHeaderRow: some View {
             HStack(spacing: 0) {
-                patchsheetHeaderCell("Name", width: 190, alignment: .leading)
-                patchsheetHeaderCell("Input", width: 140, alignment: .leading)
-                patchsheetHeaderCell("Output", width: 140, alignment: .leading)
+                patchsheetHeaderCell(nameColumnTitle, width: 190, alignment: .leading)
+                patchsheetHeaderCell(inputColumnTitle, width: 140, alignment: .leading)
+                patchsheetHeaderCell(outputColumnTitle, width: 140, alignment: .leading)
                 if showsLightingUniverseColumn {
                     patchsheetHeaderCell("Universe", width: 90, alignment: .leading)
                 }

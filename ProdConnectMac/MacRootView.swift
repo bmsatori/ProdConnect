@@ -1925,6 +1925,7 @@ enum MacNDIOrientation: String, CaseIterable, Codable, Identifiable {
 
 enum MacNDIFeedSourceType: String, CaseIterable, Codable, Identifiable {
     case patchsheet
+    case tickets
     case runOfShow
     case runOfShowLive
 
@@ -1933,6 +1934,7 @@ enum MacNDIFeedSourceType: String, CaseIterable, Codable, Identifiable {
     var title: String {
         switch self {
         case .patchsheet: return "Patchsheet"
+        case .tickets: return "Tickets"
         case .runOfShow: return "Run of Show"
         case .runOfShowLive: return "Run of Show Live"
         }
@@ -2026,6 +2028,13 @@ final class MacNDISettingsController: ObservableObject {
             }
             .store(in: &cancellables)
 
+        store.$tickets
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.syncOutputs()
+            }
+            .store(in: &cancellables)
+
         store.$runOfShows
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
@@ -2089,6 +2098,13 @@ final class MacNDISettingsController: ObservableObject {
         previewVisibleFeedIDs.contains(feedID)
     }
 
+    func closeAllPreviews() {
+        for controller in controllers.values {
+            controller.hideWindow()
+        }
+        previewVisibleFeedIDs = []
+    }
+
     func updateFeedValue<Value>(_ value: Value, at index: Int, keyPath: WritableKeyPath<MacNDIFeedConfiguration, Value>) {
         guard feeds.indices.contains(index) else { return }
         DispatchQueue.main.async {
@@ -2129,6 +2145,8 @@ final class MacNDISettingsController: ObservableObject {
         switch feed.sourceType {
         case .patchsheet:
             return "\(patches(for: feed.category).count) selected patches in \(feed.category)"
+        case .tickets:
+            return "\(store.visibleTickets.count) visible tickets"
         case .runOfShow:
             let show = runOfShow(for: feed)
             let title = show?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -2164,6 +2182,7 @@ final class MacNDISettingsController: ObservableObject {
                     sourceType: feed.sourceType,
                     category: feed.category,
                     runOfShow: runOfShow(for: feed),
+                    tickets: store.visibleTickets,
                     patches: patches(for: feed.category),
                     nameColumnTitle: Self.nameColumnTitle(for: feed.category),
                     inputColumnTitle: Self.inputColumnTitle(for: feed.category),
@@ -2186,6 +2205,24 @@ final class MacNDISettingsController: ObservableObject {
                 self.previewVisibleFeedIDs = visibleFeedIDs
             }
         }
+    }
+
+    func disableAllOutputsOnShutdown() {
+        let hadLiveFeeds = feeds.contains { $0.isLive }
+        if hadLiveFeeds {
+            feeds = feeds.map { feed in
+                var updated = feed
+                updated.isLive = false
+                return updated
+            }
+        } else {
+            persistFeeds()
+        }
+
+        for controller in controllers.values {
+            controller.close()
+        }
+        previewVisibleFeedIDs = []
     }
 
     private func controller(for feedID: String) -> MacPatchsheetNDIOutputWindowController {
@@ -2721,16 +2758,21 @@ struct MacSettingsView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                Text("Settings")
-                    .font(.system(size: 28, weight: .bold))
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Settings")
+                .font(.system(size: 28, weight: .bold))
 
-                settingsTabBar
+            settingsTabBar
+
+            if selectedSection == .users {
                 selectedSectionContent
+            } else {
+                ScrollView {
+                    selectedSectionContent
+                }
             }
-            .padding(20)
         }
+        .padding(20)
         .frame(minWidth: 860, minHeight: 620)
     }
 
@@ -2850,7 +2892,7 @@ struct MacSettingsView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("NDI Outputs")
                         .font(.title2.weight(.semibold))
-                    Text("Each feed can target Patchsheet, Run of Show, or Run of Show Live.")
+                    Text("Each feed can target Patchsheet, Tickets, Run of Show, or Run of Show Live.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
@@ -2867,7 +2909,7 @@ struct MacSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else if !ndiSettings.runtimeAvailable {
-                Text("NDI runtime is unavailable in this build. Preview windows work, but network NDI output stays disabled until the bundled runtime is present.")
+                Text("NDI runtime is unavailable in this build. Network NDI output stays disabled until the bundled runtime is present.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -2891,7 +2933,7 @@ struct MacSettingsView: View {
                                     }
                                 }
                                 .frame(width: 140)
-                            } else {
+                            } else if feed.sourceType == .runOfShow || feed.sourceType == .runOfShowLive {
                                 Picker(
                                     "Show",
                                     selection: runOfShowBinding(for: index, feed: feed)
@@ -2940,15 +2982,7 @@ struct MacSettingsView: View {
                             Text(ndiSettings.descriptorText(for: feed))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            Spacer()
-                            Button(ndiSettings.isPreviewVisible(for: feed.id) ? "Hide Preview" : "Show Preview") {
-                                ndiSettings.togglePreview(for: feed.id)
-                            }
-                            .buttonStyle(.bordered)
                         }
-
-                        ndiPreview(for: feed)
-                        .frame(height: feed.orientation == .portrait ? 320 : 240)
                     }
                     .disabled(!canManageNDI)
                 } label: {
@@ -2956,6 +2990,9 @@ struct MacSettingsView: View {
                         .font(.headline)
                 }
             }
+        }
+        .onAppear {
+            ndiSettings.closeAllPreviews()
         }
     }
 
@@ -3063,6 +3100,13 @@ struct MacSettingsView: View {
                 isActive: feed.isLive,
                 scale: min(feed.scale, 1.0)
             )
+        case .tickets:
+            MacTicketsNDIPreview(
+                tickets: store.visibleTickets,
+                outputName: feed.title,
+                isActive: feed.isLive,
+                scale: min(feed.scale, 1.0)
+            )
         case .runOfShow:
             MacRunOfShowNDIPreview(
                 show: ndiSettings.runOfShow(for: feed),
@@ -3088,6 +3132,7 @@ private struct MacPatchsheetNDIOutputConfiguration {
     let sourceType: MacNDIFeedSourceType
     let category: String
     let runOfShow: RunOfShowDocument?
+    let tickets: [SupportTicket]
     let patches: [PatchRow]
     let nameColumnTitle: String
     let inputColumnTitle: String
@@ -3192,6 +3237,13 @@ private final class MacPatchsheetNDIOutputWindowController {
                     outputColumnTitle: configuration.outputColumnTitle,
                     showsUniverseColumn: configuration.showsUniverseColumn,
                     showsHeaders: configuration.showsHeaders,
+                    isActive: sender.isReadyToSend,
+                    scale: configuration.scale
+                )
+            case .tickets:
+                MacTicketsNDIPreview(
+                    tickets: configuration.tickets,
+                    outputName: title,
                     isActive: sender.isReadyToSend,
                     scale: configuration.scale
                 )
@@ -3726,6 +3778,142 @@ private struct MacRunOfShowNDIPreview: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 10 * scale)
             .padding(.vertical, 12 * scale)
+    }
+}
+
+private struct MacTicketsNDIPreview: View {
+    let tickets: [SupportTicket]
+    let outputName: String
+    let isActive: Bool
+    let scale: Double
+
+    private var visibleTickets: [SupportTicket] {
+        tickets.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 4 * scale) {
+                    Text(outputName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "ProdConnect Tickets" : outputName)
+                        .font(.system(size: 30 * scale, weight: .bold))
+                        .foregroundStyle(.white)
+                    Text("\(visibleTickets.count) visible tickets")
+                        .font(.system(size: 12 * scale, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.72))
+                }
+                Spacer()
+                Circle()
+                    .fill(isActive ? Color.green : Color.gray.opacity(0.6))
+                    .frame(width: 12 * scale, height: 12 * scale)
+            }
+            .padding(.horizontal, 24 * scale)
+            .padding(.vertical, 20 * scale)
+            .background(
+                LinearGradient(
+                    colors: [Color(red: 0.08, green: 0.12, blue: 0.18), Color(red: 0.04, green: 0.06, blue: 0.1)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            )
+
+            if visibleTickets.isEmpty {
+                VStack(spacing: 10 * scale) {
+                    Image(systemName: "ticket")
+                        .font(.system(size: 34 * scale))
+                        .foregroundStyle(Color.white.opacity(0.5))
+                    Text("No visible tickets")
+                        .font(.system(size: 22 * scale, weight: .semibold))
+                        .foregroundStyle(.white)
+                    Text("Tickets will appear here when they are visible to the current user.")
+                        .font(.system(size: 13 * scale))
+                        .foregroundStyle(Color.white.opacity(0.62))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(red: 0.05, green: 0.06, blue: 0.08))
+            } else {
+                VStack(spacing: 0) {
+                    HStack(spacing: 0) {
+                        ticketsHeaderCell("Subject", width: 520 * scale)
+                        ticketsHeaderCell("Status", width: 130 * scale)
+                        ticketsHeaderCell("Requester", width: 220 * scale)
+                        ticketsHeaderCell("Updated", width: 170 * scale)
+                    }
+                    .background(Color.white.opacity(0.08))
+
+                    ForEach(Array(visibleTickets.prefix(10).enumerated()), id: \.element.id) { index, ticket in
+                        HStack(spacing: 0) {
+                            ticketsValueCell(ticket.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : ticket.title, width: 520 * scale, emphasized: true)
+                            ticketsStatusCell(ticket, width: 130 * scale)
+                            ticketsValueCell(ticketRequesterName(ticket), width: 220 * scale)
+                            ticketsValueCell(ticket.updatedAt.formatted(date: .abbreviated, time: .shortened), width: 170 * scale)
+                        }
+                        .background(index.isMultiple(of: 2) ? Color.white.opacity(0.03) : Color.clear)
+                        .overlay(alignment: .bottom) {
+                            Rectangle()
+                                .fill(Color.white.opacity(0.06))
+                                .frame(height: 1)
+                        }
+                    }
+                }
+                .background(Color(red: 0.05, green: 0.06, blue: 0.08))
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 20 * scale, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 20 * scale, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private func ticketsHeaderCell(_ title: String, width: CGFloat) -> some View {
+        Text(title)
+            .font(.system(size: 11 * scale, weight: .semibold))
+            .foregroundStyle(Color.white.opacity(0.68))
+            .textCase(.uppercase)
+            .frame(width: width, alignment: .leading)
+            .padding(.horizontal, 14 * scale)
+            .padding(.vertical, 10 * scale)
+    }
+
+    private func ticketsValueCell(_ value: String, width: CGFloat, emphasized: Bool = false) -> some View {
+        Text(value)
+            .font(.system(size: emphasized ? 14 * scale : 13 * scale, weight: emphasized ? .semibold : .regular))
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(width: width, alignment: .leading)
+            .padding(.horizontal, 14 * scale)
+            .padding(.vertical, 12 * scale)
+    }
+
+    private func ticketsStatusCell(_ ticket: SupportTicket, width: CGFloat) -> some View {
+        Text(ticket.status.rawValue)
+            .font(.system(size: 12 * scale, weight: .semibold))
+            .foregroundStyle(ticketStatusColor(ticket.status))
+            .frame(width: width, alignment: .leading)
+            .padding(.horizontal, 14 * scale)
+            .padding(.vertical, 12 * scale)
+    }
+
+    private func ticketRequesterName(_ ticket: SupportTicket) -> String {
+        let name = ticket.externalRequesterName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !name.isEmpty { return name }
+        let createdBy = ticket.createdBy?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return createdBy.isEmpty ? "Unknown" : createdBy
+    }
+
+    private func ticketStatusColor(_ status: TicketStatus) -> Color {
+        switch status {
+        case .new:
+            return Color(red: 0.47, green: 0.74, blue: 1.0)
+        case .open:
+            return Color(red: 0.63, green: 0.82, blue: 0.99)
+        case .inProgress:
+            return Color(red: 0.99, green: 0.72, blue: 0.25)
+        case .resolved:
+            return Color(red: 0.41, green: 0.85, blue: 0.55)
+        }
     }
 }
 
@@ -12372,13 +12560,42 @@ private struct MacUsersView: View {
         store.user?.isAdmin == true || store.user?.isOwner == true
     }
 
+    private var visibleUsers: [UserProfile] {
+        var usersByID: [String: UserProfile] = [:]
+        for member in store.teamMembers {
+            usersByID[member.id] = member
+        }
+        if let currentUser = store.user {
+            usersByID[currentUser.id] = currentUser
+        }
+        return usersByID.values.sorted {
+            $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
+    }
+
     var body: some View {
-        List(store.teamMembers.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }) { user in
-            userRow(for: user)
+        Group {
+            if visibleUsers.isEmpty {
+                VStack(spacing: 10) {
+                    Text("No users loaded")
+                        .font(.headline)
+                    Text("Team members will appear here once the team user list finishes loading.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(visibleUsers) { user in
+                    userRow(for: user)
+                }
+            }
         }
         .scrollContentBackground(.hidden)
         .background(Color.clear)
         .navigationTitle("Users")
+        .onAppear {
+            store.listenToTeamMembers()
+        }
         .sheet(item: $selectedUser) { user in
             NavigationStack {
                 MacUserDetailView(user: user)
