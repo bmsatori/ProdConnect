@@ -424,7 +424,7 @@ final class ProdConnectStore: ObservableObject {
         return user.hasPaidSubscription && (user.isAdmin || user.isOwner || user.canEditRunOfShow)
     }
 
-    private func canonicalSubscriptionTier(_ rawValue: String?) -> String {
+    nonisolated private static func canonicalSubscriptionTierValue(_ rawValue: String?) -> String {
         switch rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "free" {
         case "premium_ticketing", "premium w/ticketing", "premium with ticketing":
             return "premium_ticketing"
@@ -439,8 +439,12 @@ final class ProdConnectStore: ObservableObject {
         }
     }
 
-    private func subscriptionTierRank(for tier: String?) -> Int {
-        switch canonicalSubscriptionTier(tier) {
+    private func canonicalSubscriptionTier(_ rawValue: String?) -> String {
+        Self.canonicalSubscriptionTierValue(rawValue)
+    }
+
+    nonisolated private static func subscriptionTierRankValue(for tier: String?) -> Int {
+        switch canonicalSubscriptionTierValue(tier) {
         case "premium_ticketing":
             return 4
         case "premium":
@@ -454,24 +458,32 @@ final class ProdConnectStore: ObservableObject {
         }
     }
 
-    private func effectiveSubscriptionTier(userTier: String?, teamTier: String?) -> String {
-        let normalizedUserTier = canonicalSubscriptionTier(userTier)
-        let normalizedTeamTier = canonicalSubscriptionTier(teamTier)
-        return subscriptionTierRank(for: normalizedTeamTier) > subscriptionTierRank(for: normalizedUserTier)
+    private func subscriptionTierRank(for tier: String?) -> Int {
+        Self.subscriptionTierRankValue(for: tier)
+    }
+
+    nonisolated private static func effectiveSubscriptionTierValue(userTier: String?, teamTier: String?) -> String {
+        let normalizedUserTier = canonicalSubscriptionTierValue(userTier)
+        let normalizedTeamTier = canonicalSubscriptionTierValue(teamTier)
+        return subscriptionTierRankValue(for: normalizedTeamTier) > subscriptionTierRankValue(for: normalizedUserTier)
             ? normalizedTeamTier
             : normalizedUserTier
     }
 
-    private func isMatchingTeamCode(_ candidate: String?, code: String) -> Bool {
+    private func effectiveSubscriptionTier(userTier: String?, teamTier: String?) -> String {
+        Self.effectiveSubscriptionTierValue(userTier: userTier, teamTier: teamTier)
+    }
+
+    nonisolated private static func isMatchingTeamCode(_ candidate: String?, code: String) -> Bool {
         guard let candidate = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !candidate.isEmpty else { return false }
         return candidate.lowercased() == code.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
-    private func decodeTeamMembers(from documents: [QueryDocumentSnapshot], code: String) -> [UserProfile] {
+    nonisolated private func decodeTeamMembers(from documents: [QueryDocumentSnapshot], code: String) -> [UserProfile] {
         documents.compactMap { doc in
             var data = doc.data()
             data["id"] = doc.documentID
-            guard isMatchingTeamCode(data["teamCode"] as? String, code: code) else { return nil }
+            guard Self.isMatchingTeamCode(data["teamCode"] as? String, code: code) else { return nil }
             return Self.decodeDocument(data, as: UserProfile.self)
         }
     }
@@ -489,7 +501,7 @@ final class ProdConnectStore: ObservableObject {
 
         db.collection("teams").document(normalizedTeamCode).getDocument { snapshot, _ in
             let teamTier = snapshot?.data()?["subscriptionTier"] as? String
-            completion(self.effectiveSubscriptionTier(userTier: normalizedUserTier, teamTier: teamTier))
+            completion(Self.effectiveSubscriptionTierValue(userTier: normalizedUserTier, teamTier: teamTier))
         }
     }
 
@@ -1361,21 +1373,24 @@ final class ProdConnectStore: ObservableObject {
                         canSeeChecklists: data["canSeeChecklists"] as? Bool ?? true,
                         canSeeTickets: data["canSeeTickets"] as? Bool ?? true
                     )
-                    self.fetchEffectiveSubscriptionTier(userTier: originalSubscriptionTier, teamCode: normalizedProfileTeamCode) { resolvedTier in
-                        var resolvedProfile = profile
-                        resolvedProfile.subscriptionTier = resolvedTier
-                        self.repairUserSubscriptionTierIfNeeded(
-                            userID: uid,
-                            tier: resolvedTier,
-                            originalTier: originalSubscriptionTier
-                        )
-                        Task { @MainActor in
-                            self.user = resolvedProfile
-                            self.teamCode = resolvedProfile.teamCode
-                            self.isAdmin = resolvedProfile.isAdmin
-                            self.cacheUserProfile(resolvedProfile)
-                            self.loadNotificationState(for: resolvedProfile.id)
-                            self.listenToTeamData()
+                    Task { @MainActor in
+                        self.fetchEffectiveSubscriptionTier(userTier: originalSubscriptionTier, teamCode: normalizedProfileTeamCode) { resolvedTier in
+                            var resolvedProfile = profile
+                            resolvedProfile.subscriptionTier = resolvedTier
+                            let finalProfile = resolvedProfile
+                            self.repairUserSubscriptionTierIfNeeded(
+                                userID: uid,
+                                tier: resolvedTier,
+                                originalTier: originalSubscriptionTier
+                            )
+                            Task { @MainActor in
+                                self.user = finalProfile
+                                self.teamCode = finalProfile.teamCode
+                                self.isAdmin = finalProfile.isAdmin
+                                self.cacheUserProfile(finalProfile)
+                                self.loadNotificationState(for: finalProfile.id)
+                                self.listenToTeamData()
+                            }
                         }
                     }
                     return
@@ -1396,14 +1411,6 @@ final class ProdConnectStore: ObservableObject {
                     return
                 }
 
-                Task { @MainActor in
-                    self.user = profile
-                    self.teamCode = profile.teamCode
-                    self.isAdmin = profile.isAdmin
-                    self.cacheUserProfile(profile)
-                    self.loadNotificationState(for: profile.id)
-                    self.listenToTeamData()
-                }
             }
         }
     }
@@ -1636,24 +1643,27 @@ final class ProdConnectStore: ObservableObject {
                     canSeeChecklists: data["canSeeChecklists"] as? Bool ?? true,
                     canSeeTickets: data["canSeeTickets"] as? Bool ?? true
                 )
-                self.fetchEffectiveSubscriptionTier(userTier: originalSubscriptionTier, teamCode: normalizedProfileTeamCode) { resolvedTier in
-                    var resolvedProfile = profile
-                    resolvedProfile.subscriptionTier = resolvedTier
-                    self.repairUserSubscriptionTierIfNeeded(
-                        userID: authUID,
-                        tier: resolvedTier,
-                        originalTier: originalSubscriptionTier
-                    )
-                    Task { @MainActor in
-                        self.user = resolvedProfile
-                        self.teamCode = resolvedProfile.teamCode
-                        self.isAdmin = resolvedProfile.isAdmin
-                        self.cacheUserProfile(resolvedProfile)
-                        self.loadNotificationState(for: resolvedProfile.id)
-                        if !resolvedProfile.email.isEmpty {
-                            self.pushLogin(resolvedProfile.email)
+                Task { @MainActor in
+                    self.fetchEffectiveSubscriptionTier(userTier: originalSubscriptionTier, teamCode: normalizedProfileTeamCode) { resolvedTier in
+                        var resolvedProfile = profile
+                        resolvedProfile.subscriptionTier = resolvedTier
+                        let finalProfile = resolvedProfile
+                        self.repairUserSubscriptionTierIfNeeded(
+                            userID: authUID,
+                            tier: resolvedTier,
+                            originalTier: originalSubscriptionTier
+                        )
+                        Task { @MainActor in
+                            self.user = finalProfile
+                            self.teamCode = finalProfile.teamCode
+                            self.isAdmin = finalProfile.isAdmin
+                            self.cacheUserProfile(finalProfile)
+                            self.loadNotificationState(for: finalProfile.id)
+                            if !finalProfile.email.isEmpty {
+                                self.pushLogin(finalProfile.email)
+                            }
+                            self.listenToTeamData()
                         }
-                        self.listenToTeamData()
                     }
                 }
                 return
@@ -1677,17 +1687,6 @@ final class ProdConnectStore: ObservableObject {
                 return
             }
 
-            Task { @MainActor in
-                self.user = profile
-                self.teamCode = profile.teamCode
-                self.isAdmin = profile.isAdmin
-                self.cacheUserProfile(profile)
-                self.loadNotificationState(for: profile.id)
-                if !profile.email.isEmpty {
-                    self.pushLogin(profile.email)
-                }
-                self.listenToTeamData()
-            }
         }
     }
 
@@ -2517,6 +2516,18 @@ final class ProdConnectStore: ObservableObject {
     }
 
     func saveGear(_ item: GearItem, completion: ((Result<Void, Error>) -> Void)? = nil) {
+        guard let activeTeamCode = teamCode?.trimmingCharacters(in: .whitespacesAndNewlines), !activeTeamCode.isEmpty else {
+            completion?(.failure(NSError(
+                domain: "ProdConnect",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No team code is available."]
+            )))
+            return
+        }
+
+        var item = item
+        item.teamCode = activeTeamCode
+
         if let conflict = conflictingGear(for: item) {
             completion?(.failure(GearSaveError.duplicateSerial(
                 serial: item.serialNumber.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -2530,6 +2541,8 @@ final class ProdConnectStore: ObservableObject {
         if !location.isEmpty { saveLocation(location) }
         let campus = item.campus.trimmingCharacters(in: .whitespacesAndNewlines)
         if !campus.isEmpty { saveLocation(campus) }
+        let room = item.room.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !room.isEmpty { saveRoom(room) }
         if let index = gear.firstIndex(where: { $0.id == item.id }) {
             gear[index] = item
         } else {
@@ -2539,6 +2552,14 @@ final class ProdConnectStore: ObservableObject {
     }
     func savePatch(_ item: PatchRow, completion: ((Result<Void, Error>) -> Void)? = nil) {
         do {
+            var item = item
+            let trimmedCategory = item.category.trimmingCharacters(in: .whitespacesAndNewlines)
+            if item.position == 0, !patchsheet.contains(where: { $0.id == item.id }) {
+                let positions = patchsheet
+                    .filter { $0.category.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(trimmedCategory) == .orderedSame }
+                    .map(\.position)
+                item.position = (positions.max() ?? -1) + 1
+            }
             let data = try encodedDictionary(for: item)
             db.collection("patchsheet").document(item.id).setData(data, merge: true) { error in
                 Task { @MainActor in
@@ -2554,11 +2575,37 @@ final class ProdConnectStore: ObservableObject {
                     } else {
                         self.patchsheet.append(item)
                     }
+                    self.patchsheet.sort(by: PatchRow.autoSort)
                     completion?(.success(()))
                 }
             }
         } catch {
             completion?(.failure(error))
+        }
+    }
+    func reorderPatchsheet(category: String, orderedIDs: [String], completion: ((Result<Void, Error>) -> Void)? = nil) {
+        let normalizedCategory = category.trimmingCharacters(in: .whitespacesAndNewlines)
+        let batch = db.batch()
+        for (index, id) in orderedIDs.enumerated() {
+            batch.updateData(["position": index], forDocument: db.collection("patchsheet").document(id))
+        }
+        batch.commit { error in
+            Task { @MainActor in
+                if let error {
+                    completion?(.failure(error))
+                    return
+                }
+                for (index, id) in orderedIDs.enumerated() {
+                    if let patchIndex = self.patchsheet.firstIndex(where: {
+                        $0.id == id &&
+                        $0.category.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(normalizedCategory) == .orderedSame
+                    }) {
+                        self.patchsheet[patchIndex].position = index
+                    }
+                }
+                self.patchsheet.sort(by: PatchRow.autoSort)
+                completion?(.success(()))
+            }
         }
     }
     func saveLesson(_ item: TrainingLesson) {
@@ -3296,49 +3343,94 @@ final class ProdConnectStore: ObservableObject {
     }
 
     func deleteAllGear(completion: ((Result<Void, Error>) -> Void)? = nil) {
-        let itemsToDelete = gear
-        guard !itemsToDelete.isEmpty else {
-            completion?(.success(()))
+        guard let code = teamCode?.trimmingCharacters(in: .whitespacesAndNewlines), !code.isEmpty else {
+            completion?(.failure(NSError(
+                domain: "ProdConnect",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No team code is available."]
+            )))
             return
         }
 
-        let ids = itemsToDelete.map(\.id)
-        let imageURLs = itemsToDelete.map(\.imageURL)
-
         gearListener?.remove()
         gearListener = nil
-        gear = []
 
-        DispatchQueue.global(qos: .utility).async {
-            for url in imageURLs {
-                self.deleteStorageObject(forDownloadURL: url)
-            }
-        }
+        db.collection("gear")
+            .whereField("teamCode", isEqualTo: code)
+            .getDocuments { snapshot, error in
+                if let error {
+                    DispatchQueue.main.async {
+                        self.attachGearListenerIfNeeded(for: code)
+                        completion?(.failure(error))
+                    }
+                    return
+                }
 
-        deleteGearDocuments(ids: ids) { result in
-            DispatchQueue.main.async {
-                if self.gearListener == nil, let code = self.teamCode, !code.isEmpty {
-                    self.gearListener = self.queryForUsersTeamCode(collection: "gear", code: code)
-                        .addSnapshotListener { snapshot, _ in
-                            guard let docs = snapshot?.documents else { return }
-                            let values: [GearItem] = docs.compactMap { doc in
-                                var data = doc.data()
-                                data["id"] = doc.documentID
-                                return Self.decodeDocument(data, as: GearItem.self)
-                            }
-                            DispatchQueue.main.async {
-                                self.gear = values
+                let docs = snapshot?.documents ?? []
+                let ids = docs.map(\.documentID)
+                let imageURLs = docs.compactMap { doc in
+                    (doc.data()["imageURL"] as? String)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                .filter { !$0.isEmpty }
+
+                guard !ids.isEmpty else {
+                    DispatchQueue.main.async {
+                        self.gear = []
+                        self.persistTeamCollectionCache([GearItem](), collection: "gear", teamCode: code)
+                        self.attachGearListenerIfNeeded(for: code)
+                        completion?(.success(()))
+                    }
+                    return
+                }
+
+                DispatchQueue.global(qos: .utility).async {
+                    for url in imageURLs {
+                        self.deleteStorageObject(forDownloadURL: url)
+                    }
+                }
+
+                Task { @MainActor in
+                    self.deleteGearDocuments(ids: ids) { result in
+                        DispatchQueue.main.async {
+                            self.gear = []
+                            self.persistTeamCollectionCache([GearItem](), collection: "gear", teamCode: code)
+                            self.attachGearListenerIfNeeded(for: code)
+                            switch result {
+                            case .success:
+                                completion?(.success(()))
+                            case .failure(let error):
+                                completion?(.failure(error))
                             }
                         }
-                }
-                switch result {
-                case .success:
-                    completion?(.success(()))
-                case .failure(let error):
-                    completion?(.failure(error))
+                    }
                 }
             }
-        }
+    }
+
+    private func attachGearListenerIfNeeded(for teamCode: String) {
+        guard gearListener == nil else { return }
+        gearListener = queryForUsersTeamCode(collection: "gear", code: teamCode)
+            .addSnapshotListener { snapshot, _ in
+                guard let docs = snapshot?.documents else { return }
+                let values: [GearItem] = docs.compactMap { doc in
+                    var data = doc.data()
+                    data["id"] = doc.documentID
+                    return Self.decodeDocument(data, as: GearItem.self)
+                }
+                DispatchQueue.main.async {
+                    if self.shouldIgnoreEmptyCacheSnapshot(
+                        values: values,
+                        currentValues: self.gear,
+                        isFromCache: snapshot?.metadata.isFromCache == true
+                    ) {
+                        return
+                    }
+                    self.gear = values
+                    print("Gear listener loaded \(values.count) assets for team \(teamCode).")
+                    self.persistTeamCollectionCache(values, collection: "gear", teamCode: teamCode)
+                }
+            }
     }
 
     func deletePatchesByCategory(_ category: String, completion: ((Result<Void, Error>) -> Void)? = nil) {
@@ -3370,18 +3462,37 @@ final class ProdConnectStore: ObservableObject {
     }
 
     func replaceAllGear(_ items: [GearItem], completion: ((Result<Void, Error>) -> Void)? = nil) {
-        gear = items
+        guard let activeTeamCode = teamCode?.trimmingCharacters(in: .whitespacesAndNewlines), !activeTeamCode.isEmpty else {
+            completion?(.failure(NSError(
+                domain: "ProdConnect",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No team code is available."]
+            )))
+            return
+        }
 
-        let locationsToSave = Set(items.flatMap { item in
+        let normalizedItems = items.map { item -> GearItem in
+            var normalized = item
+            normalized.teamCode = activeTeamCode
+            return normalized
+        }
+
+        gear = normalizedItems
+
+        let locationsToSave = Set(normalizedItems.flatMap { item in
             [item.location, item.campus]
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
         })
         locationsToSave.forEach(saveLocation)
+        let roomsToSave = Set(normalizedItems.map(\.room)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty })
+        roomsToSave.forEach(saveRoom)
 
         let chunkSize = 250
-        let chunks = stride(from: 0, to: items.count, by: chunkSize).map {
-            Array(items[$0..<min($0 + chunkSize, items.count)])
+        let chunks = stride(from: 0, to: normalizedItems.count, by: chunkSize).map {
+            Array(normalizedItems[$0..<min($0 + chunkSize, normalizedItems.count)])
         }
         var firstError: Error?
 
@@ -3431,23 +3542,42 @@ final class ProdConnectStore: ObservableObject {
             return
         }
 
-        let locationsToSave = Set(items.flatMap { item in
+        guard let activeTeamCode = teamCode?.trimmingCharacters(in: .whitespacesAndNewlines), !activeTeamCode.isEmpty else {
+            completion?(.failure(NSError(
+                domain: "ProdConnect",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No team code is available."]
+            )))
+            return
+        }
+
+        let normalizedItems = items.map { item -> GearItem in
+            var normalized = item
+            normalized.teamCode = activeTeamCode
+            return normalized
+        }
+
+        let locationsToSave = Set(normalizedItems.flatMap { item in
             [item.location, item.campus]
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
         })
         locationsToSave.forEach(saveLocation)
+        let roomsToSave = Set(normalizedItems.map(\.room)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty })
+        roomsToSave.forEach(saveRoom)
 
         let chunkSize = 250
-        let chunks = stride(from: 0, to: items.count, by: chunkSize).map {
-            Array(items[$0..<min($0 + chunkSize, items.count)])
+        let chunks = stride(from: 0, to: normalizedItems.count, by: chunkSize).map {
+            Array(normalizedItems[$0..<min($0 + chunkSize, normalizedItems.count)])
         }
         var firstError: Error?
 
         func commitChunk(index: Int) {
             guard index < chunks.count else {
-                let merged = Dictionary(uniqueKeysWithValues: gear.map { ($0.id, $0) })
-                    .merging(Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })) { _, new in new }
+                let merged = Dictionary(gear.map { ($0.id, $0) }, uniquingKeysWith: { _, new in new })
+                    .merging(Dictionary(normalizedItems.map { ($0.id, $0) }, uniquingKeysWith: { _, new in new })) { _, new in new }
                 gear = Array(merged.values)
                     .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
                 completion?(firstError.map(Result.failure) ?? .success(()))
@@ -3523,16 +3653,22 @@ final class ProdConnectStore: ObservableObject {
     }
 
     func replaceAllPatch(_ rows: [PatchRow], completion: ((Result<Void, Error>) -> Void)? = nil) {
-        patchsheet = rows
+        let normalizedRows = rows.enumerated().map { index, row -> PatchRow in
+            var updated = row
+            updated.position = index
+            updated.notes = updated.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+            return updated
+        }
+        patchsheet = normalizedRows
 
-        let locationsToSave = Set(rows.map(\.campus)
+        let locationsToSave = Set(normalizedRows.map(\.campus)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty })
         locationsToSave.forEach(saveLocation)
 
         let chunkSize = 250
-        let chunks = stride(from: 0, to: rows.count, by: chunkSize).map {
-            Array(rows[$0..<min($0 + chunkSize, rows.count)])
+        let chunks = stride(from: 0, to: normalizedRows.count, by: chunkSize).map {
+            Array(normalizedRows[$0..<min($0 + chunkSize, normalizedRows.count)])
         }
         var firstError: Error?
 

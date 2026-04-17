@@ -1,6 +1,11 @@
 import Foundation
 
 class FreshserviceAPI {
+    private static let maxRateLimitRetries = 2
+    private static var didLogAssetDetailSample = false
+    private static var didLogAssetDetailAttempt = false
+    private static let objectRequestTimeout: TimeInterval = 15
+
     private static func normalizedBaseURL(from apiUrl: String) -> URL? {
         let trimmed = apiUrl.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -111,11 +116,34 @@ class FreshserviceAPI {
         return fallback
     }
 
+    private static func retryDelay(for response: HTTPURLResponse, attempt: Int) -> TimeInterval {
+        if let retryAfter = response.value(forHTTPHeaderField: "Retry-After")?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let seconds = TimeInterval(retryAfter),
+           seconds > 0 {
+            return min(seconds, 30)
+        }
+
+        let backoff = pow(2.0, Double(attempt))
+        return min(backoff, 30)
+    }
+
+    private static func rateLimitError(for response: HTTPURLResponse) -> Error {
+        let delay = Int(ceil(retryDelay(for: response, attempt: maxRateLimitRetries)))
+        return NSError(
+            domain: "Freshservice",
+            code: response.statusCode,
+            userInfo: [
+                NSLocalizedDescriptionKey: "Freshservice rate-limited the request. Wait \(delay) seconds and try again."
+            ]
+        )
+    }
+
     private static func performListRequest(
         apiKey: String,
         apiUrl: String,
         endpoint: String,
         queryItems: [URLQueryItem] = [],
+        attempt: Int = 0,
         completion: @escaping (Result<[[String: Any]], Error>) -> Void
     ) {
         guard let baseURL = normalizedBaseURL(from: apiUrl) else {
@@ -141,6 +169,7 @@ class FreshserviceAPI {
         }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
+        request.timeoutInterval = objectRequestTimeout
         let credentialData = "\(apiKey):X".data(using: .utf8)!
         let base64Credentials = credentialData.base64EncodedString()
         request.setValue("Basic \(base64Credentials)", forHTTPHeaderField: "Authorization")
@@ -168,6 +197,26 @@ class FreshserviceAPI {
             }
 
             guard (200...299).contains(httpResponse.statusCode) else {
+                if httpResponse.statusCode == 429, attempt < maxRateLimitRetries {
+                    let delay = retryDelay(for: httpResponse, attempt: attempt)
+                    DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                        performListRequest(
+                            apiKey: apiKey,
+                            apiUrl: apiUrl,
+                            endpoint: endpoint,
+                            queryItems: queryItems,
+                            attempt: attempt + 1,
+                            completion: completion
+                        )
+                    }
+                    return
+                }
+
+                if httpResponse.statusCode == 429 {
+                    completion(.failure(rateLimitError(for: httpResponse)))
+                    return
+                }
+
                 completion(.failure(NSError(
                     domain: "Freshservice",
                     code: httpResponse.statusCode,
@@ -215,6 +264,7 @@ class FreshserviceAPI {
         apiUrl: String,
         endpoint: String,
         queryItems: [URLQueryItem] = [],
+        attempt: Int = 0,
         completion: @escaping (Result<[String: Any], Error>) -> Void
     ) {
         guard let baseURL = normalizedBaseURL(from: apiUrl) else {
@@ -269,6 +319,26 @@ class FreshserviceAPI {
                 return
             }
             guard (200...299).contains(httpResponse.statusCode) else {
+                if httpResponse.statusCode == 429, attempt < maxRateLimitRetries {
+                    let delay = retryDelay(for: httpResponse, attempt: attempt)
+                    DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                        performObjectRequest(
+                            apiKey: apiKey,
+                            apiUrl: apiUrl,
+                            endpoint: endpoint,
+                            queryItems: queryItems,
+                            attempt: attempt + 1,
+                            completion: completion
+                        )
+                    }
+                    return
+                }
+
+                if httpResponse.statusCode == 429 {
+                    completion(.failure(rateLimitError(for: httpResponse)))
+                    return
+                }
+
                 completion(.failure(NSError(
                     domain: "Freshservice",
                     code: httpResponse.statusCode,
@@ -302,11 +372,150 @@ class FreshserviceAPI {
         performListRequest(apiKey: apiKey, apiUrl: apiUrl, endpoint: "api/v2/assets", completion: completion)
     }
 
+    /// Fetches all Freshservice locations (paginated) and returns a dictionary mapping ID strings to location names.
+    static func fetchLocationsWithAPIKey(
+        apiKey: String,
+        apiUrl: String,
+        completion: @escaping (Result<[String: String], Error>) -> Void
+    ) {
+        func fetchPage(_ page: Int, collected: [String: String]) {
+            let queryItems = [
+                URLQueryItem(name: "page", value: String(page)),
+                URLQueryItem(name: "per_page", value: "100")
+            ]
+            performListRequest(apiKey: apiKey, apiUrl: apiUrl, endpoint: "api/v2/locations", queryItems: queryItems) { result in
+                switch result {
+                case .success(let items):
+                    var map = collected
+                    for item in items {
+                        guard let name = item["name"] as? String, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                        if let idInt = item["id"] as? Int {
+                            map[String(idInt)] = name
+                        } else if let idString = item["id"] as? String, !idString.isEmpty {
+                            map[idString] = name
+                        }
+                    }
+                    if items.count >= 100 {
+                        fetchPage(page + 1, collected: map)
+                    } else {
+                        completion(.success(map))
+                    }
+                case .failure:
+                    completion(.success(collected))
+                }
+            }
+        }
+        fetchPage(1, collected: [:])
+    }
+
+    /// Fetches all Freshservice asset types (paginated) and returns a dictionary mapping ID strings to type names.
+    static func fetchAssetTypesWithAPIKey(
+        apiKey: String,
+        apiUrl: String,
+        completion: @escaping (Result<[String: String], Error>) -> Void
+    ) {
+        func fetchPage(_ page: Int, collected: [String: String]) {
+            let queryItems = [
+                URLQueryItem(name: "page", value: String(page)),
+                URLQueryItem(name: "per_page", value: "100")
+            ]
+            performListRequest(apiKey: apiKey, apiUrl: apiUrl, endpoint: "api/v2/asset_types", queryItems: queryItems) { result in
+                switch result {
+                case .success(let items):
+                    var map = collected
+                    for item in items {
+                        guard let name = item["name"] as? String, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                        if let idInt = item["id"] as? Int {
+                            map[String(idInt)] = name
+                        } else if let idString = item["id"] as? String, !idString.isEmpty {
+                            map[idString] = name
+                        }
+                    }
+                    if items.count >= 100 {
+                        fetchPage(page + 1, collected: map)
+                    } else {
+                        completion(.success(map))
+                    }
+                case .failure:
+                    completion(.success(collected))
+                }
+            }
+        }
+        fetchPage(1, collected: [:])
+    }
+
     static func fetchAllAssetsWithAPIKey(
         apiKey: String,
         apiUrl: String,
         perPage: Int = 100,
-        maxPages: Int = 200,
+        maxPages: Int = 300,
+        completion: @escaping (Result<([[String: Any]], Bool), Error>) -> Void
+    ) {
+        func fetchPage(_ page: Int, collected: [[String: Any]]) {
+            let queryItems = [
+                URLQueryItem(name: "page", value: String(page)),
+                URLQueryItem(name: "per_page", value: String(perPage)),
+                URLQueryItem(name: "include", value: "type_fields")
+            ]
+
+            performListRequest(
+                apiKey: apiKey,
+                apiUrl: apiUrl,
+                endpoint: "api/v2/assets",
+                queryItems: queryItems
+            ) { result in
+                switch result {
+                case .success(let items):
+                    let merged = collected + items
+                    let reachedCap = page >= maxPages && items.count >= perPage
+                    let shouldContinue = !items.isEmpty && items.count >= perPage && page < maxPages
+                    if shouldContinue {
+                        fetchPage(page + 1, collected: merged)
+                    } else {
+                        completion(.success((merged, reachedCap)))
+                    }
+                case .failure(let error):
+                    completion(.failure(error))
+                }
+            }
+        }
+
+        fetchPage(1, collected: [])
+    }
+
+    static func fetchAllAssetsForImportWithAPIKey(
+        apiKey: String,
+        apiUrl: String,
+        perPage: Int = 100,
+        maxPages: Int = 300,
+        completion: @escaping (Result<([[String: Any]], Bool), Error>) -> Void
+    ) {
+        fetchAllLegacyAssetsWithAPIKey(
+            apiKey: apiKey,
+            apiUrl: apiUrl,
+            perPage: perPage,
+            maxPages: maxPages
+        ) { legacyResult in
+            switch legacyResult {
+            case .success:
+                completion(legacyResult)
+            case .failure:
+                fetchAllAssetsWithAPIKey(
+                    apiKey: apiKey,
+                    apiUrl: apiUrl,
+                    perPage: perPage,
+                    maxPages: maxPages,
+                    completion: completion
+                )
+            }
+        }
+    }
+
+    private static func fetchAllLegacyAssetsWithAPIKey(
+        apiKey: String,
+        apiUrl: String,
+        perPage: Int,
+        maxPages: Int,
         completion: @escaping (Result<([[String: Any]], Bool), Error>) -> Void
     ) {
         func fetchPage(_ page: Int, collected: [[String: Any]]) {
@@ -318,7 +527,7 @@ class FreshserviceAPI {
             performListRequest(
                 apiKey: apiKey,
                 apiUrl: apiUrl,
-                endpoint: "api/v2/assets",
+                endpoint: "cmdb/items.json",
                 queryItems: queryItems
             ) { result in
                 switch result {
@@ -406,6 +615,100 @@ class FreshserviceAPI {
                     )))
                 }
             case .failure(let error):
+                completion(.failure(error))
+            }
+        }
+    }
+
+    static func fetchAssetDetailsWithAPIKey(
+        apiKey: String,
+        apiUrl: String,
+        assetID: String,
+        completion: @escaping (Result<[String: Any], Error>) -> Void
+    ) {
+        if !didLogAssetDetailAttempt {
+            didLogAssetDetailAttempt = true
+            print("Freshservice asset detail request starting for asset id:", assetID)
+        }
+        performObjectRequest(
+            apiKey: apiKey,
+            apiUrl: apiUrl,
+            endpoint: "api/v2/assets/\(assetID)"
+        ) { result in
+            switch result {
+            case .success(let json):
+                let objectKeys = ["asset", "config_item", "ci", "item", "data"]
+                for key in objectKeys {
+                    if let object = json[key] as? [String: Any] {
+                        if !didLogAssetDetailSample {
+                            didLogAssetDetailSample = true
+                            let sortedKeys = object.keys.sorted()
+                            print("Freshservice asset detail sample keys:", sortedKeys.joined(separator: ", "))
+
+                            let interestingFields = [
+                                "id",
+                                "display_id",
+                                "name",
+                                "display_name",
+                                "asset_tag",
+                                "serial_number",
+                                "status",
+                                "status_name",
+                                "state",
+                                "state_name",
+                                "asset_state",
+                                "asset_state_name",
+                                "ci_status",
+                                "ci_status_name",
+                                "lifecycle_state",
+                                "lifecycle_state_name",
+                                "asset_type",
+                                "asset_type_name",
+                                "asset_type_id",
+                                "ci_type",
+                                "ci_type_name",
+                                "config_item_type",
+                                "config_item_type_name",
+                                "department",
+                                "department_name",
+                                "department_id",
+                                "location",
+                                "location_name",
+                                "location_id",
+                                "site",
+                                "site_name",
+                                "workspace",
+                                "workspace_name",
+                                "usage_type",
+                                "custom_fields"
+                            ]
+
+                            for field in interestingFields where object[field] != nil {
+                                print("Freshservice asset detail sample \(field):", String(describing: object[field]!))
+                            }
+                        }
+                        completion(.success(object))
+                        return
+                    }
+                }
+
+                if json["id"] != nil || json["display_id"] != nil || json["name"] != nil {
+                    if !didLogAssetDetailSample {
+                        didLogAssetDetailSample = true
+                        let sortedKeys = json.keys.sorted()
+                        print("Freshservice asset detail sample keys:", sortedKeys.joined(separator: ", "))
+                    }
+                    completion(.success(json))
+                } else {
+                    print("Freshservice asset detail response missing asset object for id:", assetID)
+                    completion(.failure(NSError(
+                        domain: "Freshservice",
+                        code: 0,
+                        userInfo: [NSLocalizedDescriptionKey: "Freshservice asset detail response was missing the asset object."]
+                    )))
+                }
+            case .failure(let error):
+                print("Freshservice asset detail request failed for id \(assetID):", error.localizedDescription)
                 completion(.failure(error))
             }
         }

@@ -102,6 +102,9 @@ extension PatchRow {
     }
 
     nonisolated static func autoSort(_ lhs: PatchRow, _ rhs: PatchRow) -> Bool {
+        if lhs.position != rhs.position {
+            return lhs.position < rhs.position
+        }
         if lhs.sortUniverseNumber != rhs.sortUniverseNumber {
             return lhs.sortUniverseNumber < rhs.sortUniverseNumber
         }
@@ -407,12 +410,142 @@ struct RunOfShowItem: Identifiable, Codable, Equatable {
     }
 }
 
+enum RunOfShowStagePlotRole: String, CaseIterable, Codable, Identifiable {
+    case instrument = "Instrument"
+    case vocal = "Vocal"
+    case drumSet = "Drum Set"
+    case guitar = "Guitar"
+    case bassGuitar = "Bass Guitar"
+    case microphoneStand = "Microphone Stand"
+    case keyboard = "Keyboard"
+    case speaker = "Speaker"
+
+    var id: String { rawValue }
+}
+
+extension RunOfShowStagePlotRole {
+    var defaultTitle: String { rawValue }
+
+    var systemImageName: String? {
+        switch self {
+        case .instrument, .vocal:
+            return nil
+        case .drumSet:
+            return "drumsticks.fill"
+        case .guitar:
+            return "guitars.fill"
+        case .bassGuitar:
+            return "guitars"
+        case .microphoneStand:
+            return "music.mic"
+        case .keyboard:
+            return "pianokeys"
+        case .speaker:
+            return "hifispeaker.2.fill"
+        }
+    }
+
+    var usesSymbolArtwork: Bool {
+        systemImageName != nil
+    }
+
+    var defaultPosition: CGPoint {
+        switch self {
+        case .instrument:
+            return CGPoint(x: 0.35, y: 0.55)
+        case .vocal:
+            return CGPoint(x: 0.65, y: 0.55)
+        case .drumSet:
+            return CGPoint(x: 0.5, y: 0.34)
+        case .guitar:
+            return CGPoint(x: 0.28, y: 0.58)
+        case .bassGuitar:
+            return CGPoint(x: 0.72, y: 0.58)
+        case .microphoneStand:
+            return CGPoint(x: 0.5, y: 0.68)
+        case .keyboard:
+            return CGPoint(x: 0.5, y: 0.48)
+        case .speaker:
+            return CGPoint(x: 0.12, y: 0.42)
+        }
+    }
+}
+
+enum RunOfShowStageType: String, CaseIterable, Codable, Identifiable {
+    case rectangle = "Rectangle"
+    case archedFront = "Rectangle + Arch"
+    case round = "Round"
+
+    var id: String { rawValue }
+}
+
+struct RunOfShowStagePlotItem: Identifiable, Codable, Equatable {
+    var id: String = UUID().uuidString
+    var role: RunOfShowStagePlotRole
+    var title: String
+    var subtitle: String
+    var x: Double
+    var y: Double
+    var rotationDegrees: Double
+    var sizeScale: Double
+    var position: Int = 0
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case role
+        case title
+        case subtitle
+        case x
+        case y
+        case rotationDegrees
+        case sizeScale
+        case position
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        role: RunOfShowStagePlotRole = .instrument,
+        title: String = "",
+        subtitle: String = "",
+        x: Double = 0.5,
+        y: Double = 0.5,
+        rotationDegrees: Double = 0,
+        sizeScale: Double = 1,
+        position: Int = 0
+    ) {
+        self.id = id
+        self.role = role
+        self.title = title
+        self.subtitle = subtitle
+        self.x = min(max(x, 0), 1)
+        self.y = min(max(y, 0), 1)
+        self.rotationDegrees = rotationDegrees
+        self.sizeScale = min(max(sizeScale, 0.6), 1.8)
+        self.position = position
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        role = try container.decodeIfPresent(RunOfShowStagePlotRole.self, forKey: .role) ?? .instrument
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
+        subtitle = try container.decodeIfPresent(String.self, forKey: .subtitle) ?? ""
+        x = min(max(try container.decodeIfPresent(Double.self, forKey: .x) ?? 0.5, 0), 1)
+        y = min(max(try container.decodeIfPresent(Double.self, forKey: .y) ?? 0.5, 0), 1)
+        rotationDegrees = try container.decodeIfPresent(Double.self, forKey: .rotationDegrees) ?? 0
+        sizeScale = min(max(try container.decodeIfPresent(Double.self, forKey: .sizeScale) ?? 1, 0.6), 1.8)
+        position = try container.decodeIfPresent(Int.self, forKey: .position) ?? 0
+    }
+}
+
 struct RunOfShowDocument: Identifiable, Codable, Equatable {
     var id: String = UUID().uuidString
     var title: String
     var teamCode: String
     var scheduledStart: Date
     var items: [RunOfShowItem]
+    var stageType: RunOfShowStageType
+    var stagePlotItems: [RunOfShowStagePlotItem]
     var autoStartLive: Bool = false
     var isLiveActive: Bool = false
     var liveCurrentItemID: String?
@@ -426,6 +559,8 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
         case teamCode
         case scheduledStart
         case items
+        case stageType
+        case stagePlotItems
         case autoStartLive
         case isLiveActive
         case liveCurrentItemID
@@ -440,6 +575,8 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
         teamCode: String,
         scheduledStart: Date = Date(),
         items: [RunOfShowItem] = [],
+        stageType: RunOfShowStageType = .rectangle,
+        stagePlotItems: [RunOfShowStagePlotItem] = [],
         autoStartLive: Bool = false,
         isLiveActive: Bool = false,
         liveCurrentItemID: String? = nil,
@@ -452,6 +589,8 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
         self.teamCode = teamCode
         self.scheduledStart = scheduledStart
         self.items = items
+        self.stageType = stageType
+        self.stagePlotItems = stagePlotItems
         self.autoStartLive = autoStartLive
         self.isLiveActive = isLiveActive
         self.liveCurrentItemID = liveCurrentItemID
@@ -470,6 +609,11 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
             if $0.position != $1.position { return $0.position < $1.position }
             return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
         }
+        stageType = try container.decodeIfPresent(RunOfShowStageType.self, forKey: .stageType) ?? .rectangle
+        stagePlotItems = (try container.decodeIfPresent([RunOfShowStagePlotItem].self, forKey: .stagePlotItems) ?? []).sorted {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+        }
         autoStartLive = try container.decodeIfPresent(Bool.self, forKey: .autoStartLive) ?? false
         isLiveActive = try container.decodeIfPresent(Bool.self, forKey: .isLiveActive) ?? false
         liveCurrentItemID = try container.decodeIfPresent(String.self, forKey: .liveCurrentItemID)
@@ -479,9 +623,90 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
     }
 }
 
+private func csvEscapedValue(_ value: String) -> String {
+    "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
+}
+
+private func exportStagePlotItemTitle(_ item: RunOfShowStagePlotItem) -> String {
+    let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+    return title.isEmpty ? item.role.defaultTitle : title
+}
+
+func runOfShowCSV(for show: RunOfShowDocument) -> String {
+    let isoFormatter = ISO8601DateFormatter()
+    let header = [
+        "Show Title",
+        "Scheduled Start",
+        "Position",
+        "Item Start",
+        "Duration",
+        "Title",
+        "Person",
+        "Notes"
+    ].map(csvEscapedValue).joined(separator: ",")
+
+    var currentStart = show.scheduledStart
+    let rows = show.sortedItems.enumerated().map { index, item in
+        defer {
+            currentStart = currentStart.addingTimeInterval(TimeInterval(item.durationSeconds))
+        }
+        return [
+            show.title,
+            isoFormatter.string(from: show.scheduledStart),
+            String(index + 1),
+            isoFormatter.string(from: currentStart),
+            item.formattedDuration,
+            item.title.trimmingCharacters(in: .whitespacesAndNewlines),
+            item.person.trimmingCharacters(in: .whitespacesAndNewlines),
+            item.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        ].map(csvEscapedValue).joined(separator: ",")
+    }
+
+    return "\u{FEFF}" + ([header] + rows).joined(separator: "\n")
+}
+
+func stagePlotCSV(for show: RunOfShowDocument) -> String {
+    let header = [
+        "Show Title",
+        "Stage Type",
+        "Position",
+        "Role",
+        "Title",
+        "Subtitle",
+        "X",
+        "Y",
+        "Rotation Degrees",
+        "Size Percent"
+    ].map(csvEscapedValue).joined(separator: ",")
+
+    let rows = show.sortedStagePlotItems.enumerated().map { index, item in
+        [
+            show.title,
+            show.stageType.rawValue,
+            String(index + 1),
+            item.role.rawValue,
+            exportStagePlotItemTitle(item),
+            item.subtitle.trimmingCharacters(in: .whitespacesAndNewlines),
+            String(format: "%.4f", item.x),
+            String(format: "%.4f", item.y),
+            String(format: "%.1f", item.rotationDegrees),
+            String(Int((item.sizeScale * 100).rounded()))
+        ].map(csvEscapedValue).joined(separator: ",")
+    }
+
+    return "\u{FEFF}" + ([header] + rows).joined(separator: "\n")
+}
+
 extension RunOfShowDocument {
     var sortedItems: [RunOfShowItem] {
         items.sorted {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+        }
+    }
+
+    var sortedStagePlotItems: [RunOfShowStagePlotItem] {
+        stagePlotItems.sorted {
             if $0.position != $1.position { return $0.position < $1.position }
             return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
         }

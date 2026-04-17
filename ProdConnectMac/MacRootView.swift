@@ -15,6 +15,11 @@ import UniformTypeIdentifiers
 import WebKit
 
 private enum MacFreshserviceAPI {
+    private static let maxRateLimitRetries = 2
+    private static var didLogAssetDetailSample = false
+    private static var didLogAssetDetailAttempt = false
+    private static let objectRequestTimeout: TimeInterval = 15
+
     private static func normalizedBaseURL(from apiUrl: String) -> URL? {
         let trimmed = apiUrl.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -68,11 +73,34 @@ private enum MacFreshserviceAPI {
         return fallback
     }
 
+    private static func retryDelay(for response: HTTPURLResponse, attempt: Int) -> TimeInterval {
+        if let retryAfter = response.value(forHTTPHeaderField: "Retry-After")?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let seconds = TimeInterval(retryAfter),
+           seconds > 0 {
+            return min(seconds, 30)
+        }
+
+        let backoff = pow(2.0, Double(attempt))
+        return min(backoff, 30)
+    }
+
+    private static func rateLimitError(for response: HTTPURLResponse) -> Error {
+        let delay = Int(ceil(retryDelay(for: response, attempt: maxRateLimitRetries)))
+        return NSError(
+            domain: "Freshservice",
+            code: response.statusCode,
+            userInfo: [
+                NSLocalizedDescriptionKey: "Freshservice rate-limited the request. Wait \(delay) seconds and try again."
+            ]
+        )
+    }
+
     private static func performListRequest(
         apiKey: String,
         apiUrl: String,
         endpoint: String,
         queryItems: [URLQueryItem] = [],
+        attempt: Int = 0,
         completion: @escaping (Result<[[String: Any]], Error>) -> Void
     ) {
         guard let baseURL = normalizedBaseURL(from: apiUrl) else {
@@ -98,6 +126,7 @@ private enum MacFreshserviceAPI {
         }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
+        request.timeoutInterval = objectRequestTimeout
         let credentialData = "\(apiKey):X".data(using: .utf8) ?? Data()
         request.setValue("Basic \(credentialData.base64EncodedString())", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -116,6 +145,26 @@ private enum MacFreshserviceAPI {
                 return
             }
             guard (200...299).contains(httpResponse.statusCode) else {
+                if httpResponse.statusCode == 429, attempt < maxRateLimitRetries {
+                    let delay = retryDelay(for: httpResponse, attempt: attempt)
+                    DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                        performListRequest(
+                            apiKey: apiKey,
+                            apiUrl: apiUrl,
+                            endpoint: endpoint,
+                            queryItems: queryItems,
+                            attempt: attempt + 1,
+                            completion: completion
+                        )
+                    }
+                    return
+                }
+
+                if httpResponse.statusCode == 429 {
+                    completion(.failure(rateLimitError(for: httpResponse)))
+                    return
+                }
+
                 completion(.failure(NSError(
                     domain: "Freshservice",
                     code: httpResponse.statusCode,
@@ -151,11 +200,241 @@ private enum MacFreshserviceAPI {
         }.resume()
     }
 
+    private static func performObjectRequest(
+        apiKey: String,
+        apiUrl: String,
+        endpoint: String,
+        queryItems: [URLQueryItem] = [],
+        attempt: Int = 0,
+        completion: @escaping (Result<[String: Any], Error>) -> Void
+    ) {
+        guard let baseURL = normalizedBaseURL(from: apiUrl) else {
+            completion(.failure(NSError(
+                domain: "Freshservice",
+                code: 0,
+                userInfo: [NSLocalizedDescriptionKey: "Invalid Freshservice URL. Enter only the base URL, like https://yourcompany.freshservice.com."]
+            )))
+            return
+        }
+
+        let normalizedEndpoint = endpoint.hasPrefix("/") ? String(endpoint.dropFirst()) : endpoint
+        let urlString = baseURL.absoluteString.hasSuffix("/") ? "\(baseURL.absoluteString)\(normalizedEndpoint)" : "\(baseURL.absoluteString)/\(normalizedEndpoint)"
+        guard var components = URLComponents(string: urlString) else {
+            completion(.failure(NSError(domain: "Freshservice", code: 0, userInfo: [NSLocalizedDescriptionKey: "Invalid Freshservice URL."])))
+            return
+        }
+        if !queryItems.isEmpty {
+            components.queryItems = queryItems
+        }
+        guard let url = components.url else {
+            completion(.failure(NSError(domain: "Freshservice", code: 0, userInfo: [NSLocalizedDescriptionKey: "Invalid Freshservice URL."])))
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        let credentialData = "\(apiKey):X".data(using: .utf8) ?? Data()
+        request.setValue("Basic \(credentialData.base64EncodedString())", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+            guard let httpResponse = response as? HTTPURLResponse, let data else {
+                completion(.failure(NSError(
+                    domain: "Freshservice",
+                    code: 0,
+                    userInfo: [NSLocalizedDescriptionKey: "Freshservice returned an invalid response."]
+                )))
+                return
+            }
+            guard (200...299).contains(httpResponse.statusCode) else {
+                if httpResponse.statusCode == 429, attempt < maxRateLimitRetries {
+                    let delay = retryDelay(for: httpResponse, attempt: attempt)
+                    DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                        performObjectRequest(
+                            apiKey: apiKey,
+                            apiUrl: apiUrl,
+                            endpoint: endpoint,
+                            queryItems: queryItems,
+                            attempt: attempt + 1,
+                            completion: completion
+                        )
+                    }
+                    return
+                }
+
+                if httpResponse.statusCode == 429 {
+                    completion(.failure(rateLimitError(for: httpResponse)))
+                    return
+                }
+
+                completion(.failure(NSError(
+                    domain: "Freshservice",
+                    code: httpResponse.statusCode,
+                    userInfo: [NSLocalizedDescriptionKey: extractErrorMessage(from: data, response: httpResponse)]
+                )))
+                return
+            }
+
+            do {
+                let jsonObject = try JSONSerialization.jsonObject(with: data)
+                if let json = jsonObject as? [String: Any] {
+                    completion(.success(json))
+                } else {
+                    completion(.failure(NSError(
+                        domain: "Freshservice",
+                        code: httpResponse.statusCode,
+                        userInfo: [NSLocalizedDescriptionKey: "Freshservice returned a response in an unsupported format."]
+                    )))
+                }
+            } catch {
+                completion(.failure(NSError(
+                    domain: "Freshservice",
+                    code: httpResponse.statusCode,
+                    userInfo: [NSLocalizedDescriptionKey: "Freshservice returned non-JSON data."]
+                )))
+            }
+        }.resume()
+    }
+
     static func fetchAllAssetsWithAPIKey(
         apiKey: String,
         apiUrl: String,
         perPage: Int = 100,
-        maxPages: Int = 200,
+        maxPages: Int = 300,
+        completion: @escaping (Result<([[String: Any]], Bool), Error>) -> Void
+    ) {
+        func fetchPage(_ page: Int, collected: [[String: Any]]) {
+            let queryItems = [
+                URLQueryItem(name: "page", value: String(page)),
+                URLQueryItem(name: "per_page", value: String(perPage)),
+                URLQueryItem(name: "include", value: "type_fields")
+            ]
+            performListRequest(apiKey: apiKey, apiUrl: apiUrl, endpoint: "api/v2/assets", queryItems: queryItems) { result in
+                switch result {
+                case .success(let items):
+                    let merged = collected + items
+                    let reachedCap = page >= maxPages && items.count >= perPage
+                    let shouldContinue = !items.isEmpty && items.count >= perPage && page < maxPages
+                    if shouldContinue {
+                        fetchPage(page + 1, collected: merged)
+                    } else {
+                        completion(.success((merged, reachedCap)))
+                    }
+                case .failure(let error):
+                    completion(.failure(error))
+                }
+            }
+        }
+        fetchPage(1, collected: [])
+    }
+
+    static func fetchLocationsWithAPIKey(
+        apiKey: String,
+        apiUrl: String,
+        completion: @escaping (Result<[String: String], Error>) -> Void
+    ) {
+        func fetchPage(_ page: Int, collected: [String: String]) {
+            let queryItems = [
+                URLQueryItem(name: "page", value: String(page)),
+                URLQueryItem(name: "per_page", value: "100")
+            ]
+            performListRequest(apiKey: apiKey, apiUrl: apiUrl, endpoint: "api/v2/locations", queryItems: queryItems) { result in
+                switch result {
+                case .success(let items):
+                    var map = collected
+                    for item in items {
+                        guard let name = item["name"] as? String, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                        if let idInt = item["id"] as? Int {
+                            map[String(idInt)] = name
+                        } else if let idString = item["id"] as? String, !idString.isEmpty {
+                            map[idString] = name
+                        }
+                    }
+                    if items.count >= 100 {
+                        fetchPage(page + 1, collected: map)
+                    } else {
+                        completion(.success(map))
+                    }
+                case .failure:
+                    completion(.success(collected))
+                }
+            }
+        }
+        fetchPage(1, collected: [:])
+    }
+
+    static func fetchAssetTypesWithAPIKey(
+        apiKey: String,
+        apiUrl: String,
+        completion: @escaping (Result<[String: String], Error>) -> Void
+    ) {
+        func fetchPage(_ page: Int, collected: [String: String]) {
+            let queryItems = [
+                URLQueryItem(name: "page", value: String(page)),
+                URLQueryItem(name: "per_page", value: "100")
+            ]
+            performListRequest(apiKey: apiKey, apiUrl: apiUrl, endpoint: "api/v2/asset_types", queryItems: queryItems) { result in
+                switch result {
+                case .success(let items):
+                    var map = collected
+                    for item in items {
+                        guard let name = item["name"] as? String, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                        if let idInt = item["id"] as? Int {
+                            map[String(idInt)] = name
+                        } else if let idString = item["id"] as? String, !idString.isEmpty {
+                            map[idString] = name
+                        }
+                    }
+                    if items.count >= 100 {
+                        fetchPage(page + 1, collected: map)
+                    } else {
+                        completion(.success(map))
+                    }
+                case .failure:
+                    completion(.success(collected))
+                }
+            }
+        }
+        fetchPage(1, collected: [:])
+    }
+
+    static func fetchAllAssetsForImportWithAPIKey(
+        apiKey: String,
+        apiUrl: String,
+        perPage: Int = 100,
+        maxPages: Int = 300,
+        completion: @escaping (Result<([[String: Any]], Bool), Error>) -> Void
+    ) {
+        fetchAllLegacyAssetsWithAPIKey(
+            apiKey: apiKey,
+            apiUrl: apiUrl,
+            perPage: perPage,
+            maxPages: maxPages
+        ) { legacyResult in
+            switch legacyResult {
+            case .success:
+                completion(legacyResult)
+            case .failure:
+                fetchAllAssetsWithAPIKey(
+                    apiKey: apiKey,
+                    apiUrl: apiUrl,
+                    perPage: perPage,
+                    maxPages: maxPages,
+                    completion: completion
+                )
+            }
+        }
+    }
+
+    private static func fetchAllLegacyAssetsWithAPIKey(
+        apiKey: String,
+        apiUrl: String,
+        perPage: Int,
+        maxPages: Int,
         completion: @escaping (Result<([[String: Any]], Bool), Error>) -> Void
     ) {
         func fetchPage(_ page: Int, collected: [[String: Any]]) {
@@ -163,7 +442,7 @@ private enum MacFreshserviceAPI {
                 URLQueryItem(name: "page", value: String(page)),
                 URLQueryItem(name: "per_page", value: String(perPage))
             ]
-            performListRequest(apiKey: apiKey, apiUrl: apiUrl, endpoint: "api/v2/assets", queryItems: queryItems) { result in
+            performListRequest(apiKey: apiKey, apiUrl: apiUrl, endpoint: "cmdb/items.json", queryItems: queryItems) { result in
                 switch result {
                 case .success(let items):
                     let merged = collected + items
@@ -212,6 +491,58 @@ private enum MacFreshserviceAPI {
         }
         fetchPage(1, collected: [])
     }
+
+    static func fetchAssetDetailsWithAPIKey(
+        apiKey: String,
+        apiUrl: String,
+        assetID: String,
+        completion: @escaping (Result<[String: Any], Error>) -> Void
+    ) {
+        if !didLogAssetDetailAttempt {
+            didLogAssetDetailAttempt = true
+            print("Freshservice asset detail request starting for asset id:", assetID)
+        }
+        performObjectRequest(
+            apiKey: apiKey,
+            apiUrl: apiUrl,
+            endpoint: "api/v2/assets/\(assetID)"
+        ) { result in
+            switch result {
+            case .success(let json):
+                let objectKeys = ["asset", "config_item", "ci", "item", "data"]
+                for key in objectKeys {
+                    if let object = json[key] as? [String: Any] {
+                        if !didLogAssetDetailSample {
+                            didLogAssetDetailSample = true
+                            let sortedKeys = object.keys.sorted()
+                            print("Freshservice asset detail sample keys:", sortedKeys.joined(separator: ", "))
+                        }
+                        completion(.success(object))
+                        return
+                    }
+                }
+
+                if json["id"] != nil || json["display_id"] != nil || json["name"] != nil {
+                    if !didLogAssetDetailSample {
+                        didLogAssetDetailSample = true
+                        let sortedKeys = json.keys.sorted()
+                        print("Freshservice asset detail sample keys:", sortedKeys.joined(separator: ", "))
+                    }
+                    completion(.success(json))
+                } else {
+                    print("Freshservice asset detail response missing asset object for id:", assetID)
+                    completion(.failure(NSError(
+                        domain: "Freshservice",
+                        code: 0,
+                        userInfo: [NSLocalizedDescriptionKey: "Freshservice asset detail response was missing the asset object."]
+                    )))
+                }
+            case .failure(let error):
+                print("Freshservice asset detail request failed for id \(assetID):", error.localizedDescription)
+                completion(.failure(error))
+            }
+        }
+    }
 }
 
 private enum MacRoute: String, CaseIterable, Identifiable {
@@ -249,7 +580,7 @@ private enum MacRoute: String, CaseIterable, Identifiable {
         switch self {
         case .chat: return "message"
         case .patchsheet: return "square.grid.3x2"
-        case .runOfShow: return "list.bullet.rectangle.portrait"
+        case .runOfShow: return "music.note.list"
         case .training: return "graduationcap"
         case .gear: return "shippingbox"
         case .tickets: return "ticket"
@@ -451,14 +782,28 @@ struct MacRootView: View {
     }
 
     private var sidebar: some View {
-        List(selection: $selectedRoute) {
+        List {
             ForEach(sidebarRoutes) { route in
-                Label(route.title, systemImage: route.icon)
-                    .tag(route)
+                Button {
+                    selectedRoute = route
+                } label: {
+                    Label(route.title, systemImage: route.icon)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(selectedRoute == route ? Color.accentColor : Color.primary)
+                .listRowBackground(
+                    selectedRoute == route
+                        ? Color.accentColor.opacity(0.15)
+                        : Color.clear
+                )
             }
             .onMove(perform: moveSidebarRoutes)
         }
+        .listStyle(.sidebar)
         .navigationTitle("ProdConnect")
+        .navigationSplitViewColumnWidth(min: 220, ideal: 220, max: 220)
         .scrollContentBackground(.hidden)
         .background(Color.black.opacity(0.2))
     }
@@ -1561,6 +1906,7 @@ private struct MacPatchsheetView: View {
     @State private var selectedPatch: PatchRow?
     @State private var noteDrafts: [String: String] = [:]
     @FocusState private var focusedNotesPatchID: String?
+    @State private var isExporting = false
 
     private let categories = ["Audio", "Video", "Lighting"]
 
@@ -1602,6 +1948,7 @@ private struct MacPatchsheetView: View {
     private var patchsheetOutputColumnWidth: CGFloat { 160 * patchsheetZoom }
     private var patchsheetUniverseColumnWidth: CGFloat { 110 * patchsheetZoom }
     private var patchsheetNotesColumnWidth: CGFloat { 260 * patchsheetZoom }
+    private var patchsheetOrderColumnWidth: CGFloat { store.canEditPatchsheet ? 78 : 0 }
     private var patchsheetNDIColumnWidth: CGFloat { 72 }
     private var patchsheetTableWidth: CGFloat {
         patchsheetNameColumnWidth
@@ -1609,12 +1956,18 @@ private struct MacPatchsheetView: View {
             + patchsheetOutputColumnWidth
             + (showsLightingUniverseColumn ? patchsheetUniverseColumnWidth : 0)
             + patchsheetNotesColumnWidth
+            + patchsheetOrderColumnWidth
             + (hasNDIFeature ? patchsheetNDIColumnWidth : 0)
     }
     private var patchsheetHeaderFont: Font { .system(size: 11 * patchsheetZoom, weight: .semibold) }
     private var patchsheetRowFont: Font { .system(size: 13 * patchsheetZoom) }
     private var patchsheetEmphasisFont: Font { .system(size: 13 * patchsheetZoom, weight: .semibold) }
     private var patchsheetCellVerticalPadding: CGFloat { 10 * patchsheetZoom }
+    private var allFilteredNDIEnabled: Bool { !filtered.isEmpty && filtered.allSatisfy(\.ndiEnabled) }
+    private var patchsheetBulkNDISymbolName: String {
+        if allFilteredNDIEnabled { return "checkmark.square.fill" }
+        return "square"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -1637,6 +1990,12 @@ private struct MacPatchsheetView: View {
                 }
 
                 Spacer(minLength: 0)
+
+                Button(action: exportPatchsheet) {
+                    Label("Export", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(.bordered)
+                .disabled(isExporting || filtered.isEmpty)
 
             }
 
@@ -1722,8 +2081,11 @@ private struct MacPatchsheetView: View {
                 patchsheetHeaderCell("Universe", width: patchsheetUniverseColumnWidth)
             }
             patchsheetHeaderCell("Notes", width: patchsheetNotesColumnWidth)
+            if store.canEditPatchsheet {
+                patchsheetHeaderCell("Order", width: patchsheetOrderColumnWidth, alignment: .center)
+            }
             if hasNDIFeature {
-                patchsheetHeaderCell("NDI", width: patchsheetNDIColumnWidth, alignment: .center)
+                patchsheetNDIHeaderCell
             }
         }
         .background(Color.white.opacity(0.045))
@@ -1737,6 +2099,28 @@ private struct MacPatchsheetView: View {
             .frame(width: width, alignment: alignment)
             .padding(.horizontal, 14)
             .padding(.vertical, 11 * patchsheetZoom)
+    }
+
+    private var patchsheetNDIHeaderCell: some View {
+        HStack(spacing: 6) {
+            Text("NDI")
+                .font(patchsheetHeaderFont)
+                .textCase(.uppercase)
+                .foregroundStyle(.secondary)
+
+            Button {
+                setAllFilteredNDIEnabled(!allFilteredNDIEnabled)
+            } label: {
+                Image(systemName: patchsheetBulkNDISymbolName)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(canManageNDI ? (allFilteredNDIEnabled ? .green : .secondary) : .secondary)
+            }
+            .buttonStyle(.plain)
+            .disabled(!canManageNDI || filtered.isEmpty)
+        }
+        .frame(width: patchsheetNDIColumnWidth, alignment: .center)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 11 * patchsheetZoom)
     }
 
     private func patchsheetRow(for patch: PatchRow) -> some View {
@@ -1756,6 +2140,9 @@ private struct MacPatchsheetView: View {
                 }
             }
             patchsheetNotesCell(for: patch)
+            if store.canEditPatchsheet {
+                patchsheetOrderCell(for: patch)
+            }
             if hasNDIFeature {
                 patchsheetNDICell(for: patch)
             }
@@ -1824,12 +2211,98 @@ private struct MacPatchsheetView: View {
         }
     }
 
+    private func patchsheetOrderCell(for patch: PatchRow) -> some View {
+        let ids = filtered.map(\.id)
+        let currentIndex = ids.firstIndex(of: patch.id)
+        let canMoveUp = currentIndex.map { $0 > 0 } ?? false
+        let canMoveDown = currentIndex.map { $0 < ids.count - 1 } ?? false
+
+        return HStack(spacing: 6) {
+            Button {
+                movePatch(patch, direction: -1)
+            } label: {
+                Image(systemName: "chevron.up")
+            }
+            .buttonStyle(.plain)
+            .disabled(!canMoveUp)
+
+            Button {
+                movePatch(patch, direction: 1)
+            } label: {
+                Image(systemName: "chevron.down")
+            }
+            .buttonStyle(.plain)
+            .disabled(!canMoveDown)
+        }
+        .font(.system(size: 12, weight: .semibold))
+        .foregroundStyle(.secondary)
+        .frame(width: patchsheetOrderColumnWidth, alignment: .center)
+        .padding(.vertical, patchsheetCellVerticalPadding)
+    }
+
     private var secondaryPlaceholder: String {
         switch selectedCategory {
         case "Video": return "Destination"
         case "Lighting": return "Channel Count"
         default: return "Output"
         }
+    }
+
+    private func exportPatchsheet() {
+        guard !filtered.isEmpty else { return }
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async {
+                exportPatchsheet()
+            }
+            return
+        }
+        isExporting = true
+        defer { isExporting = false }
+
+        let header = [
+            "Name",
+            inputColumnTitle,
+            outputColumnTitle,
+            "Universe",
+            "Notes",
+            "Category",
+            "Campus",
+            "Room",
+            "NDI Enabled"
+        ].map(csvEscaped).joined(separator: ",")
+
+        let rows = filtered.map { patch in
+            [
+                patch.name,
+                patch.input,
+                patch.output,
+                patch.universe ?? "",
+                patch.notes,
+                patch.category,
+                patch.campus,
+                patch.room,
+                patch.ndiEnabled ? "Yes" : "No"
+            ].map(csvEscaped).joined(separator: ",")
+        }
+
+        let csv = "\u{FEFF}" + ([header] + rows).joined(separator: "\n")
+        let savePanel = NSSavePanel()
+        savePanel.title = "Export Patchsheet"
+        savePanel.nameFieldStringValue = "Patchsheet-\(selectedCategory.replacingOccurrences(of: " ", with: "")).csv"
+        savePanel.allowedContentTypes = [.commaSeparatedText]
+        savePanel.canCreateDirectories = true
+
+        guard savePanel.runModal() == .OK, let url = savePanel.url else { return }
+
+        do {
+            try csv.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            print("Patchsheet export failed:", error.localizedDescription)
+        }
+    }
+
+    private func csvEscaped(_ value: String) -> String {
+        "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
     }
 
     private var canSubmitNewPatch: Bool {
@@ -1867,6 +2340,19 @@ private struct MacPatchsheetView: View {
         }
     }
 
+    private func setAllFilteredNDIEnabled(_ isEnabled: Bool) {
+        guard canManageNDI else { return }
+
+        for patch in filtered where patch.ndiEnabled != isEnabled {
+            var updated = patch
+            updated.ndiEnabled = isEnabled
+            store.savePatch(updated)
+            if selectedPatch?.id == updated.id {
+                selectedPatch = updated
+            }
+        }
+    }
+
     private func notesBinding(for patch: PatchRow) -> Binding<String> {
         Binding(
             get: {
@@ -1892,6 +2378,19 @@ private struct MacPatchsheetView: View {
         if selectedPatch?.id == updated.id {
             selectedPatch = updated
         }
+    }
+
+    private func movePatch(_ patch: PatchRow, direction: Int) {
+        let current = filtered
+        guard let currentIndex = current.firstIndex(where: { $0.id == patch.id }) else { return }
+        let destinationIndex = currentIndex + direction
+        guard current.indices.contains(destinationIndex) else { return }
+
+        var reordered = current
+        let moved = reordered.remove(at: currentIndex)
+        reordered.insert(moved, at: destinationIndex)
+
+        store.reorderPatchsheet(category: selectedCategory, orderedIDs: reordered.map(\.id))
     }
 }
 
@@ -1928,6 +2427,7 @@ enum MacNDIFeedSourceType: String, CaseIterable, Codable, Identifiable {
     case tickets
     case runOfShow
     case runOfShowLive
+    case stagePlot
 
     var id: String { rawValue }
 
@@ -1937,6 +2437,7 @@ enum MacNDIFeedSourceType: String, CaseIterable, Codable, Identifiable {
         case .tickets: return "Tickets"
         case .runOfShow: return "Run of Show"
         case .runOfShowLive: return "Run of Show Live"
+        case .stagePlot: return "Stage Plot"
         }
     }
 }
@@ -2155,6 +2656,10 @@ final class MacNDISettingsController: ObservableObject {
             let show = runOfShow(for: feed)
             let title = show?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return "Live view for \(title.isEmpty ? "selected show" : title)"
+        case .stagePlot:
+            let show = runOfShow(for: feed)
+            let title = show?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return "\(show?.sortedStagePlotItems.count ?? 0) stage plot items in \(title.isEmpty ? "selected show" : title)"
         }
     }
 
@@ -2933,7 +3438,7 @@ struct MacSettingsView: View {
                                     }
                                 }
                                 .frame(width: 140)
-                            } else if feed.sourceType == .runOfShow || feed.sourceType == .runOfShowLive {
+                            } else if feed.sourceType == .runOfShow || feed.sourceType == .runOfShowLive || feed.sourceType == .stagePlot {
                                 Picker(
                                     "Show",
                                     selection: runOfShowBinding(for: index, feed: feed)
@@ -3122,6 +3627,13 @@ struct MacSettingsView: View {
                 scale: min(feed.scale, 1.0),
                 now: Date()
             )
+        case .stagePlot:
+            MacStagePlotNDIPreview(
+                show: ndiSettings.runOfShow(for: feed),
+                outputName: feed.title,
+                isActive: feed.isLive,
+                scale: min(feed.scale, 1.0)
+            )
         }
     }
 }
@@ -3262,6 +3774,13 @@ private final class MacPatchsheetNDIOutputWindowController {
                     scale: configuration.scale,
                     now: Date()
                 )
+            case .stagePlot:
+                MacStagePlotNDIPreview(
+                    show: configuration.runOfShow,
+                    outputName: title,
+                    isActive: sender.isReadyToSend,
+                    scale: configuration.scale
+                )
             }
         }
     }
@@ -3300,7 +3819,8 @@ private enum MacNDIRenderer {
                 .frame(width: size.width, height: size.height)
         )
         renderer.proposedSize = ProposedViewSize(size)
-        renderer.scale = NSScreen.main?.backingScaleFactor ?? 2.0
+        // NDI should receive exact output pixels, not Retina-scaled backing pixels.
+        renderer.scale = 1.0
         return renderer.cgImage
     }
 }
@@ -3781,6 +4301,285 @@ private struct MacRunOfShowNDIPreview: View {
     }
 }
 
+private struct MacStagePlotNDIPreview: View {
+    let show: RunOfShowDocument?
+    let outputName: String
+    let isActive: Bool
+    let scale: Double
+
+    var body: some View {
+        let items = show?.sortedStagePlotItems ?? []
+        let resolvedTitle = show?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        return ZStack(alignment: .topLeading) {
+            stagePlotPreviewSurface(type: show?.stageType ?? .rectangle)
+
+            VStack(alignment: .leading, spacing: 8 * scale) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4 * scale) {
+                        Text(outputName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "ProdConnect Stage Plot" : outputName)
+                            .font(.system(size: 26 * scale, weight: .bold))
+                            .foregroundStyle(.white)
+                        Text(resolvedTitle.isEmpty ? "Stage Plot Preview" : resolvedTitle)
+                            .font(.system(size: 12 * scale, weight: .medium))
+                            .foregroundStyle(Color.white.opacity(0.7))
+                    }
+                    Spacer()
+                    Text(isActive ? "LIVE" : "PREVIEW")
+                        .font(.system(size: 10 * scale, weight: .bold))
+                        .padding(.horizontal, 10 * scale)
+                        .padding(.vertical, 6 * scale)
+                        .background((isActive ? Color.green : Color.gray).opacity(0.24))
+                        .clipShape(Capsule())
+                        .foregroundStyle(isActive ? Color.green : Color.white.opacity(0.75))
+                }
+                Spacer()
+            }
+            .padding(20 * scale)
+
+            VStack {
+                Text("UPSTAGE")
+                    .font(.system(size: 11 * scale, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.76))
+                Spacer()
+                HStack {
+                    Text("STAGE RIGHT")
+                    Spacer()
+                    Text("STAGE LEFT")
+                }
+                .font(.system(size: 10 * scale, weight: .semibold))
+                .foregroundStyle(Color.white.opacity(0.54))
+                Text("DOWNSTAGE")
+                    .font(.system(size: 11 * scale, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.76))
+            }
+            .padding(24 * scale)
+
+            GeometryReader { proxy in
+                let size = proxy.size
+                ForEach(items) { item in
+                    stagePlotPreviewNode(item)
+                    .scaleEffect(item.sizeScale)
+                    .rotationEffect(.degrees(item.rotationDegrees))
+                    .position(
+                        x: 44 * scale + item.x * max(size.width - (88 * scale), 1),
+                        y: 86 * scale + item.y * max(size.height - (172 * scale), 1)
+                    )
+                }
+            }
+
+            if items.isEmpty {
+                VStack(spacing: 10 * scale) {
+                    Image(systemName: "music.note.house")
+                        .font(.system(size: 34 * scale))
+                        .foregroundStyle(Color.white.opacity(0.48))
+                    Text("No stage plot items")
+                        .font(.system(size: 22 * scale, weight: .semibold))
+                        .foregroundStyle(.white)
+                    Text("Add instruments or vocals in Run of Show to populate this feed.")
+                        .font(.system(size: 13 * scale))
+                        .foregroundStyle(Color.white.opacity(0.64))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func stagePlotPreviewSurface(type: RunOfShowStageType) -> some View {
+        ZStack {
+            switch type {
+            case .rectangle:
+                RoundedRectangle(cornerRadius: 22 * scale, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.13, green: 0.13, blue: 0.16),
+                                Color(red: 0.07, green: 0.07, blue: 0.1)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                RoundedRectangle(cornerRadius: 22 * scale, style: .continuous)
+                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                    .padding(14 * scale)
+            case .archedFront:
+                MacStagePlotArchedFrontShape(curveDepth: 0.18, cornerRadius: 22 * scale)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color(red: 0.13, green: 0.13, blue: 0.16),
+                            Color(red: 0.07, green: 0.07, blue: 0.1)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                MacStagePlotArchedFrontShape(curveDepth: 0.18, cornerRadius: 22 * scale)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                .padding(14 * scale)
+            case .round:
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.13, green: 0.13, blue: 0.16),
+                                Color(red: 0.07, green: 0.07, blue: 0.1)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                Circle()
+                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                    .padding(14 * scale)
+            }
+        }
+    }
+
+    private func stagePlotPreviewTitle(_ item: RunOfShowStagePlotItem) -> String {
+        let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return title.isEmpty ? item.role.defaultTitle : title
+    }
+
+    private func stagePlotPreviewColor(for role: RunOfShowStagePlotRole) -> Color {
+        switch role {
+        case .instrument:
+            return Color(red: 0.25, green: 0.52, blue: 0.94)
+        case .vocal:
+            return Color(red: 0.88, green: 0.33, blue: 0.46)
+        case .drumSet:
+            return Color(red: 0.77, green: 0.41, blue: 0.18)
+        case .guitar:
+            return Color(red: 0.98, green: 0.66, blue: 0.19)
+        case .bassGuitar:
+            return Color(red: 0.28, green: 0.77, blue: 0.58)
+        case .microphoneStand:
+            return Color(red: 0.69, green: 0.37, blue: 0.93)
+        case .keyboard:
+            return Color(red: 0.36, green: 0.72, blue: 0.96)
+        case .speaker:
+            return Color(red: 0.54, green: 0.59, blue: 0.66)
+        }
+    }
+
+    @ViewBuilder
+    private func stagePlotPreviewNode(_ item: RunOfShowStagePlotItem) -> some View {
+        if item.role.usesSymbolArtwork {
+            VStack(spacing: 6 * scale) {
+                stagePlotPreviewArtwork(for: item.role, color: stagePlotPreviewColor(for: item.role))
+                    .frame(width: 46 * scale, height: 40 * scale)
+                Text(stagePlotPreviewTitle(item))
+                    .font(.system(size: 11 * scale, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .padding(.horizontal, 10 * scale)
+                    .padding(.vertical, 6 * scale)
+                    .background(Color.black.opacity(0.32))
+                    .clipShape(Capsule())
+            }
+            .padding(10 * scale)
+            .background(
+                RoundedRectangle(cornerRadius: 14 * scale, style: .continuous)
+                    .fill(Color.white.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 14 * scale, style: .continuous)
+                    .stroke(Color.white.opacity(0.18), lineWidth: 1)
+            )
+        } else {
+            VStack(alignment: .leading, spacing: 2 * scale) {
+                Text(stagePlotPreviewTitle(item))
+                    .font(.system(size: 12 * scale, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                if !item.subtitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text(item.subtitle)
+                        .font(.system(size: 10 * scale))
+                        .foregroundStyle(Color.white.opacity(0.72))
+                        .lineLimit(1)
+                }
+            }
+            .padding(.horizontal, 10 * scale)
+            .padding(.vertical, 8 * scale)
+            .frame(minWidth: 100 * scale, maxWidth: 170 * scale, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 12 * scale, style: .continuous)
+                    .fill(stagePlotPreviewColor(for: item.role).opacity(0.86))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12 * scale, style: .continuous)
+                    .stroke(Color.white.opacity(0.26), lineWidth: 1)
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func stagePlotPreviewArtwork(for role: RunOfShowStagePlotRole, color: Color) -> some View {
+        if let symbolName = role.systemImageName {
+            ZStack {
+                Circle()
+                    .fill(color.opacity(0.22))
+                    .frame(width: 38 * scale, height: 38 * scale)
+                Image(systemName: symbolName)
+                    .font(.system(size: 21 * scale, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+        } else {
+            EmptyView()
+        }
+    }
+}
+
+private enum StagePlotRotationCorner: CaseIterable, Identifiable {
+    case topLeading
+    case topTrailing
+    case bottomLeading
+    case bottomTrailing
+
+    var id: Self { self }
+
+    var alignment: Alignment {
+        switch self {
+        case .topLeading:
+            return .topLeading
+        case .topTrailing:
+            return .topTrailing
+        case .bottomLeading:
+            return .bottomLeading
+        case .bottomTrailing:
+            return .bottomTrailing
+        }
+    }
+
+    var offset: CGSize {
+        switch self {
+        case .topLeading:
+            return CGSize(width: -14, height: -14)
+        case .topTrailing:
+            return CGSize(width: 14, height: -14)
+        case .bottomLeading:
+            return CGSize(width: -14, height: 14)
+        case .bottomTrailing:
+            return CGSize(width: 14, height: 14)
+        }
+    }
+
+    var iconRotationDegrees: Double {
+        switch self {
+        case .topLeading:
+            return 180
+        case .topTrailing:
+            return 0
+        case .bottomLeading:
+            return 90
+        case .bottomTrailing:
+            return -90
+        }
+    }
+}
+
 private struct MacTicketsNDIPreview: View {
     let tickets: [SupportTicket]
     let outputName: String
@@ -3969,18 +4768,24 @@ private struct MacRunOfShowLiveNDIPreview: View {
                 .padding(.vertical, 18 * scale)
                 .background(isOverrun ? Color(red: 0.79, green: 0.17, blue: 0.2) : Color(red: 0.2, green: 0.68, blue: 0.36))
 
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(items.prefix(6).enumerated()), id: \.element.id) { _, item in
-                        HStack(spacing: 8 * scale) {
-                            Text(item.title)
-                                .font(.system(size: 11 * scale, weight: item.id == currentItem?.id ? .semibold : .regular))
-                                .foregroundStyle(item.id == currentItem?.id ? Color.white : Color.white.opacity(0.68))
-                                .lineLimit(2)
-                            Spacer()
+                GeometryReader { proxy in
+                    let itemCount = max(items.count, 1)
+                    let rowHeight = max(18 * scale, min(40 * scale, proxy.size.height / CGFloat(itemCount)))
+                    let rowFontSize = max(9 * scale, min(12 * scale, rowHeight * 0.34))
+
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(items, id: \.id) { item in
+                            HStack(spacing: 8 * scale) {
+                                Text(item.title)
+                                    .font(.system(size: rowFontSize, weight: item.id == currentItem?.id ? .semibold : .regular))
+                                    .foregroundStyle(item.id == currentItem?.id ? Color.white : Color.white.opacity(0.68))
+                                    .lineLimit(1)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 10 * scale)
+                            .frame(maxWidth: .infinity, minHeight: rowHeight, maxHeight: rowHeight, alignment: .leading)
+                            .background(item.id == currentItem?.id ? Color.orange.opacity(0.2) : Color.clear)
                         }
-                        .padding(.horizontal, 10 * scale)
-                        .padding(.vertical, 8 * scale)
-                        .background(item.id == currentItem?.id ? Color.orange.opacity(0.2) : Color.clear)
                     }
                 }
                 .background(Color(red: 0.1, green: 0.11, blue: 0.14))
@@ -4207,10 +5012,36 @@ private struct MacEditPatchView: View {
 }
 
 private struct MacRunOfShowView: View {
+    private enum ExportSubject: String, Identifiable {
+        case runOfShow = "Run of Show"
+        case stagePlot = "Stage Plot"
+
+        var id: String { rawValue }
+    }
+
+    private enum ExportFormat: String, Identifiable {
+        case pdf = "PDF"
+        case jpeg = "JPEG"
+
+        var id: String { rawValue }
+        var fileExtension: String { self == .pdf ? "pdf" : "jpg" }
+    }
+
     @EnvironmentObject private var store: ProdConnectStore
     @EnvironmentObject private var runOfShowControls: MacRunOfShowControlController
     @State private var selectedShowID: String?
     @State private var showToDelete: RunOfShowDocument?
+    @State private var selectedStagePlotItemID: String?
+    @State private var editingStagePlotItemID: String?
+    @State private var stagePlotDragPoints: [String: CGPoint] = [:]
+    @State private var stagePlotRotationDrafts: [String: Double] = [:]
+    @State private var activeStagePlotRotationItemID: String?
+    @State private var exportErrorMessage: String?
+    @State private var pendingExportSubject: ExportSubject?
+    @State private var pendingExportData: Data?
+    @State private var pendingExportFilename: String?
+    @State private var pendingExportContentType: UTType?
+    @State private var isShowingExportSheet = false
 
     private var canEdit: Bool {
         store.canEditRunOfShow
@@ -4226,19 +5057,21 @@ private struct MacRunOfShowView: View {
     }
 
     var body: some View {
-        HSplitView {
+        HStack(spacing: 20) {
             sidebar
-                .frame(minWidth: 240, idealWidth: 280, maxWidth: 320)
+                .frame(width: 280, alignment: .topLeading)
 
             if let show = selectedShow {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
                         showHeader(show)
                         timelineGrid(for: show)
+                        stagePlotPanel(for: show)
                         livePanel(for: show)
                     }
                     .padding(20)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .navigationTitle("Run of Show")
             } else {
                 ContentUnavailableView(
@@ -4249,16 +5082,35 @@ private struct MacRunOfShowView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .overlay {
+            if isShowingExportSheet {
+                exportOverlay
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 16)
         .onAppear {
             if selectedShowID == nil {
                 selectedShowID = shows.first?.id
             }
+            syncSelectedStagePlotItem()
+            syncStagePlotDragPoints()
         }
         .onChange(of: shows.map(\.id)) { _, ids in
             if let selectedShowID, ids.contains(selectedShowID) {
+                syncSelectedStagePlotItem()
+                syncStagePlotDragPoints()
                 return
             }
             self.selectedShowID = ids.first
+            syncSelectedStagePlotItem()
+            syncStagePlotDragPoints()
+        }
+        .onChange(of: isShowingExportSheet) { oldValue, newValue in
+            if oldValue && !newValue {
+                presentPendingSavePanelIfNeeded()
+            }
         }
         .alert("Delete Run of Show?", isPresented: Binding(
             get: { showToDelete != nil },
@@ -4275,6 +5127,24 @@ private struct MacRunOfShowView: View {
             }
         } message: {
             Text("This permanently deletes the selected run of show.")
+        }
+        .alert("Export Failed", isPresented: Binding(
+            get: { exportErrorMessage != nil },
+            set: { if !$0 { exportErrorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(exportErrorMessage ?? "Unable to export this file.")
+        }
+        .sheet(isPresented: Binding(
+            get: { editingStagePlotItemID != nil },
+            set: { if !$0 { editingStagePlotItemID = nil } }
+        )) {
+            if let show = selectedShow,
+               let itemID = editingStagePlotItemID,
+               let item = show.sortedStagePlotItems.first(where: { $0.id == itemID }) {
+                stagePlotEditorSheet(show: show, item: item)
+            }
         }
     }
 
@@ -4319,8 +5189,10 @@ private struct MacRunOfShowView: View {
                 }
             }
         }
+        .frame(maxHeight: .infinity, alignment: .top)
         .padding(16)
         .background(Color.black.opacity(0.16))
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
     private func showHeader(_ show: RunOfShowDocument) -> some View {
@@ -4344,6 +5216,12 @@ private struct MacRunOfShowView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button("Export") {
+                    pendingExportSubject = nil
+                    isShowingExportSheet = true
+                }
+                .buttonStyle(.bordered)
+
                 if canEdit {
                     Button("Delete", role: .destructive) {
                         showToDelete = show
@@ -4433,6 +5311,389 @@ private struct MacRunOfShowView: View {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(Color.white.opacity(0.06), lineWidth: 1)
         )
+    }
+
+    private func stagePlotPanel(for show: RunOfShowDocument) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            stagePlotHeader(show)
+            stagePlotCanvas(show)
+
+            if show.sortedStagePlotItems.isEmpty {
+                ContentUnavailableView(
+                    "No Stage Plot Items",
+                    systemImage: "music.note.house",
+                    description: Text("Add instruments or vocals to build a stage layout for this show.")
+                )
+            } else {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(show.sortedStagePlotItems) { item in
+                        stagePlotEditorCard(show: show, item: item)
+                    }
+                }
+            }
+        }
+        .padding(18)
+        .background(Color.white.opacity(0.02))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+    }
+
+    private func stagePlotHeader(_ show: RunOfShowDocument) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Stage Plot")
+                        .font(.title2.weight(.semibold))
+                    Text("Drag each label into place on the stage.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if canEdit {
+                    Menu("Add Item") {
+                        stagePlotAddButtons(show: show)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+
+            Picker(
+                "Stage Type",
+                selection: Binding(
+                    get: { show.stageType },
+                    set: { newValue in
+                        updateShow(show) { $0.stageType = newValue }
+                    }
+                )
+            ) {
+                ForEach(RunOfShowStageType.allCases) { stageType in
+                    Text(stageType.rawValue).tag(stageType)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(!canEdit)
+        }
+    }
+
+    private func stagePlotCanvas(_ show: RunOfShowDocument) -> some View {
+        GeometryReader { proxy in
+            let size = proxy.size
+            ZStack {
+                stagePlotStageSurface(type: show.stageType)
+
+                VStack {
+                    Text("UPSTAGE")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color.white.opacity(0.7))
+                    Spacer()
+                    HStack {
+                        Text("STAGE RIGHT")
+                        Spacer()
+                        Text("STAGE LEFT")
+                    }
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Color.white.opacity(0.55))
+                    Text("DOWNSTAGE")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color.white.opacity(0.7))
+                }
+                .padding(16)
+
+                ForEach(show.sortedStagePlotItems) { item in
+                    stagePlotCanvasItem(item, canvasSize: size)
+                }
+            }
+        }
+        .frame(height: 360)
+    }
+
+    private func stagePlotCanvasItem(_ item: RunOfShowStagePlotItem, canvasSize: CGSize) -> some View {
+        let isSelected = item.id == selectedStagePlotItemID
+        let displayPosition = stagePlotDisplayPosition(for: item)
+        let displayRotation = stagePlotDisplayRotation(for: item)
+
+        return stagePlotCanvasNode(item, isSelected: isSelected)
+        .overlay {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(item.role.usesSymbolArtwork ? Color.clear : Color.white.opacity(isSelected ? 0.95 : 0.28), lineWidth: isSelected ? 2 : 1)
+                if canEdit, let show = selectedShow, isSelected {
+                    stagePlotRotationHotZone(item: item, show: show)
+                }
+            }
+        }
+        .scaleEffect(item.sizeScale)
+        .rotationEffect(.degrees(displayRotation))
+        .shadow(color: Color.black.opacity(0.28), radius: 10, y: 6)
+        .position(stagePlotPoint(x: displayPosition.x, y: displayPosition.y, canvasSize: canvasSize))
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { value in
+                    guard canEdit else { return }
+                    selectedStagePlotItemID = item.id
+                    stagePlotDragPoints[item.id] = normalizedStagePlotPoint(for: value.location, canvasSize: canvasSize)
+                }
+                .onEnded { value in
+                    guard canEdit, let show = selectedShow else { return }
+                    let point = normalizedStagePlotPoint(for: value.location, canvasSize: canvasSize)
+                    stagePlotDragPoints[item.id] = point
+                    updateStagePlotItem(show, itemID: item.id) {
+                        $0.x = point.x
+                        $0.y = point.y
+                    }
+                    stagePlotDragPoints[item.id] = nil
+                }
+        )
+        .onTapGesture { selectedStagePlotItemID = item.id }
+        .contextMenu {
+            if let show = selectedShow, canEdit {
+                Button("Rename / Edit") {
+                    openStagePlotEditor(item.id)
+                }
+                Button(role: .destructive) {
+                    deleteStagePlotItem(show, itemID: item.id)
+                } label: {
+                    Text("Delete")
+                }
+            }
+        }
+    }
+
+    private func stagePlotEditorCard(show: RunOfShowDocument, item: RunOfShowStagePlotItem) -> some View {
+        HStack(spacing: 12) {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(stagePlotColor(for: item.role).opacity(0.22))
+                .frame(width: 8)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(stagePlotItemTitle(item))
+                    .font(.headline)
+                    .foregroundStyle(item.id == selectedStagePlotItemID ? Color.accentColor : Color.primary)
+                Text(item.subtitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? item.role.rawValue : item.subtitle)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Text("X \(Int((item.x * 100).rounded()))  •  Y \(Int((item.y * 100).rounded()))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+
+            Spacer()
+
+            if canEdit {
+                Button("Edit") {
+                    openStagePlotEditor(item.id)
+                }
+                .buttonStyle(.bordered)
+
+                Button(role: .destructive) {
+                    deleteStagePlotItem(show, itemID: item.id)
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(item.id == selectedStagePlotItemID ? Color.accentColor.opacity(0.08) : Color.white.opacity(0.04))
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .onTapGesture {
+            selectedStagePlotItemID = item.id
+        }
+        .contextMenu {
+            if canEdit {
+                Button("Rename / Edit") {
+                    openStagePlotEditor(item.id)
+                }
+                Button(role: .destructive) {
+                    deleteStagePlotItem(show, itemID: item.id)
+                } label: {
+                    Text("Delete")
+                }
+            }
+        }
+    }
+
+    private func stagePlotEditorSheet(show: RunOfShowDocument, item: RunOfShowStagePlotItem) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Edit Stage Item")
+                .font(.title3.weight(.semibold))
+
+            Picker(
+                "Type",
+                selection: Binding(
+                    get: { item.role },
+                    set: { newValue in
+                        updateStagePlotItem(show, itemID: item.id) { $0.role = newValue }
+                    }
+                )
+            ) {
+                ForEach(RunOfShowStagePlotRole.allCases) { role in
+                    Text(role.rawValue).tag(role)
+                }
+            }
+
+            TextField(
+                item.role.usesSymbolArtwork ? "Label" : (item.role == .instrument ? "Instrument Name" : "Vocal Name"),
+                text: Binding(
+                    get: { item.title },
+                    set: { newValue in
+                        updateStagePlotItem(show, itemID: item.id) { $0.title = newValue }
+                    }
+                )
+            )
+            .textFieldStyle(.roundedBorder)
+
+            TextField(
+                item.role == .vocal ? "Mic / Notes" : "Player / Notes",
+                text: Binding(
+                    get: { item.subtitle },
+                    set: { newValue in
+                        updateStagePlotItem(show, itemID: item.id) { $0.subtitle = newValue }
+                    }
+                )
+            )
+            .textFieldStyle(.roundedBorder)
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Size")
+                    Spacer()
+                    Text("\(Int((item.sizeScale * 100).rounded()))%")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+
+                Slider(
+                    value: Binding(
+                        get: { item.sizeScale },
+                        set: { newValue in
+                            updateStagePlotItem(show, itemID: item.id) { $0.sizeScale = newValue }
+                        }
+                    ),
+                    in: 0.6...1.8
+                )
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Rotation")
+                    Spacer()
+                    Text("\(Int(item.rotationDegrees.rounded()))°")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+
+                HStack {
+                    Button("-15°") {
+                        updateStagePlotItem(show, itemID: item.id) { $0.rotationDegrees -= 15 }
+                    }
+                    Button("Reset") {
+                        updateStagePlotItem(show, itemID: item.id) { $0.rotationDegrees = 0 }
+                    }
+                    Button("+15°") {
+                        updateStagePlotItem(show, itemID: item.id) { $0.rotationDegrees += 15 }
+                    }
+                }
+            }
+
+            HStack {
+                Spacer()
+                Button("Done") {
+                    editingStagePlotItemID = nil
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20)
+        .frame(width: 360)
+    }
+
+    @ViewBuilder
+    private func stagePlotStageSurface(type: RunOfShowStageType) -> some View {
+        ZStack {
+            switch type {
+            case .rectangle:
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.14, green: 0.14, blue: 0.17),
+                                Color(red: 0.08, green: 0.08, blue: 0.11)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                    .padding(10)
+            case .archedFront:
+                MacStagePlotArchedFrontShape(curveDepth: 0.18, cornerRadius: 18)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color(red: 0.14, green: 0.14, blue: 0.17),
+                            Color(red: 0.08, green: 0.08, blue: 0.11)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                MacStagePlotArchedFrontShape(curveDepth: 0.18, cornerRadius: 18)
+                .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                .padding(10)
+            case .round:
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.14, green: 0.14, blue: 0.17),
+                                Color(red: 0.08, green: 0.08, blue: 0.11)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                Circle()
+                    .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                    .padding(10)
+            }
+        }
+    }
+
+    private func stagePlotPoint(for item: RunOfShowStagePlotItem, canvasSize: CGSize) -> CGPoint {
+        stagePlotPoint(x: item.x, y: item.y, canvasSize: canvasSize)
+    }
+
+    private func stagePlotPoint(x: Double, y: Double, canvasSize: CGSize) -> CGPoint {
+        CGPoint(
+            x: 36 + x * max(canvasSize.width - 72, 1),
+            y: 42 + y * max(canvasSize.height - 84, 1)
+        )
+    }
+
+    private func normalizedStagePlotPoint(for location: CGPoint, canvasSize: CGSize) -> CGPoint {
+        let x = min(max((location.x - 36) / max(canvasSize.width - 72, 1), 0), 1)
+        let y = min(max((location.y - 42) / max(canvasSize.height - 84, 1), 0), 1)
+        return CGPoint(x: x, y: y)
+    }
+
+    private func stagePlotItemTitle(_ item: RunOfShowStagePlotItem) -> String {
+        let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return title.isEmpty ? item.role.defaultTitle : title
+    }
+
+    private func openStagePlotEditor(_ itemID: String) {
+        selectedStagePlotItemID = itemID
+        editingStagePlotItemID = itemID
     }
 
     private func livePanel(for show: RunOfShowDocument) -> some View {
@@ -4816,6 +6077,401 @@ private struct MacRunOfShowView: View {
         selectedShowID = show.id
     }
 
+    private func performExport(subject: ExportSubject, format: ExportFormat, show: RunOfShowDocument) {
+        let export: (Data?, String) = {
+            switch (subject, format) {
+            case (.runOfShow, .pdf):
+                return (makeRunOfShowPDFData(show), exportFilename(prefix: "RunOfShow", showTitle: show.title, fileExtension: format.fileExtension))
+            case (.runOfShow, .jpeg):
+                return (makeRunOfShowJPEGData(show), exportFilename(prefix: "RunOfShow", showTitle: show.title, fileExtension: format.fileExtension))
+            case (.stagePlot, .pdf):
+                return (makeStagePlotPDFData(show), exportFilename(prefix: "StagePlot", showTitle: show.title, fileExtension: format.fileExtension))
+            case (.stagePlot, .jpeg):
+                return (makeStagePlotJPEGData(show), exportFilename(prefix: "StagePlot", showTitle: show.title, fileExtension: format.fileExtension))
+            }
+        }()
+
+        guard let data = export.0 else {
+            exportErrorMessage = "Unable to render \(subject.rawValue) \(format.rawValue)."
+            return
+        }
+
+        pendingExportData = data
+        pendingExportFilename = export.1
+        pendingExportContentType = format == .pdf ? .pdf : .jpeg
+        isShowingExportSheet = false
+    }
+
+    private func presentPendingSavePanelIfNeeded(attempt: Int = 0) {
+        guard let data = pendingExportData,
+              let filename = pendingExportFilename,
+              let contentType = pendingExportContentType else { return }
+
+        let activeWindow = NSApp.keyWindow ?? NSApp.mainWindow
+        if let activeWindow, activeWindow.attachedSheet != nil, attempt < 12 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                presentPendingSavePanelIfNeeded(attempt: attempt + 1)
+            }
+            return
+        }
+
+        pendingExportData = nil
+        pendingExportFilename = nil
+        pendingExportContentType = nil
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            presentExportFolderPicker(data: data, filename: filename, contentType: contentType)
+        }
+    }
+
+    @MainActor
+    private func presentExportFolderPicker(data: Data, filename: String, contentType: UTType) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async {
+                presentExportFolderPicker(data: data, filename: filename, contentType: contentType)
+            }
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.title = "Choose Export Folder"
+        panel.message = "Choose where to save \(filename)"
+        panel.prompt = "Choose Folder"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+
+        let handleResponse: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let directoryURL = panel.url else { return }
+            let destinationURL = directoryURL.appendingPathComponent(filename)
+            let didAccessDirectory = directoryURL.startAccessingSecurityScopedResource()
+            let didAccessDestination = destinationURL.startAccessingSecurityScopedResource()
+            defer {
+                if didAccessDestination {
+                    destinationURL.stopAccessingSecurityScopedResource()
+                }
+                if didAccessDirectory {
+                    directoryURL.stopAccessingSecurityScopedResource()
+                }
+            }
+
+            var coordinationError: NSError?
+            let coordinator = NSFileCoordinator()
+            coordinator.coordinate(writingItemAt: destinationURL, options: .forReplacing, error: &coordinationError) { coordinatedURL in
+                do {
+                    try data.write(to: coordinatedURL, options: .atomic)
+                } catch {
+                    exportErrorMessage = error.localizedDescription
+                }
+            }
+
+            if let coordinationError {
+                exportErrorMessage = coordinationError.localizedDescription
+            }
+        }
+
+        if let hostWindow = NSApp.keyWindow ?? NSApp.mainWindow {
+            panel.beginSheetModal(for: hostWindow, completionHandler: handleResponse)
+            return
+        }
+
+        handleResponse(panel.runModal())
+    }
+
+    private var exportOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.45)
+                .ignoresSafeArea()
+                .onTapGesture {
+                    cancelExportFlow()
+                }
+
+            VStack(alignment: .leading, spacing: 20) {
+                HStack {
+                    Text("Export")
+                        .font(.title3.weight(.semibold))
+                    Spacer()
+                    Button("Cancel") {
+                        cancelExportFlow()
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                Text("Choose what to export and the file format.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Content")
+                        .font(.headline)
+                    HStack(spacing: 10) {
+                        Button("Run of Show") {
+                            pendingExportSubject = .runOfShow
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(pendingExportSubject == .runOfShow ? .accentColor : .gray)
+
+                        Button("Stage Plot") {
+                            pendingExportSubject = .stagePlot
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(pendingExportSubject == .stagePlot ? .accentColor : .gray)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Format")
+                        .font(.headline)
+                    HStack(spacing: 10) {
+                        Button("PDF") {
+                            guard let show = selectedShow, let subject = pendingExportSubject else { return }
+                            performExport(subject: subject, format: .pdf, show: show)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(pendingExportSubject == nil)
+
+                        Button("JPEG") {
+                            guard let show = selectedShow, let subject = pendingExportSubject else { return }
+                            performExport(subject: subject, format: .jpeg, show: show)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(pendingExportSubject == nil)
+                    }
+                }
+            }
+            .padding(24)
+            .frame(width: 420)
+            .background(Color(nsColor: .windowBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+            )
+            .shadow(color: Color.black.opacity(0.28), radius: 22, y: 12)
+        }
+    }
+
+    private func cancelExportFlow() {
+        pendingExportSubject = nil
+        pendingExportData = nil
+        pendingExportFilename = nil
+        pendingExportContentType = nil
+        isShowingExportSheet = false
+    }
+
+    private func exportFilename(prefix: String, showTitle: String, fileExtension: String) -> String {
+        let trimmed = showTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = trimmed.isEmpty ? "UntitledShow" : trimmed
+        let sanitized = base.replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        return "\(prefix)-\(sanitized).\(fileExtension)"
+    }
+
+    private func makeRunOfShowPDFData(_ show: RunOfShowDocument) -> Data? {
+        let width: CGFloat = 1000
+        let height = runOfShowExportHeight(for: show, rowHeight: 54, minimumHeight: 560)
+        let size = CGSize(width: width, height: height)
+        let content = runOfShowExportView(show)
+            .frame(width: width, height: height)
+
+        guard let image = MacNDIRenderer.snapshot(of: content, size: size) else { return nil }
+        return makePDFData(from: image, size: size)
+    }
+
+    private func makeRunOfShowJPEGData(_ show: RunOfShowDocument) -> Data? {
+        let width: CGFloat = 1200
+        let height = runOfShowExportHeight(for: show, rowHeight: 66, minimumHeight: 800)
+        let size = CGSize(width: width, height: height)
+        let content = runOfShowExportView(show)
+            .frame(width: width, height: height)
+
+        guard let image = MacNDIRenderer.snapshot(of: content, size: size) else { return nil }
+        let rep = NSBitmapImageRep(cgImage: image)
+        return rep.representation(using: .jpeg, properties: [.compressionFactor: 0.92])
+    }
+
+    private func makeStagePlotPDFData(_ show: RunOfShowDocument) -> Data? {
+        let size = CGSize(width: 1100, height: 720)
+        let content = stagePlotExportView(show)
+            .frame(width: size.width, height: size.height)
+
+        guard let image = MacNDIRenderer.snapshot(of: content, size: size) else { return nil }
+        return makePDFData(from: image, size: size)
+    }
+
+    private func makeStagePlotJPEGData(_ show: RunOfShowDocument) -> Data? {
+        let size = CGSize(width: 1600, height: 900)
+        let content = stagePlotExportView(show)
+            .frame(width: size.width, height: size.height)
+
+        guard let image = MacNDIRenderer.snapshot(of: content, size: size) else { return nil }
+        let rep = NSBitmapImageRep(cgImage: image)
+        return rep.representation(using: .jpeg, properties: [.compressionFactor: 0.92])
+    }
+
+    private func makePDFData(from image: CGImage, size: CGSize) -> Data? {
+        let data = NSMutableData()
+        guard let consumer = CGDataConsumer(data: data as CFMutableData) else { return nil }
+        var mediaBox = CGRect(origin: .zero, size: size)
+        guard let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else { return nil }
+        context.beginPDFPage(nil)
+        context.draw(image, in: mediaBox)
+        context.endPDFPage()
+        context.closePDF()
+        return data as Data
+    }
+
+    private func runOfShowExportView(_ show: RunOfShowDocument) -> some View {
+        let items = show.sortedItems
+
+        return VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(show.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Run of Show" : show.title)
+                    .font(.system(size: 34, weight: .bold))
+                    .foregroundStyle(Color.black)
+                Text("Scheduled Start: \(show.scheduledStart.formatted(date: .abbreviated, time: .shortened))")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(Color.black.opacity(0.65))
+                Text("\(items.count) items • \(formatDuration(seconds: show.totalDurationSeconds)) total")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(Color.black.opacity(0.65))
+            }
+            .padding(.leading, 64)
+            .padding(.trailing, 14)
+            .padding(.top, 30)
+            .padding(.bottom, 20)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(red: 0.95, green: 0.97, blue: 1.0))
+
+            VStack(spacing: 0) {
+                HStack(spacing: 0) {
+                    exportHeaderCell("Time", width: 120)
+                    exportHeaderCell("Length", width: 90)
+                    exportHeaderCell("Title", width: 240)
+                    exportHeaderCell("Person", width: 165)
+                    exportHeaderCell("Notes", width: 285)
+                }
+
+                ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                    HStack(alignment: .top, spacing: 0) {
+                        exportValueCell(startTimeText(for: show, itemIndex: index), width: 120)
+                        exportValueCell(item.formattedDuration, width: 90)
+                        exportValueCell(item.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : item.title, width: 240)
+                        exportValueCell(item.person.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Unassigned" : item.person, width: 165)
+                        exportValueCell(item.notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? " " : item.notes, width: 285)
+                    }
+                    .background(index.isMultiple(of: 2) ? Color.black.opacity(0.03) : Color.white)
+                    .overlay(alignment: .bottom) {
+                        Rectangle()
+                            .fill(Color.black.opacity(0.08))
+                            .frame(height: 1)
+                    }
+                }
+            }
+            .padding(.leading, 64)
+            .padding(.trailing, 6)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.white)
+    }
+
+    private func runOfShowExportHeight(for show: RunOfShowDocument, rowHeight: CGFloat, minimumHeight: CGFloat) -> CGFloat {
+        let itemCount = CGFloat(max(show.sortedItems.count, 1))
+        let headerHeight: CGFloat = 124
+        let tableHeaderHeight: CGFloat = 42
+        let bottomPadding: CGFloat = 24
+        return max(minimumHeight, headerHeight + tableHeaderHeight + (itemCount * rowHeight) + bottomPadding)
+    }
+
+    private func stagePlotExportView(_ show: RunOfShowDocument) -> some View {
+        VStack(alignment: .leading, spacing: 20) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(show.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Stage Plot" : show.title)
+                        .font(.system(size: 34, weight: .bold))
+                        .foregroundStyle(.white)
+                    Text("Stage Plot")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.68))
+                }
+                Spacer()
+                Text(show.stageType.rawValue)
+                    .font(.system(size: 14, weight: .semibold))
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(Color.white.opacity(0.08))
+                    .clipShape(Capsule())
+                    .foregroundStyle(.white)
+            }
+
+            GeometryReader { proxy in
+                let size = proxy.size
+
+                ZStack {
+                    stagePlotStageSurface(type: show.stageType)
+
+                    VStack {
+                        Text("UPSTAGE")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(Color.white.opacity(0.76))
+                        Spacer()
+                        HStack {
+                            Text("STAGE RIGHT")
+                            Spacer()
+                            Text("STAGE LEFT")
+                        }
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.58))
+                        Text("DOWNSTAGE")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(Color.white.opacity(0.76))
+                    }
+                    .padding(28)
+
+                    ForEach(show.sortedStagePlotItems) { item in
+                        stagePlotCanvasNode(item, isSelected: false)
+                            .scaleEffect(item.sizeScale)
+                            .rotationEffect(.degrees(item.rotationDegrees))
+                            .position(stagePlotPoint(x: item.x, y: item.y, canvasSize: size))
+                    }
+                }
+            }
+        }
+        .padding(28)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(red: 0.09, green: 0.1, blue: 0.13),
+                    Color(red: 0.03, green: 0.04, blue: 0.06)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
+    }
+
+    private func exportHeaderCell(_ title: String, width: CGFloat) -> some View {
+        Text(title)
+            .font(.system(size: 13, weight: .semibold))
+            .textCase(.uppercase)
+            .foregroundStyle(Color.black.opacity(0.65))
+            .frame(width: width, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(Color.black.opacity(0.05))
+    }
+
+    private func exportValueCell(_ value: String, width: CGFloat) -> some View {
+        Text(value)
+            .font(.system(size: 13))
+            .foregroundStyle(Color.black.opacity(0.9))
+            .frame(width: width, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 12)
+            .lineLimit(3)
+    }
+
     private func addItem(to show: RunOfShowDocument) {
         updateShow(show) { mutable in
             mutable.items.append(
@@ -4913,6 +6569,23 @@ private struct MacRunOfShowView: View {
         }
     }
 
+    private func syncSelectedStagePlotItem() {
+        let ids = Set(selectedShow?.sortedStagePlotItems.map(\.id) ?? [])
+        if let selectedStagePlotItemID, ids.contains(selectedStagePlotItemID) {
+            return
+        }
+        selectedStagePlotItemID = selectedShow?.sortedStagePlotItems.first?.id
+    }
+
+    private func syncStagePlotDragPoints() {
+        let validIDs = Set(selectedShow?.sortedStagePlotItems.map(\.id) ?? [])
+        stagePlotDragPoints = stagePlotDragPoints.filter { validIDs.contains($0.key) }
+        stagePlotRotationDrafts = stagePlotRotationDrafts.filter { validIDs.contains($0.key) }
+        if let activeStagePlotRotationItemID, !validIDs.contains(activeStagePlotRotationItemID) {
+            self.activeStagePlotRotationItemID = nil
+        }
+    }
+
     private func handleAutomaticLiveStart(for show: RunOfShowDocument, now: Date) {
         guard canEdit,
               show.autoStartLive,
@@ -4942,10 +6615,276 @@ private struct MacRunOfShowView: View {
         return String(format: "%d:%02d", minutes, remainingSeconds)
     }
 
+    private func addStagePlotItem(to show: RunOfShowDocument, role: RunOfShowStagePlotRole) {
+        updateShow(show) { mutable in
+            let nextPosition = mutable.stagePlotItems.count
+            let defaultPosition = role.defaultPosition
+            let newItem = RunOfShowStagePlotItem(
+                role: role,
+                title: role.defaultTitle,
+                subtitle: "",
+                x: defaultPosition.x,
+                y: defaultPosition.y,
+                position: nextPosition
+            )
+            mutable.stagePlotItems.append(newItem)
+            selectedStagePlotItemID = newItem.id
+        }
+    }
+
+    private func updateStagePlotItem(_ show: RunOfShowDocument, itemID: String, change: (inout RunOfShowStagePlotItem) -> Void) {
+        updateShow(show) { mutable in
+            guard let index = mutable.stagePlotItems.firstIndex(where: { $0.id == itemID }) else { return }
+            change(&mutable.stagePlotItems[index])
+            mutable.stagePlotItems[index].x = min(max(mutable.stagePlotItems[index].x, 0), 1)
+            mutable.stagePlotItems[index].y = min(max(mutable.stagePlotItems[index].y, 0), 1)
+            mutable.stagePlotItems[index].rotationDegrees = min(max(mutable.stagePlotItems[index].rotationDegrees, -180), 180)
+            mutable.stagePlotItems[index].sizeScale = min(max(mutable.stagePlotItems[index].sizeScale, 0.6), 1.8)
+        }
+    }
+
+    private func deleteStagePlotItem(_ show: RunOfShowDocument, itemID: String) {
+        updateShow(show) { mutable in
+            mutable.stagePlotItems.removeAll { $0.id == itemID }
+            mutable.stagePlotItems = mutable.stagePlotItems.enumerated().map { offset, item in
+                var updated = item
+                updated.position = offset
+                return updated
+            }
+            if selectedStagePlotItemID == itemID {
+                selectedStagePlotItemID = mutable.sortedStagePlotItems.first?.id
+            }
+        }
+    }
+
+    private func stagePlotColor(for role: RunOfShowStagePlotRole) -> Color {
+        switch role {
+        case .instrument:
+            return Color(red: 0.25, green: 0.52, blue: 0.94)
+        case .vocal:
+            return Color(red: 0.88, green: 0.33, blue: 0.46)
+        case .drumSet:
+            return Color(red: 0.77, green: 0.41, blue: 0.18)
+        case .guitar:
+            return Color(red: 0.98, green: 0.66, blue: 0.19)
+        case .bassGuitar:
+            return Color(red: 0.28, green: 0.77, blue: 0.58)
+        case .microphoneStand:
+            return Color(red: 0.69, green: 0.37, blue: 0.93)
+        case .keyboard:
+            return Color(red: 0.36, green: 0.72, blue: 0.96)
+        case .speaker:
+            return Color(red: 0.54, green: 0.59, blue: 0.66)
+        }
+    }
+
+    @ViewBuilder
+    private func stagePlotAddButtons(show: RunOfShowDocument) -> some View {
+        ForEach(RunOfShowStagePlotRole.allCases) { role in
+            Button {
+                addStagePlotItem(to: show, role: role)
+            } label: {
+                if let symbol = role.systemImageName {
+                    Label(role.rawValue, systemImage: symbol)
+                } else {
+                    Text(role.rawValue)
+                }
+            }
+        }
+    }
+
+    private func stagePlotDisplayPosition(for item: RunOfShowStagePlotItem) -> CGPoint {
+        stagePlotDragPoints[item.id] ?? CGPoint(x: item.x, y: item.y)
+    }
+
+    private func stagePlotDisplayRotation(for item: RunOfShowStagePlotItem) -> Double {
+        stagePlotRotationDrafts[item.id] ?? item.rotationDegrees
+    }
+
+    private func normalizedStagePlotRotation(_ degrees: Double) -> Double {
+        let wrapped = degrees.truncatingRemainder(dividingBy: 360)
+        if wrapped > 180 { return wrapped - 360 }
+        if wrapped < -180 { return wrapped + 360 }
+        return wrapped
+    }
+
+    private func stagePlotRotationAngle(for location: CGPoint, in size: CGSize) -> Double {
+        let center = CGPoint(x: size.width / 2, y: size.height / 2)
+        let radians = atan2(location.y - center.y, location.x - center.x)
+        return normalizedStagePlotRotation((radians * 180 / .pi) + 90)
+    }
+
+    private func commitStagePlotRotation(_ rotation: Double, show: RunOfShowDocument, itemID: String) {
+        let normalized = normalizedStagePlotRotation(rotation)
+        stagePlotRotationDrafts[itemID] = normalized
+        updateStagePlotItem(show, itemID: itemID) { $0.rotationDegrees = normalized }
+        stagePlotRotationDrafts[itemID] = nil
+    }
+
+    private func nudgeStagePlotRotation(show: RunOfShowDocument, itemID: String, by degrees: Double = 15) {
+        guard let item = show.stagePlotItems.first(where: { $0.id == itemID }) else { return }
+        commitStagePlotRotation(item.rotationDegrees + degrees, show: show, itemID: itemID)
+    }
+
+    private func stagePlotRotationHotZone(item: RunOfShowStagePlotItem, show: RunOfShowDocument) -> some View {
+        GeometryReader { proxy in
+            ZStack {
+                ForEach(StagePlotRotationCorner.allCases) { corner in
+                    stagePlotRotationHandle(item: item, show: show, corner: corner, size: proxy.size)
+                }
+            }
+        }
+    }
+
+    private func stagePlotRotationHandle(
+        item: RunOfShowStagePlotItem,
+        show: RunOfShowDocument,
+        corner: StagePlotRotationCorner,
+        size: CGSize
+    ) -> some View {
+        Circle()
+            .fill(Color.clear)
+            .frame(width: 34, height: 34)
+            .overlay {
+                Circle()
+                    .fill(Color.white.opacity(activeStagePlotRotationItemID == item.id ? 1 : 0.94))
+                    .frame(width: 22, height: 22)
+                    .overlay(
+                        Image(systemName: "rotate.right.fill")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(Color.black.opacity(0.72))
+                            .rotationEffect(.degrees(corner.iconRotationDegrees))
+                    )
+                    .shadow(color: Color.black.opacity(0.22), radius: 4, y: 2)
+            }
+            .contentShape(Circle())
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: corner.alignment)
+            .offset(x: corner.offset.width, y: corner.offset.height)
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { value in
+                        activeStagePlotRotationItemID = item.id
+                        stagePlotRotationDrafts[item.id] = stagePlotRotationAngle(for: value.location, in: size)
+                    }
+                    .onEnded { value in
+                        defer { activeStagePlotRotationItemID = nil }
+                        commitStagePlotRotation(
+                            stagePlotRotationAngle(for: value.location, in: size),
+                            show: show,
+                            itemID: item.id
+                        )
+                    }
+            )
+            .simultaneousGesture(
+                TapGesture()
+                    .onEnded {
+                        activeStagePlotRotationItemID = nil
+                        nudgeStagePlotRotation(show: show, itemID: item.id)
+                    }
+            )
+    }
+
+    @ViewBuilder
+    private func stagePlotCanvasNode(_ item: RunOfShowStagePlotItem, isSelected: Bool) -> some View {
+        if item.role.usesSymbolArtwork {
+            VStack(spacing: 6) {
+                stagePlotCanvasArtwork(for: item.role, color: stagePlotColor(for: item.role))
+                    .frame(width: 46, height: 40)
+                Text(stagePlotItemTitle(item))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.black.opacity(isSelected ? 0.45 : 0.28))
+                    .clipShape(Capsule())
+            }
+            .padding(10)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color.white.opacity(isSelected ? 0.1 : 0.05))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color.white.opacity(isSelected ? 0.4 : 0.14), lineWidth: isSelected ? 2 : 1)
+            )
+        } else {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(stagePlotItemTitle(item))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                if !item.subtitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text(item.subtitle)
+                        .font(.caption2)
+                        .foregroundStyle(Color.white.opacity(0.72))
+                        .lineLimit(1)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .frame(minWidth: 96, maxWidth: 160, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(stagePlotColor(for: item.role).opacity(isSelected ? 0.95 : 0.78))
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func stagePlotCanvasArtwork(for role: RunOfShowStagePlotRole, color: Color) -> some View {
+        if let symbolName = role.systemImageName {
+            ZStack {
+                Circle()
+                    .fill(color.opacity(0.22))
+                    .frame(width: 38, height: 38)
+                Image(systemName: symbolName)
+                    .font(.system(size: 21, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+        } else {
+            EmptyView()
+        }
+    }
+
     private func overrunClock(seconds: Int) -> String {
         let minutes = max(seconds, 0) / 60
         let remainingSeconds = max(seconds, 0) % 60
         return String(format: "-%02d:%02d", minutes, remainingSeconds)
+    }
+}
+
+private struct MacStagePlotArchedFrontShape: Shape {
+    var curveDepth: CGFloat
+    var cornerRadius: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        let depth = max(12, min(rect.height * curveDepth, rect.height * 0.35))
+        let radius = min(cornerRadius, rect.width * 0.12, rect.height * 0.18)
+        let top = rect.minY
+        let left = rect.minX
+        let right = rect.maxX
+        let backBottom = rect.maxY - depth
+
+        var path = Path()
+        path.move(to: CGPoint(x: left + radius, y: top))
+        path.addLine(to: CGPoint(x: right - radius, y: top))
+        path.addQuadCurve(
+            to: CGPoint(x: right, y: top + radius),
+            control: CGPoint(x: right, y: top)
+        )
+        path.addLine(to: CGPoint(x: right, y: backBottom))
+        path.addQuadCurve(
+            to: CGPoint(x: left, y: backBottom),
+            control: CGPoint(x: rect.midX, y: rect.maxY + depth * 1.05)
+        )
+        path.addLine(to: CGPoint(x: left, y: top + radius))
+        path.addQuadCurve(
+            to: CGPoint(x: left + radius, y: top),
+            control: CGPoint(x: left, y: top)
+        )
+        path.closeSubpath()
+        return path
     }
 }
 
@@ -6017,6 +7956,24 @@ private struct MacWebVideoView: NSViewRepresentable {
     }
 }
 
+private struct CSVExportDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.commaSeparatedText] }
+
+    let data: Data
+
+    init(text: String) {
+        self.data = Data(text.utf8)
+    }
+
+    init(configuration: ReadConfiguration) throws {
+        self.data = configuration.file.regularFileContents ?? Data()
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: data)
+    }
+}
+
 private struct MacGearView: View {
     @EnvironmentObject private var store: ProdConnectStore
     @State private var selectedGearItem: GearItem?
@@ -6032,6 +7989,7 @@ private struct MacGearView: View {
     @State private var category = "Audio"
     @State private var status: GearItem.GearStatus = .available
     @State private var location = ""
+    @State private var room = ""
     @State private var campus = ""
     @State private var purchaseDate = Date()
     @State private var purchasedFrom = ""
@@ -6083,7 +8041,7 @@ private struct MacGearView: View {
     }
 
     private var allGearLocations: [String] {
-        Array(Set(store.gear.map(\.location))).filter { !$0.isEmpty }.sorted()
+        Array(Set(store.gear.map { gearCampusLabel($0) })).filter { $0 != "—" && !$0.isEmpty }.sorted()
     }
 
     private var filteredGear: [GearItem] {
@@ -6092,7 +8050,7 @@ private struct MacGearView: View {
             result = result.filter {
                 $0.name.localizedCaseInsensitiveContains(searchText) ||
                 $0.category.localizedCaseInsensitiveContains(searchText) ||
-                $0.location.localizedCaseInsensitiveContains(searchText)
+                gearCampusLabel($0).localizedCaseInsensitiveContains(searchText)
             }
         }
         if let selectedCategory {
@@ -6102,7 +8060,7 @@ private struct MacGearView: View {
             result = result.filter { $0.status == selectedStatus }
         }
         if let selectedLocation {
-            result = result.filter { $0.location == selectedLocation }
+            result = result.filter { gearCampusLabel($0) == selectedLocation }
         }
         return result
     }
@@ -6395,7 +8353,7 @@ private struct MacGearView: View {
         LazyVGrid(columns: columns, alignment: .leading, spacing: 0) {
             gearHeaderButton("Name", column: .name)
             gearHeaderButton("Category", column: .category)
-            gearHeaderButton("Campus", column: .campus)
+            gearHeaderButton("Location", column: .campus)
             gearHeaderButton("Status", column: .status)
         }
         .padding(.horizontal, 14)
@@ -6489,11 +8447,15 @@ private struct MacGearView: View {
     }
 
     private func gearCampusLabel(_ item: GearItem) -> String {
+        let location = item.location.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !location.isEmpty {
+            return location
+        }
         let campus = item.campus.trimmingCharacters(in: .whitespacesAndNewlines)
         if !campus.isEmpty {
             return campus
         }
-        let fallback = item.location.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = item.room.trimmingCharacters(in: .whitespacesAndNewlines)
         return fallback.isEmpty ? "—" : fallback
     }
 
@@ -6530,6 +8492,7 @@ private struct MacGearView: View {
         category = item.category.isEmpty ? "Audio" : item.category
         status = item.status
         location = item.location
+        room = item.room
         campus = item.campus
         purchaseDate = item.purchaseDate ?? Date()
         purchasedFrom = item.purchasedFrom
@@ -6608,13 +8571,20 @@ private struct MacGearView: View {
 
     private func exportGear() {
         guard !filteredGear.isEmpty else { return }
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async {
+                exportGear()
+            }
+            return
+        }
         isExporting = true
+        defer { isExporting = false }
 
         let header = [
             "Name",
             "Category",
             "Status",
-            "Campus",
+            "Location",
             "Room",
             "Serial Number",
             "Asset ID",
@@ -6627,8 +8597,8 @@ private struct MacGearView: View {
                 item.name,
                 item.category,
                 item.status.rawValue,
-                item.campus,
                 item.location,
+                item.room,
                 item.serialNumber,
                 item.assetId,
                 item.purchasedFrom,
@@ -6643,18 +8613,14 @@ private struct MacGearView: View {
         savePanel.allowedContentTypes = [.commaSeparatedText]
         savePanel.canCreateDirectories = true
 
+        guard savePanel.runModal() == .OK, let url = savePanel.url else { return }
+
         do {
-            guard savePanel.runModal() == .OK, let url = savePanel.url else {
-                isExporting = false
-                return
-            }
             try csv.write(to: url, atomically: true, encoding: .utf8)
         } catch {
             mergeResultMessage = "Export failed: \(error.localizedDescription)"
             showMergeResult = true
         }
-
-        isExporting = false
     }
 
     private func csvEscaped(_ value: String) -> String {
@@ -6666,6 +8632,7 @@ private struct MacGearView: View {
         category = "Audio"
         status = .available
         location = ""
+        room = ""
         campus = ""
         purchaseDate = Date()
         purchasedFrom = ""
@@ -6696,21 +8663,21 @@ private struct MacGearView: View {
                                 }
                             }
                             if store.locations.isEmpty {
-                                labeledTextField("Campus", text: $campus)
+                                labeledTextField("Location", text: $location)
                             } else {
-                                fieldHeader("Campus")
-                                Picker("Campus", selection: $campus) {
-                                    Text("Select campus").tag("")
+                                fieldHeader("Location")
+                                Picker("Location", selection: $location) {
+                                    Text("Select location").tag("")
                                     ForEach(store.locations.sorted(), id: \.self) { option in
                                         Text(option).tag(option)
                                     }
                                 }
                             }
                             if store.rooms.isEmpty {
-                                labeledTextField("Room", text: $location)
+                                labeledTextField("Room", text: $room)
                             } else {
                                 fieldHeader("Room")
-                                Picker("Room", selection: $location) {
+                                Picker("Room", selection: $room) {
                                     Text("Select room").tag("")
                                     ForEach(store.rooms.sorted(), id: \.self) { option in
                                         Text(option).tag(option)
@@ -6772,6 +8739,7 @@ private struct MacGearView: View {
                             purchasedFrom: purchasedFrom.trimmingCharacters(in: .whitespacesAndNewlines),
                             cost: Double(costText),
                             location: location.trimmingCharacters(in: .whitespacesAndNewlines),
+                            room: room.trimmingCharacters(in: .whitespacesAndNewlines),
                             serialNumber: serialNumber.trimmingCharacters(in: .whitespacesAndNewlines),
                             campus: campus.trimmingCharacters(in: .whitespacesAndNewlines),
                             assetId: assetId.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -6844,8 +8812,8 @@ private struct MacGearDetailView: View {
                 detailRow("Status", item.status.rawValue, valueColor: statusColor)
                 detailRow("Serial Number", item.serialNumber)
                 detailRow("Asset ID", item.assetId)
-                detailRow("Campus", item.campus)
-                detailRow("Room", item.location)
+                detailRow("Location", item.location)
+                detailRow("Room", item.room)
             }
 
             Section("Install Info") {
@@ -6972,6 +8940,8 @@ private struct MacTicketsView: View {
     @State private var exportStatusFilter = TicketReportStatusFilter.active.rawValue
     @State private var exportCampusFilter = ""
     @State private var exportAgentSelection = ""
+    @State private var exportCategoryFilter = ""
+    @State private var exportSubcategoryFilter = ""
     @State private var externalTicketFormEnabled = false
     @State private var externalTicketFormAccessKey = ""
     @State private var isSavingExternalTicketForm = false
@@ -7048,10 +9018,29 @@ private struct MacTicketsView: View {
         return values.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
     }
 
+    private var availableTicketReportCategories: [String] {
+        let values = Set(store.visibleTickets.map { $0.category.trimmingCharacters(in: .whitespacesAndNewlines) }).filter { !$0.isEmpty }
+        return values.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    private var availableTicketReportSubcategories: [String] {
+        let source = exportCategoryFilter.isEmpty
+            ? store.visibleTickets
+            : store.visibleTickets.filter { $0.category.trimmingCharacters(in: .whitespacesAndNewlines) == exportCategoryFilter }
+        let values = Set(source.map { $0.subcategory.trimmingCharacters(in: .whitespacesAndNewlines) }).filter { !$0.isEmpty }
+        return values.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
     private var reportTickets: [SupportTicket] {
         store.visibleTickets.filter { ticket in
             let campusMatches = exportCampusFilter.isEmpty
                 || ticket.campus.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(exportCampusFilter) == .orderedSame
+
+            let categoryMatches = exportCategoryFilter.isEmpty
+                || ticket.category.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(exportCategoryFilter) == .orderedSame
+
+            let subcategoryMatches = exportSubcategoryFilter.isEmpty
+                || ticket.subcategory.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(exportSubcategoryFilter) == .orderedSame
 
             let agentMatches: Bool
             if exportAgentSelection.isEmpty {
@@ -7079,7 +9068,7 @@ private struct MacTicketsView: View {
                 statusMatches = ticket.status == .inProgress
             }
 
-            return campusMatches && agentMatches && statusMatches
+            return campusMatches && categoryMatches && subcategoryMatches && agentMatches && statusMatches
         }
         .sorted { $0.createdAt > $1.createdAt }
     }
@@ -7279,6 +9268,28 @@ private struct MacTicketsView: View {
                     Picker("Status", selection: $exportStatusFilter) {
                         ForEach(TicketReportStatusFilter.allCases, id: \.rawValue) { option in
                             Text(option.title).tag(option.rawValue)
+                        }
+                    }
+
+                    Picker("Category", selection: $exportCategoryFilter) {
+                        Text("All Categories").tag("")
+                        ForEach(availableTicketReportCategories, id: \.self) { category in
+                            Text(category).tag(category)
+                        }
+                    }
+                    .onChange(of: exportCategoryFilter) { _ in
+                        // Clear subcategory if it no longer exists under the new category
+                        if !exportSubcategoryFilter.isEmpty && !availableTicketReportSubcategories.contains(exportSubcategoryFilter) {
+                            exportSubcategoryFilter = ""
+                        }
+                    }
+
+                    if !availableTicketReportSubcategories.isEmpty {
+                        Picker("Subcategory", selection: $exportSubcategoryFilter) {
+                            Text("All Subcategories").tag("")
+                            ForEach(availableTicketReportSubcategories, id: \.self) { sub in
+                                Text(sub).tag(sub)
+                            }
                         }
                     }
 
@@ -7800,6 +9811,7 @@ private struct MacTicketsView: View {
         "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
     }
 
+    @MainActor
     private func exportTicketReport() {
         guard !reportTickets.isEmpty else { return }
         isExportingTicketReport = true
@@ -11979,7 +13991,7 @@ private struct MacCustomizeView: View {
                     let (items, reachedCap) = payload
                     let filteredItems = filteredFreshserviceItems(items)
                     if reachedCap {
-                        freshserviceStatusMessage = "Connected to Freshservice. Found at least \(filteredItems.count) assets (20,000 asset cap reached)."
+                        freshserviceStatusMessage = "Connected to Freshservice. Found at least \(filteredItems.count) assets (2,000 asset test cap reached)."
                     } else {
                         freshserviceStatusMessage = "Connected to Freshservice. Found \(filteredItems.count) assets."
                     }
@@ -12029,19 +14041,41 @@ private struct MacCustomizeView: View {
                 switch result {
                 case .success(let payload):
                     let (items, reachedCap) = payload
+                    logFreshserviceAssetSample(items)
                     let filteredItems = filteredFreshserviceItems(items)
                     switch selectedDestination {
                     case .assetsTab:
-                        let imported = filteredItems.compactMap { mapFreshserviceAsset($0) }
-                        store.upsertGear(imported) { saveResult in
-                            isImportingFreshserviceData = false
-                            switch saveResult {
-                            case .success:
-                                freshserviceStatusMessage = reachedCap
-                                    ? "Imported \(imported.count) Freshservice \(selectedImportKind.rawValue) into Assets and Firebase. 20,000 asset cap reached."
-                                    : "Imported \(imported.count) Freshservice \(selectedImportKind.rawValue) into Assets and Firebase."
-                            case .failure(let error):
-                                freshserviceStatusMessage = "Import failed while saving assets: \(error.localizedDescription)"
+                        let saveAssets: ([[String: Any]]) -> Void = { importItems in
+                            let rawImported = importItems.compactMap { mapFreshserviceAsset($0) }
+                            // Deduplicate by ID — Freshservice can return the same asset on multiple pages
+                            var seen = Set<String>()
+                            let imported = rawImported.filter { seen.insert($0.id).inserted }
+                            store.upsertGear(imported) { saveResult in
+                                isImportingFreshserviceData = false
+                                switch saveResult {
+                                case .success:
+                                    freshserviceStatusMessage = reachedCap
+                                        ? "Imported \(imported.count) Freshservice \(selectedImportKind.rawValue) into Assets and Firebase. 20,000 asset cap reached."
+                                        : "Imported \(imported.count) Freshservice \(selectedImportKind.rawValue) into Assets and Firebase."
+                                case .failure(let error):
+                                    freshserviceStatusMessage = "Import failed while saving assets: \(error.localizedDescription)"
+                                }
+                            }
+                        }
+
+                        let resolveAndSave: ([[String: Any]]) -> Void = { assetsToResolve in
+                            resolveFreshserviceAssetLookups(assetsToResolve, apiKey: trimmedKey, apiUrl: trimmedURL) { resolvedItems in
+                                saveAssets(resolvedItems)
+                            }
+                        }
+
+                        if hasResolvedFreshserviceAssetFields(filteredItems) {
+                            resolveAndSave(filteredItems)
+                        } else {
+                            enrichFreshserviceAssets(filteredItems, apiKey: trimmedKey, apiUrl: trimmedURL) { enrichedItems in
+                                DispatchQueue.main.async {
+                                    resolveAndSave(enrichedItems)
+                                }
                             }
                         }
                     case .ticketsTab:
@@ -12051,7 +14085,7 @@ private struct MacCustomizeView: View {
                             switch saveResult {
                             case .success:
                                 freshserviceStatusMessage = reachedCap
-                                    ? "Imported \(imported.count) Freshservice \(selectedImportKind.rawValue) into Tickets and Firebase. 20,000 asset cap reached."
+                                    ? "Imported \(imported.count) Freshservice \(selectedImportKind.rawValue) into Tickets and Firebase. 30,000 asset cap reached."
                                     : "Imported \(imported.count) Freshservice \(selectedImportKind.rawValue) into Tickets and Firebase."
                             case .failure(let error):
                                 freshserviceStatusMessage = "Import failed while saving tickets: \(error.localizedDescription)"
@@ -12107,7 +14141,7 @@ private struct MacCustomizeView: View {
 
         switch selectedImportKind {
         case .assets:
-            MacFreshserviceAPI.fetchAllAssetsWithAPIKey(apiKey: trimmedKey, apiUrl: trimmedURL, completion: assetCompletion)
+            MacFreshserviceAPI.fetchAllAssetsForImportWithAPIKey(apiKey: trimmedKey, apiUrl: trimmedURL, completion: assetCompletion)
         case .tickets:
             MacFreshserviceAPI.fetchAllTicketsWithAPIKey(apiKey: trimmedKey, apiUrl: trimmedURL, completion: ticketCompletion)
         }
@@ -12123,6 +14157,230 @@ private struct MacCustomizeView: View {
             return items.filter { shouldIncludeFreshserviceTicket($0) }
         }
     }
+
+    private func logFreshserviceAssetSample(_ items: [[String: Any]]) {
+        guard selectedImportKind == .assets, let first = items.first else { return }
+        let sortedKeys = first.keys.sorted()
+        print("Freshservice asset sample keys:", sortedKeys.joined(separator: ", "))
+        if let typeFields = first["type_fields"] as? [String: Any] {
+            let tfKeys = typeFields.keys.sorted()
+            print("Freshservice type_fields keys:", tfKeys.joined(separator: ", "))
+            for key in tfKeys {
+                print("  type_fields[\(key)]:", String(describing: typeFields[key]!))
+            }
+        } else {
+            print("Freshservice type_fields: not present (include=type_fields may not be supported on list endpoint)")
+        }
+    }
+
+    private func hasResolvedFreshserviceAssetFields(_ assets: [[String: Any]]) -> Bool {
+        guard let first = assets.first else { return false }
+
+        // Freshservice v2 API returns only IDs (location_id, asset_type_id) — never embedded
+        // name objects or flat name strings. Per-asset detail fetches return the same structure,
+        // so enrichment cannot resolve names. Skip it and let resolveFreshserviceAssetLookups
+        // handle resolution via the /locations and /asset_types endpoints instead.
+        let hasIDOnlyFields = stringValue(first["location_id"]) != nil
+            || stringValue(first["asset_type_id"]) != nil
+        if hasIDOnlyFields { return true }
+
+        let resolvedFields = [
+            nestedStringValue(first["asset_type"], key: "name"),
+            stringValue(first["asset_type_name"]),
+            stringValue(first["ci_type_name"]),
+            stringValue(first["config_item_type_name"]),
+            nestedStringValue(first["location"], key: "name"),
+            stringValue(first["location_name"]),
+            nestedStringValue(first["department"], key: "name"),
+            stringValue(first["department_name"]),
+            nestedStringValue(first["asset_state"], key: "name"),
+            stringValue(first["asset_state_name"]),
+            stringValue(first["state_name"])
+        ]
+
+        return resolvedFields
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .contains { !$0.isEmpty }
+    }
+
+    private func resolveFreshserviceAssetLookups(
+        _ assets: [[String: Any]],
+        apiKey: String,
+        apiUrl: String,
+        completion: @escaping ([[String: Any]]) -> Void
+    ) {
+        let group = DispatchGroup()
+        var locationMap = [String: String]()
+        var assetTypeMap = [String: String]()
+
+        group.enter()
+        MacFreshserviceAPI.fetchLocationsWithAPIKey(apiKey: apiKey, apiUrl: apiUrl) { result in
+            if case .success(let map) = result { locationMap = map }
+            group.leave()
+        }
+
+        group.enter()
+        MacFreshserviceAPI.fetchAssetTypesWithAPIKey(apiKey: apiKey, apiUrl: apiUrl) { result in
+            if case .success(let map) = result { assetTypeMap = map }
+            group.leave()
+        }
+
+        group.notify(queue: .main) {
+            let resolved = assets.map { asset -> [String: Any] in
+                var enriched = asset
+
+                // Resolve top-level location_id → location_name
+                if stringValue(asset["location_name"]) == nil,
+                   let locID = stringValue(asset["location_id"]),
+                   let locName = locationMap[locID] {
+                    enriched["location_name"] = locName
+                }
+
+                // Resolve asset_type_id → asset_type_name
+                if stringValue(asset["asset_type_name"]) == nil,
+                   let typeID = stringValue(asset["asset_type_id"]),
+                   let typeName = assetTypeMap[typeID] {
+                    enriched["asset_type_name"] = typeName
+                }
+
+                // Resolve any type_fields values that are numeric location IDs
+                // (e.g. lf_physical_room_location_* stores a location_id integer)
+                if var typeFields = enriched["type_fields"] as? [String: Any] {
+                    for (key, value) in typeFields {
+                        let idStr: String?
+                        if let n = value as? Int { idStr = String(n) }
+                        else if let s = value as? String, s.allSatisfy({ $0.isNumber }), !s.isEmpty { idStr = s }
+                        else { idStr = nil }
+
+                        if let id = idStr, let name = locationMap[id] {
+                            typeFields[key] = name
+                        }
+                    }
+                    enriched["type_fields"] = typeFields
+                }
+
+                return enriched
+            }
+            completion(resolved)
+        }
+    }
+
+    private func enrichFreshserviceAssets(
+        _ assets: [[String: Any]],
+        apiKey: String,
+        apiUrl: String,
+        completion: @escaping ([[String: Any]]) -> Void
+    ) {
+        let indexedAssets = assets.enumerated().compactMap { index, asset -> (Int, [String], [String: Any])? in
+            let identifiers = [
+                stringValue(asset["display_id"]),
+                stringValue(asset["id"]),
+                stringValue(asset["asset_tag"])
+            ]
+            .compactMap { $0 }
+            .reduce(into: [String]()) { partialResult, identifier in
+                if !partialResult.contains(identifier) {
+                    partialResult.append(identifier)
+                }
+            }
+
+            guard !identifiers.isEmpty else { return nil }
+            return (index, identifiers, asset)
+        }
+        guard !indexedAssets.isEmpty else {
+            completion(assets)
+            return
+        }
+
+        let maxConcurrentRequests = 8
+        let syncQueue = DispatchQueue(label: "MacFreshserviceAssetEnrichmentSync")
+        var nextIndex = 0
+        var activeRequests = 0
+        var didComplete = false
+        var enrichedAssets = assets
+
+        func finishIfNeeded() {
+            guard !didComplete else { return }
+            if nextIndex >= indexedAssets.count && activeRequests == 0 {
+                didComplete = true
+                DispatchQueue.main.async {
+                    completion(enrichedAssets)
+                }
+            }
+        }
+
+        func launchMoreRequests() {
+            guard !didComplete else { return }
+            while activeRequests < maxConcurrentRequests && nextIndex < indexedAssets.count {
+                let (assetIndex, identifiers, originalAsset) = indexedAssets[nextIndex]
+                nextIndex += 1
+                activeRequests += 1
+
+                fetchFreshserviceAssetDetails(
+                    identifiers: identifiers,
+                    apiKey: apiKey,
+                    apiUrl: apiUrl
+                ) { result in
+                    syncQueue.async {
+                        defer {
+                            activeRequests -= 1
+                            launchMoreRequests()
+                            finishIfNeeded()
+                        }
+
+                        guard !didComplete else { return }
+                        guard case .success(let detail) = result else { return }
+
+                        var merged = originalAsset
+                        merged.merge(detail) { _, new in new }
+                        enrichedAssets[assetIndex] = merged
+                    }
+                }
+            }
+        }
+
+        syncQueue.async {
+            launchMoreRequests()
+            finishIfNeeded()
+        }
+    }
+
+    private func fetchFreshserviceAssetDetails(
+        identifiers: [String],
+        apiKey: String,
+        apiUrl: String,
+        completion: @escaping (Result<[String: Any], Error>) -> Void
+    ) {
+        guard let identifier = identifiers.first else {
+            completion(.failure(NSError(
+                domain: "Freshservice",
+                code: 0,
+                userInfo: [NSLocalizedDescriptionKey: "No Freshservice asset identifier was available."]
+            )))
+            return
+        }
+
+        MacFreshserviceAPI.fetchAssetDetailsWithAPIKey(apiKey: apiKey, apiUrl: apiUrl, assetID: identifier) { result in
+            switch result {
+            case .success:
+                completion(result)
+            case .failure:
+                let remaining = Array(identifiers.dropFirst())
+                guard !remaining.isEmpty else {
+                    completion(result)
+                    return
+                }
+                fetchFreshserviceAssetDetails(
+                    identifiers: remaining,
+                    apiKey: apiKey,
+                    apiUrl: apiUrl,
+                    completion: completion
+                )
+            }
+        }
+    }
+
+
 
     private func refreshManagedByGroupOptions() {
         let trimmedURL = freshserviceAPIURL.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -12151,7 +14409,7 @@ private struct MacCustomizeView: View {
                     if managedByGroupOptions.isEmpty {
                         freshserviceStatusMessage = "Connected to Freshservice. No managed-by groups were found."
                     } else if reachedCap {
-                        freshserviceStatusMessage = "Loaded \(managedByGroupOptions.count) managed-by groups from the first 20,000 assets."
+                        freshserviceStatusMessage = "Loaded \(managedByGroupOptions.count) managed-by groups from the first 30,000 assets."
                     } else {
                         freshserviceStatusMessage = "Loaded \(managedByGroupOptions.count) managed-by groups from Freshservice."
                     }
@@ -12190,35 +14448,77 @@ private struct MacCustomizeView: View {
             ?? stringValue(asset["display_name"])
             ?? nestedStringValue(asset["product"], key: "name")
             ?? "Freshservice Asset"
+        let category = freshserviceAssetTypeName(from: asset) ?? "Freshservice"
+        let location = freshserviceLocationName(from: asset) ?? ""
+        let campus = freshserviceCampusName(from: asset) ?? location
+        let room = typeFieldValue(from: asset, prefix: "lf_physical_room_location") ?? ""
 
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return nil
         }
 
+        let serialNumber = stringValue(asset["serial_number"])
+            ?? typeFieldValue(from: asset, prefix: "serial_number")
+            ?? ""
+
         var item = GearItem(
             id: freshserviceID.map { "freshservice-\($0)" } ?? UUID().uuidString,
             name: name,
-            category: nestedStringValue(asset["asset_type"], key: "name")
-                ?? nestedStringValue(asset["product"], key: "name")
-                ?? stringValue(asset["asset_type_name"])
-                ?? "Freshservice",
+            category: category,
             status: mappedStatus(from: asset),
             teamCode: store.teamCode ?? "",
-            location: nestedStringValue(asset["location"], key: "name")
-                ?? nestedStringValue(asset["department"], key: "name")
-                ?? "",
-            serialNumber: stringValue(asset["serial_number"]) ?? "",
-            campus: nestedStringValue(asset["department"], key: "name") ?? "",
+            location: location,
+            room: room,
+            serialNumber: serialNumber,
+            campus: campus,
             assetId: stringValue(asset["asset_tag"]) ?? stringValue(asset["display_id"]) ?? "",
             maintenanceNotes: stringValue(asset["description"]) ?? "",
             createdBy: "Freshservice Import"
         )
 
-        item.purchasedFrom = nestedStringValue(asset["vendor"], key: "name") ?? ""
-        item.purchaseDate = parsedDate(from: asset["purchase_date"]) ?? parsedDate(from: asset["created_at"])
+        item.purchasedFrom = typeFieldValue(from: asset, prefix: "purchase_from")
+            ?? nestedStringValue(asset["vendor"], key: "name")
+            ?? ""
+        item.purchaseDate = parsedDate(from: typeFieldValue(from: asset, prefix: "acquisition_date"))
+            ?? parsedDate(from: asset["purchase_date"])
+            ?? parsedDate(from: asset["created_at"])
         item.installDate = parsedDate(from: asset["created_at"])
-        item.cost = doubleValue(asset["cost"]) ?? doubleValue(asset["salvage_price"])
+        item.cost = doubleValue(typeFieldValue(from: asset, prefix: "cost"))
+            ?? doubleValue(asset["cost"])
+            ?? doubleValue(asset["salvage_price"])
         return item
+    }
+
+    private func freshserviceAssetTypeName(from asset: [String: Any]) -> String? {
+        [
+            nestedStringValue(asset["asset_type"], key: "name"),
+            stringValue(asset["asset_type_name"]),
+            stringValue(asset["ci_type_name"]),
+            stringValue(asset["config_item_type_name"]),
+            nestedStringValue(asset["product"], key: "name")
+        ]
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .first { !$0.isEmpty }
+    }
+
+    private func freshserviceLocationName(from asset: [String: Any]) -> String? {
+        [
+            nestedStringValue(asset["location"], key: "name"),
+            stringValue(asset["location_name"])
+        ]
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .first { !$0.isEmpty }
+    }
+
+    private func freshserviceCampusName(from asset: [String: Any]) -> String? {
+        [
+            nestedStringValue(asset["department"], key: "name"),
+            stringValue(asset["department_name"]),
+            nestedStringValue(asset["location"], key: "name"),
+            stringValue(asset["location_name"])
+        ]
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .first { !$0.isEmpty }
     }
 
     private func mapFreshserviceTicket(_ ticket: [String: Any]) -> SupportTicket? {
@@ -12298,18 +14598,25 @@ private struct MacCustomizeView: View {
     }
 
     private func mappedStatus(from asset: [String: Any]) -> GearItem.GearStatus {
+        // Asset state lives in type_fields with a tenant-suffixed key, e.g. "asset_state_37000348776"
         let raw = (
-            nestedStringValue(asset["state"], key: "name")
+            typeFieldValue(from: asset, prefix: "asset_state")
+            ?? nestedStringValue(asset["asset_state"], key: "name")
+            ?? stringValue(asset["asset_state_name"])
+            ?? nestedStringValue(asset["state"], key: "name")
             ?? nestedStringValue(asset["ci_status"], key: "name")
-            ?? stringValue(asset["usage_type"])
+            ?? stringValue(asset["state_name"])
+            ?? stringValue(asset["ci_status_name"])
             ?? stringValue(asset["status"])
             ?? ""
         ).lowercased()
 
         if raw.contains("repair") || raw.contains("maint") { return .needsRepair }
-        if raw.contains("retired") { return .retired }
+        if raw.contains("retired") || raw.contains("disposal") { return .retired }
         if raw.contains("missing") || raw.contains("lost") { return .missing }
-        if raw.contains("use") || raw.contains("deployed") || raw.contains("assigned") || raw.contains("checkout") { return .inUse }
+        if raw.contains("checkout") || raw.contains("checked out") { return .checkedOut }
+        if raw.contains("use") || raw.contains("deployed") || raw.contains("assigned") || raw.contains("loaner") { return .inUse }
+        if raw.contains("stock") || raw.contains("available") || raw.contains("store") || raw.contains("spare") { return .available }
         return .available
     }
 
@@ -12410,6 +14717,16 @@ private struct MacCustomizeView: View {
         return stringValue(dictionary[key])
     }
 
+    /// Finds the first value in `type_fields` whose key starts with `prefix` (Freshservice
+    /// appends a numeric tenant ID suffix to all type field keys, e.g. "asset_state_37000348776").
+    private func typeFieldValue(from asset: [String: Any], prefix: String) -> String? {
+        guard let typeFields = asset["type_fields"] as? [String: Any] else { return nil }
+        for (key, value) in typeFields where key.hasPrefix(prefix) {
+            if let str = stringValue(value) { return str }
+        }
+        return nil
+    }
+
     private func doubleValue(_ value: Any?) -> Double? {
         if let number = value as? NSNumber { return number.doubleValue }
         if let string = value as? String {
@@ -12471,6 +14788,7 @@ private struct MacCustomizeView: View {
                 case "name": item.name = value
                 case "category": item.category = value
                 case "location": item.location = value
+                case "room": item.room = value
                 case "campus": item.campus = value
                 case "serial", "serialnumber": item.serialNumber = value
                 case "asset id", "assetid": item.assetId = value
@@ -12525,10 +14843,14 @@ private struct MacCustomizeView: View {
                 guard index < values.count else { continue }
                 let value = values[index].trimmingCharacters(in: .whitespaces)
 
-                switch header.lowercased() {
+                switch header
+                    .replacingOccurrences(of: "\u{FEFF}", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased() {
                 case "name": row.name = value
                 case "input": row.input = value
                 case "output": row.output = value
+                case "notes", "note", "comments", "comment": row.notes = value
                 case "category": row.category = value
                 case "campus": row.campus = value
                 case "room": row.room = value
@@ -12538,6 +14860,7 @@ private struct MacCustomizeView: View {
             }
 
             if !row.name.isEmpty {
+                row.position = rows.count
                 rows.append(row)
             }
         }
@@ -13427,6 +15750,7 @@ private struct MacAccountView: View {
 }
 
 private struct MacSubscriptionOptionsView: View {
+    @EnvironmentObject private var store: ProdConnectStore
     @Environment(\.dismiss) private var dismiss
     @State private var basicProduct: Product?
     @State private var basicTicketingProduct: Product?
@@ -13444,6 +15768,13 @@ private struct MacSubscriptionOptionsView: View {
     let onPurchasePremiumTicketing: () async -> Void
     let onRestorePurchases: () async -> Void
 
+    private var shouldHighlightIntroOffer: Bool {
+        guard currentTier == "free" else { return false }
+        guard let user = store.user else { return false }
+        let distinctMemberIDs = Set(store.teamMembers.map(\.id))
+        return distinctMemberIDs.isEmpty || distinctMemberIDs == [user.id]
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -13454,10 +15785,21 @@ private struct MacSubscriptionOptionsView: View {
                     Text("Choose the plan that fits your production team. Subscriptions renew automatically unless canceled in your Apple account settings.")
                         .foregroundStyle(.secondary)
 
+                    if shouldHighlightIntroOffer {
+                        Text("Start with a 7-day free trial on any plan.")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.green)
+
+                        Text("Available for new individual subscriptions. Team members on someone else’s account are not eligible.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+
                     subscriptionCard(
                         title: basicProduct?.displayName ?? "Basic",
                         subtitle: "$99.99. Includes chat and training, but hides Locations, Rooms, and Tickets.",
                         price: priceText(for: basicProduct),
+                        offerText: introductoryOfferText(for: basicProduct),
                         buttonTitle: currentTier == "basic" ? "Current Plan" : "Choose Basic",
                         isPrimary: true,
                         isDisabled: isPurchasing || currentTier == "basic" || currentTier == "basic_ticketing" || currentTier == "premium" || currentTier == "premium_ticketing"
@@ -13469,6 +15811,7 @@ private struct MacSubscriptionOptionsView: View {
                         title: basicTicketingProduct?.displayName ?? "Basic W/Ticketing",
                         subtitle: "$199.99. Includes chat, training, and Tickets, but hides Locations and Rooms.",
                         price: priceText(for: basicTicketingProduct),
+                        offerText: introductoryOfferText(for: basicTicketingProduct),
                         buttonTitle: currentTier == "basic_ticketing" ? "Current Plan" : "Choose Basic W/Ticketing",
                         isPrimary: false,
                         isDisabled: isPurchasing || currentTier == "basic_ticketing" || currentTier == "premium" || currentTier == "premium_ticketing"
@@ -13480,6 +15823,7 @@ private struct MacSubscriptionOptionsView: View {
                         title: premiumProduct?.displayName ?? "Premium",
                         subtitle: "$249.99. Includes everything except Tickets.",
                         price: priceText(for: premiumProduct),
+                        offerText: introductoryOfferText(for: premiumProduct),
                         buttonTitle: currentTier == "premium" ? "Current Plan" : "Choose Premium",
                         isPrimary: false,
                         isDisabled: isPurchasing || currentTier == "premium" || currentTier == "premium_ticketing"
@@ -13491,6 +15835,7 @@ private struct MacSubscriptionOptionsView: View {
                         title: premiumTicketingProduct?.displayName ?? "Premium W/Ticketing",
                         subtitle: "$499.99. Includes every feature.",
                         price: priceText(for: premiumTicketingProduct),
+                        offerText: introductoryOfferText(for: premiumTicketingProduct),
                         buttonTitle: currentTier == "premium_ticketing" ? "Current Plan" : "Choose Premium W/Ticketing",
                         isPrimary: false,
                         isDisabled: isPurchasing || currentTier == "premium_ticketing"
@@ -13534,6 +15879,7 @@ private struct MacSubscriptionOptionsView: View {
         title: String,
         subtitle: String,
         price: String,
+        offerText: String?,
         buttonTitle: String,
         isPrimary: Bool,
         isDisabled: Bool,
@@ -13544,6 +15890,11 @@ private struct MacSubscriptionOptionsView: View {
                 .font(.headline)
             Text(price)
                 .font(.subheadline.weight(.medium))
+            if let offerText {
+                Text(offerText)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.green)
+            }
             Text(subtitle)
                 .font(.footnote)
                 .foregroundStyle(.secondary)
@@ -13591,6 +15942,42 @@ private struct MacSubscriptionOptionsView: View {
             return "Loading pricing..."
         }
         return product?.displayPrice ?? "Available in App Store"
+    }
+
+    private func introductoryOfferText(for product: Product?) -> String? {
+        guard shouldHighlightIntroOffer else { return nil }
+        guard let offer = product?.subscription?.introductoryOffer else {
+            return "Includes a 7-day free trial for new subscribers."
+        }
+
+        let periodText = subscriptionPeriodText(value: offer.period.value, unit: offer.period.unit)
+        switch offer.paymentMode {
+        case .freeTrial:
+            return "Includes \(periodText) free trial for new subscribers."
+        case .payAsYouGo:
+            return "Intro offer: \(offer.displayPrice) for \(periodText)."
+        case .payUpFront:
+            return "Intro offer: \(offer.displayPrice) upfront for \(periodText)."
+        default:
+            return "Intro offer available for new subscribers."
+        }
+    }
+
+    private func subscriptionPeriodText(value: Int, unit: Product.SubscriptionPeriod.Unit) -> String {
+        let resolvedUnit: String
+        switch unit {
+        case .day:
+            resolvedUnit = value == 1 ? "day" : "days"
+        case .week:
+            resolvedUnit = value == 1 ? "week" : "weeks"
+        case .month:
+            resolvedUnit = value == 1 ? "month" : "months"
+        case .year:
+            resolvedUnit = value == 1 ? "year" : "years"
+        @unknown default:
+            resolvedUnit = "period"
+        }
+        return "\(value) \(resolvedUnit)"
     }
 
     private func runPurchase(_ action: @escaping () async -> Void) async {

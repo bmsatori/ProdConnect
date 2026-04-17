@@ -16,6 +16,7 @@ struct GearItem: Identifiable, Codable {
     var purchasedFrom: String = ""
     var cost: Double?
     var location: String = ""
+    var room: String = ""
     var serialNumber: String = ""
     var campus: String = ""
     var assetId: String = ""
@@ -39,6 +40,7 @@ struct GearItem: Identifiable, Codable {
         case purchasedFrom
         case cost
         case location
+        case room
         case serialNumber
         case campus
         case assetId
@@ -63,6 +65,7 @@ struct GearItem: Identifiable, Codable {
         purchasedFrom: String = "",
         cost: Double? = nil,
         location: String = "",
+        room: String = "",
         serialNumber: String = "",
         campus: String = "",
         assetId: String = "",
@@ -85,6 +88,7 @@ struct GearItem: Identifiable, Codable {
         self.purchasedFrom = purchasedFrom
         self.cost = cost
         self.location = location
+        self.room = room
         self.serialNumber = serialNumber
         self.campus = campus
         self.assetId = assetId
@@ -110,6 +114,7 @@ struct GearItem: Identifiable, Codable {
         purchasedFrom = try container.decodeIfPresent(String.self, forKey: .purchasedFrom) ?? ""
         cost = try container.decodeIfPresent(Double.self, forKey: .cost)
         location = try container.decodeIfPresent(String.self, forKey: .location) ?? ""
+        room = try container.decodeIfPresent(String.self, forKey: .room) ?? ""
         serialNumber = try container.decodeIfPresent(String.self, forKey: .serialNumber) ?? ""
         campus = try container.decodeIfPresent(String.self, forKey: .campus) ?? ""
         assetId = try container.decodeIfPresent(String.self, forKey: .assetId) ?? ""
