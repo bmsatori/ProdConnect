@@ -667,7 +667,7 @@ struct MacRootView: View {
             case .tickets:
                 return store.canUseTickets
             case .users:
-                return false
+                return store.user?.isAdmin == true || store.user?.isOwner == true
             default:
                 return true
             }
@@ -1223,6 +1223,11 @@ private struct MacChatView: View {
     @State private var previewAttachment: MacChatAttachmentPreviewItem?
     @State private var isUploadingAttachment = false
     @State private var attachmentError: String?
+    @State private var channelSettingsDraft: ChatChannel?
+
+    private var canManageChannels: Bool {
+        store.user?.isAdmin == true || store.user?.isOwner == true
+    }
 
     private var currentEmail: String? {
         store.user?.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -1231,6 +1236,14 @@ private struct MacChatView: View {
     private var groupChannels: [ChatChannel] {
         store.channels
             .filter { $0.kind == .group }
+            .filter { channel in
+                guard !canManageChannels, let currentEmail else { return true }
+                if channel.isHidden { return false }
+                let hiddenUsers = Set(channel.hiddenUserEmails.map {
+                    $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                })
+                return !hiddenUsers.contains(currentEmail)
+            }
             .sorted { $0.position < $1.position }
     }
 
@@ -1282,7 +1295,22 @@ private struct MacChatView: View {
     }
 
     private var selectedChannel: ChatChannel? {
-        store.channels.first(where: { $0.id == selectedChannelID }) ?? groupChannels.first ?? directChannels.first
+        let visibleChannels = groupChannels + directChannels
+        return visibleChannels.first(where: { $0.id == selectedChannelID }) ?? groupChannels.first ?? directChannels.first
+    }
+
+    private func canSendMessages(in channel: ChatChannel) -> Bool {
+        if canManageChannels { return true }
+        guard let currentEmail else { return false }
+        if channel.isReadOnly { return false }
+        let readOnlyUsers = Set(channel.readOnlyUserEmails.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        })
+        return !readOnlyUsers.contains(currentEmail)
+    }
+
+    private func canEditOrDeleteMessages(in channel: ChatChannel) -> Bool {
+        canManageChannels || canSendMessages(in: channel)
     }
 
     var body: some View {
@@ -1306,6 +1334,7 @@ private struct MacChatView: View {
                             newChannelName = ""
                         }
                     }
+                    .disabled(!canManageChannels)
                     List(selection: $selectedChannelID) {
                         Section("Channels") {
                             ForEach(groupChannels) { channel in
@@ -1382,12 +1411,12 @@ private struct MacChatView: View {
                                                         Button("Edit") {
                                                             beginEditing(message)
                                                         }
-                                                        .disabled(channel.isReadOnly)
+                                                        .disabled(!canEditOrDeleteMessages(in: channel))
 
                                                         Button("Delete", role: .destructive) {
                                                             pendingDeleteMessage = message
                                                         }
-                                                        .disabled(channel.isReadOnly)
+                                                        .disabled(!canEditOrDeleteMessages(in: channel))
                                                     }
                                                     .id(message.id)
                                                 }
@@ -1430,7 +1459,7 @@ private struct MacChatView: View {
                                         Image(systemName: "photo.on.rectangle")
                                     }
                                     .buttonStyle(.plain)
-                                    .disabled(channel.isReadOnly || isUploadingAttachment || editingMessageID != nil)
+                                    .disabled(!canSendMessages(in: channel) || isUploadingAttachment || editingMessageID != nil)
 
                                     Button {
                                         pickAttachment(allowedTypes: [.data], preferredKind: .file)
@@ -1438,7 +1467,7 @@ private struct MacChatView: View {
                                         Image(systemName: "paperclip")
                                     }
                                     .buttonStyle(.plain)
-                                    .disabled(channel.isReadOnly || isUploadingAttachment || editingMessageID != nil)
+                                    .disabled(!canSendMessages(in: channel) || isUploadingAttachment || editingMessageID != nil)
 
                                     TextField("Message", text: $draftMessage)
                                         .onSubmit {
@@ -1454,7 +1483,7 @@ private struct MacChatView: View {
                                         saveMessage(in: channel)
                                     }
                                     .controlSize(.large)
-                                    .disabled(channel.isReadOnly || isUploadingAttachment)
+                                    .disabled(!canSendMessages(in: channel) || isUploadingAttachment)
                                 }
 
                                 if isUploadingAttachment {
@@ -1468,6 +1497,13 @@ private struct MacChatView: View {
                                         .foregroundStyle(.red)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 }
+
+                                if !canSendMessages(in: channel) {
+                                    Text("Read-only channel. Only admins can post.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.top, 16)
@@ -1478,6 +1514,17 @@ private struct MacChatView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                         .navigationTitle(channelTitle(channel))
                         .background(Color.clear)
+                        .toolbar {
+                            if canManageChannels && channel.kind == .group {
+                                ToolbarItem(placement: .primaryAction) {
+                                    Button {
+                                        channelSettingsDraft = channel
+                                    } label: {
+                                        Image(systemName: "slider.horizontal.3")
+                                    }
+                                }
+                            }
+                        }
                         .alert("Delete Message?", isPresented: isShowingDeleteMessageAlert, presenting: pendingDeleteMessage) { message in
                             Button("Cancel", role: .cancel) { }
                             Button("Delete", role: .destructive) {
@@ -1503,6 +1550,12 @@ private struct MacChatView: View {
         }
         .sheet(item: $previewAttachment) { item in
             MacChatAttachmentPreviewView(item: item)
+        }
+        .sheet(item: $channelSettingsDraft) { draft in
+            MacChannelSettingsView(channel: draft) { updated in
+                store.saveChannel(updated)
+                selectedChannelID = updated.id
+            }
         }
     }
 
@@ -1619,6 +1672,7 @@ private struct MacChatView: View {
     }
 
     private func beginEditing(_ message: ChatMessage) {
+        guard let channel = selectedChannel, canEditOrDeleteMessages(in: channel) else { return }
         editingMessageID = message.id
         draftMessage = message.text
         attachmentError = nil
@@ -1632,6 +1686,7 @@ private struct MacChatView: View {
     }
 
     private func saveMessage(in channel: ChatChannel) {
+        guard canSendMessages(in: channel) else { return }
         let text = draftMessage.trimmingCharacters(in: .whitespacesAndNewlines)
         if let currentEditingMessageID = editingMessageID,
            let index = channel.messages.firstIndex(where: { $0.id == currentEditingMessageID }) {
@@ -1694,6 +1749,7 @@ private struct MacChatView: View {
     }
 
     private func deleteMessage(_ message: ChatMessage, from channel: ChatChannel) {
+        guard canEditOrDeleteMessages(in: channel) else { return }
         var updated = channel
         updated.messages.removeAll { $0.id == message.id }
         updated.lastMessageAt = updated.messages.last?.timestamp
@@ -1844,6 +1900,99 @@ private struct MacChatView: View {
                 reader.scrollTo(lastMessageID, anchor: .bottom)
             }
         }
+    }
+}
+
+private struct MacChannelSettingsView: View {
+    @EnvironmentObject private var store: ProdConnectStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var channel: ChatChannel
+    @State private var channelName: String
+    let onSave: (ChatChannel) -> Void
+
+    init(channel: ChatChannel, onSave: @escaping (ChatChannel) -> Void) {
+        _channel = State(initialValue: channel)
+        _channelName = State(initialValue: channel.name)
+        self.onSave = onSave
+    }
+
+    private var trimmedChannelName: String {
+        channelName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Details") {
+                    TextField("Channel Name", text: $channelName)
+                }
+
+                Section("Permissions") {
+                    Toggle("Read-only for non-admins", isOn: $channel.isReadOnly)
+                    Toggle("Hidden from non-admins", isOn: $channel.isHidden)
+                }
+
+                Section("Read-only users") {
+                    ForEach(store.teamMembers) { member in
+                        Toggle(isOn: Binding(
+                            get: {
+                                channel.readOnlyUserEmails.contains(member.email)
+                            },
+                            set: { isOn in
+                                if isOn {
+                                    if !channel.readOnlyUserEmails.contains(member.email) {
+                                        channel.readOnlyUserEmails.append(member.email)
+                                    }
+                                } else {
+                                    channel.readOnlyUserEmails.removeAll { $0 == member.email }
+                                }
+                            }
+                        )) {
+                            Text(member.displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? member.email : member.displayName)
+                        }
+                    }
+                }
+
+                Section("Hidden users") {
+                    ForEach(store.teamMembers) { member in
+                        Toggle(isOn: Binding(
+                            get: {
+                                channel.hiddenUserEmails.contains(member.email)
+                            },
+                            set: { isOn in
+                                if isOn {
+                                    if !channel.hiddenUserEmails.contains(member.email) {
+                                        channel.hiddenUserEmails.append(member.email)
+                                    }
+                                } else {
+                                    channel.hiddenUserEmails.removeAll { $0 == member.email }
+                                }
+                            }
+                        )) {
+                            Text(member.displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? member.email : member.displayName)
+                        }
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            .navigationTitle("Channel Settings")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        channel.name = trimmedChannelName
+                        onSave(channel)
+                        dismiss()
+                    }
+                    .disabled(trimmedChannelName.isEmpty)
+                }
+            }
+        }
+        .frame(minWidth: 520, minHeight: 620)
     }
 }
 
@@ -2442,11 +2591,39 @@ enum MacNDIFeedSourceType: String, CaseIterable, Codable, Identifiable {
     }
 }
 
+enum MacTicketNDIStatusFilter: String, CaseIterable, Codable, Identifiable {
+    case all = "All Tickets"
+    case new = "New"
+    case open = "Open"
+    case inProgress = "Pending"
+    case resolved = "Resolved"
+
+    var id: String { rawValue }
+
+    var title: String { rawValue }
+
+    func matches(_ status: TicketStatus) -> Bool {
+        switch self {
+        case .all:
+            return true
+        case .new:
+            return status == .new
+        case .open:
+            return status == .open
+        case .inProgress:
+            return status == .inProgress
+        case .resolved:
+            return status == .resolved
+        }
+    }
+}
+
 struct MacNDIFeedConfiguration: Identifiable, Codable, Equatable {
     var id: String = UUID().uuidString
     var title: String = "ProdConnect Feed"
     var sourceType: MacNDIFeedSourceType = .patchsheet
     var category: String = "Audio"
+    var ticketStatusFilter: MacTicketNDIStatusFilter = .all
     var runOfShowID: String?
     var isLive = false
     var showsHeaders = true
@@ -2458,6 +2635,7 @@ struct MacNDIFeedConfiguration: Identifiable, Codable, Equatable {
         case title
         case sourceType
         case category
+        case ticketStatusFilter
         case runOfShowID
         case isLive
         case showsHeaders
@@ -2470,6 +2648,7 @@ struct MacNDIFeedConfiguration: Identifiable, Codable, Equatable {
         title: String = "ProdConnect Feed",
         sourceType: MacNDIFeedSourceType = .patchsheet,
         category: String = "Audio",
+        ticketStatusFilter: MacTicketNDIStatusFilter = .all,
         runOfShowID: String? = nil,
         isLive: Bool = false,
         showsHeaders: Bool = true,
@@ -2480,6 +2659,7 @@ struct MacNDIFeedConfiguration: Identifiable, Codable, Equatable {
         self.title = title
         self.sourceType = sourceType
         self.category = category
+        self.ticketStatusFilter = ticketStatusFilter
         self.runOfShowID = runOfShowID
         self.isLive = isLive
         self.showsHeaders = showsHeaders
@@ -2493,6 +2673,7 @@ struct MacNDIFeedConfiguration: Identifiable, Codable, Equatable {
         title = try container.decodeIfPresent(String.self, forKey: .title) ?? "ProdConnect Feed"
         sourceType = try container.decodeIfPresent(MacNDIFeedSourceType.self, forKey: .sourceType) ?? .patchsheet
         category = try container.decodeIfPresent(String.self, forKey: .category) ?? "Audio"
+        ticketStatusFilter = try container.decodeIfPresent(MacTicketNDIStatusFilter.self, forKey: .ticketStatusFilter) ?? .all
         runOfShowID = try container.decodeIfPresent(String.self, forKey: .runOfShowID)
         isLive = try container.decodeIfPresent(Bool.self, forKey: .isLive) ?? false
         showsHeaders = try container.decodeIfPresent(Bool.self, forKey: .showsHeaders) ?? true
@@ -2642,12 +2823,18 @@ final class MacNDISettingsController: ObservableObject {
         return shows.first
     }
 
+    func tickets(for feed: MacNDIFeedConfiguration) -> [SupportTicket] {
+        store.visibleTickets
+            .filter { feed.ticketStatusFilter.matches($0.status) }
+            .sorted { $0.updatedAt > $1.updatedAt }
+    }
+
     func descriptorText(for feed: MacNDIFeedConfiguration) -> String {
         switch feed.sourceType {
         case .patchsheet:
             return "\(patches(for: feed.category).count) selected patches in \(feed.category)"
         case .tickets:
-            return "\(store.visibleTickets.count) visible tickets"
+            return "\(tickets(for: feed).count) \(feed.ticketStatusFilter.title.lowercased())"
         case .runOfShow:
             let show = runOfShow(for: feed)
             let title = show?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -2687,7 +2874,7 @@ final class MacNDISettingsController: ObservableObject {
                     sourceType: feed.sourceType,
                     category: feed.category,
                     runOfShow: runOfShow(for: feed),
-                    tickets: store.visibleTickets,
+                    tickets: tickets(for: feed),
                     patches: patches(for: feed.category),
                     nameColumnTitle: Self.nameColumnTitle(for: feed.category),
                     inputColumnTitle: Self.inputColumnTitle(for: feed.category),
@@ -3073,38 +3260,20 @@ final class MacRunOfShowControlController: ObservableObject {
     private func startOrRestart(_ show: RunOfShowDocument) {
         autoStartSuppressedShowIDs.remove(show.id)
         var updated = show
-        let items = updated.sortedItems
-        guard let first = items.first else { return }
-        let now = Date()
-        updated.isLiveActive = true
-        updated.liveCurrentItemID = first.id
-        updated.liveShowStartedAt = now
-        updated.liveItemStartedAt = now
+        updated.startLiveSession(at: Date())
         store.saveRunOfShow(updated)
     }
 
     private func move(_ show: RunOfShowDocument, direction: Int) {
         var updated = show
-        let items = updated.sortedItems
-        guard let currentIndex = updated.itemIndex(for: updated.liveCurrentItemID) else { return }
-        let newIndex = currentIndex + direction
-        guard items.indices.contains(newIndex) else { return }
-        updated.isLiveActive = true
-        updated.liveCurrentItemID = items[newIndex].id
-        updated.liveItemStartedAt = Date()
-        if updated.liveShowStartedAt == nil {
-            updated.liveShowStartedAt = Date()
-        }
+        updated.moveLiveSession(direction: direction, at: Date())
         store.saveRunOfShow(updated)
     }
 
     private func reset(_ show: RunOfShowDocument) {
         autoStartSuppressedShowIDs.insert(show.id)
         var updated = show
-        updated.isLiveActive = false
-        updated.liveCurrentItemID = nil
-        updated.liveShowStartedAt = nil
-        updated.liveItemStartedAt = nil
+        updated.resetLiveSession()
         store.saveRunOfShow(updated)
     }
 
@@ -3438,6 +3607,13 @@ struct MacSettingsView: View {
                                     }
                                 }
                                 .frame(width: 140)
+                            } else if feed.sourceType == .tickets {
+                                Picker("Status", selection: feedBinding(index, \.ticketStatusFilter)) {
+                                    ForEach(MacTicketNDIStatusFilter.allCases) { option in
+                                        Text(option.title).tag(option)
+                                    }
+                                }
+                                .frame(width: 150)
                             } else if feed.sourceType == .runOfShow || feed.sourceType == .runOfShowLive || feed.sourceType == .stagePlot {
                                 Picker(
                                     "Show",
@@ -3607,7 +3783,7 @@ struct MacSettingsView: View {
             )
         case .tickets:
             MacTicketsNDIPreview(
-                tickets: store.visibleTickets,
+                tickets: ndiSettings.tickets(for: feed),
                 outputName: feed.title,
                 isActive: feed.isLive,
                 scale: min(feed.scale, 1.0)
@@ -4131,6 +4307,7 @@ private struct MacPatchsheetNDIPreview: View {
                         if showsUniverseColumn {
                             headerCell("Universe")
                         }
+                        headerCell("Notes")
                     }
                 }
 
@@ -4143,6 +4320,7 @@ private struct MacPatchsheetNDIPreview: View {
                             if showsUniverseColumn {
                                 valueCell(patch.universe ?? "")
                             }
+                            valueCell(patch.notes)
                         }
                         .overlay(alignment: .bottom) {
                             Rectangle()
@@ -5275,9 +5453,10 @@ private struct MacRunOfShowView: View {
             HStack(spacing: 0) {
                 timelineHeaderCell("Time", width: 110)
                 timelineHeaderCell("Length", width: 90)
+                timelineHeaderCell("Actual", width: 90)
                 timelineHeaderCell("Title", width: 260)
                 timelineHeaderCell("Person", width: 180)
-                timelineHeaderCell("Notes", width: 320)
+                timelineHeaderCell("Notes", width: 230)
                 timelineHeaderCell("", width: 110)
             }
             .background(Color.white.opacity(0.05))
@@ -5286,13 +5465,14 @@ private struct MacRunOfShowView: View {
                 HStack(spacing: 0) {
                     timelineValueCell(startTimeText(for: show, itemIndex: index), width: 110)
                     timelineLengthCell(show: show, item: item)
+                    timelineActualRuntimeCell(show: show, item: item)
                     timelineEditableCell(title: "Title", text: item.title, width: 260) { newValue in
                         updateItem(show, itemID: item.id) { $0.title = newValue }
                     }
                     timelineEditableCell(title: "Person", text: item.person, width: 180) { newValue in
                         updateItem(show, itemID: item.id) { $0.person = newValue }
                     }
-                    timelineEditableCell(title: "Notes", text: item.notes, width: 320) { newValue in
+                    timelineEditableCell(title: "Notes", text: item.notes, width: 230) { newValue in
                         updateItem(show, itemID: item.id) { $0.notes = newValue }
                     }
                     timelineActionsCell(show: show, item: item, index: index)
@@ -6032,6 +6212,26 @@ private struct MacRunOfShowView: View {
         .disabled(!canEdit)
     }
 
+    private func timelineActualRuntimeCell(show: RunOfShowDocument, item: RunOfShowItem) -> some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            let now = context.date
+            let actualSeconds = show.actualRuntimeSeconds(for: item.id, at: now)
+            let isCurrent = show.isLiveActive && show.liveCurrentItemID == item.id
+            let isOverrun = (actualSeconds ?? 0) > item.durationSeconds
+
+            Text(actualSeconds.map { formatDuration(seconds: $0) } ?? "—")
+                .font(.system(size: 12, weight: isCurrent ? .semibold : .regular, design: .monospaced))
+                .foregroundStyle(
+                    actualSeconds == nil
+                        ? Color.secondary
+                        : (isOverrun ? Color.red : (isCurrent ? Color.orange : Color.primary))
+                )
+                .frame(width: 90, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 12)
+        }
+    }
+
     private func timelineActionsCell(show: RunOfShowDocument, item: RunOfShowItem, index: Int) -> some View {
         HStack(spacing: 6) {
             Button {
@@ -6509,38 +6709,20 @@ private struct MacRunOfShowView: View {
     private func startLive(_ show: RunOfShowDocument) {
         runOfShowControls.clearAutoStartSuppression(for: show.id)
         updateShow(show) { mutable in
-            let items = mutable.sortedItems
-            guard let first = items.first else { return }
-            let now = Date()
-            mutable.isLiveActive = true
-            mutable.liveCurrentItemID = first.id
-            mutable.liveShowStartedAt = now
-            mutable.liveItemStartedAt = now
+            mutable.startLiveSession(at: Date())
         }
     }
 
     private func moveLive(_ show: RunOfShowDocument, direction: Int) {
         updateShow(show) { mutable in
-            let items = mutable.sortedItems
-            guard let currentIndex = mutable.itemIndex(for: mutable.liveCurrentItemID) else { return }
-            let newIndex = currentIndex + direction
-            guard items.indices.contains(newIndex) else { return }
-            mutable.isLiveActive = true
-            mutable.liveCurrentItemID = items[newIndex].id
-            mutable.liveItemStartedAt = Date()
-            if mutable.liveShowStartedAt == nil {
-                mutable.liveShowStartedAt = Date()
-            }
+            mutable.moveLiveSession(direction: direction, at: Date())
         }
     }
 
     private func resetLive(_ show: RunOfShowDocument) {
         runOfShowControls.suppressAutoStart(for: show.id)
         updateShow(show) { mutable in
-            mutable.isLiveActive = false
-            mutable.liveCurrentItemID = nil
-            mutable.liveShowStartedAt = nil
-            mutable.liveItemStartedAt = nil
+            mutable.resetLiveSession()
         }
     }
 
@@ -8476,6 +8658,8 @@ private struct MacGearView: View {
         case .needsRepair:
             return .pink
         case .retired:
+            return .gray
+        case .recycle:
             return .gray
         case .missing:
             return .red
@@ -14599,20 +14783,29 @@ private struct MacCustomizeView: View {
 
     private func mappedStatus(from asset: [String: Any]) -> GearItem.GearStatus {
         // Asset state lives in type_fields with a tenant-suffixed key, e.g. "asset_state_37000348776"
-        let raw = (
-            typeFieldValue(from: asset, prefix: "asset_state")
-            ?? nestedStringValue(asset["asset_state"], key: "name")
-            ?? stringValue(asset["asset_state_name"])
-            ?? nestedStringValue(asset["state"], key: "name")
-            ?? nestedStringValue(asset["ci_status"], key: "name")
-            ?? stringValue(asset["state_name"])
-            ?? stringValue(asset["ci_status_name"])
-            ?? stringValue(asset["status"])
-            ?? ""
-        ).lowercased()
+        let statusCandidates: [String?] = [
+            typeFieldValue(from: asset, prefix: "asset_state"),
+            typeFieldValue(from: asset, prefix: "lifecycle_state"),
+            nestedStringValue(asset["asset_state"], key: "name"),
+            stringValue(asset["asset_state_name"]),
+            nestedStringValue(asset["lifecycle_state"], key: "name"),
+            stringValue(asset["lifecycle_state_name"]),
+            nestedStringValue(asset["state"], key: "name"),
+            nestedStringValue(asset["ci_status"], key: "name"),
+            stringValue(asset["state_name"]),
+            stringValue(asset["ci_status_name"]),
+            stringValue(asset["status"])
+        ]
+        let raw = statusCandidates
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first(where: { !$0.isEmpty })?
+            .lowercased() ?? ""
 
         if raw.contains("repair") || raw.contains("maint") { return .needsRepair }
-        if raw.contains("retired") || raw.contains("disposal") { return .retired }
+        if raw.contains("recycle") || raw.contains("recycling") { return .recycle }
+        if raw.contains("retired") || raw.contains("disposal") || raw.contains("disposed") || raw.contains("decommission") || raw.contains("obsolete") {
+            return .retired
+        }
         if raw.contains("missing") || raw.contains("lost") { return .missing }
         if raw.contains("checkout") || raw.contains("checked out") { return .checkedOut }
         if raw.contains("use") || raw.contains("deployed") || raw.contains("assigned") || raw.contains("loaner") { return .inUse }
@@ -14800,6 +14993,8 @@ private struct MacCustomizeView: View {
                         item.status = .inUse
                     } else if lowerValue.contains("repair") {
                         item.status = .needsRepair
+                    } else if lowerValue.contains("recycle") {
+                        item.status = .recycle
                     } else if lowerValue.contains("retired") {
                         item.status = .retired
                     } else if lowerValue.contains("missing") {

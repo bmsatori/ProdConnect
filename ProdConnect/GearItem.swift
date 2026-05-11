@@ -134,6 +134,7 @@ struct GearItem: Identifiable, Codable {
         case inUse = "In Use"
         case needsRepair = "Needs Repair"
         case retired = "Retired"
+        case recycle = "Recycle"
         case missing = "Missing"
         case checkedOut = "Checked Out"
         case maintenance = "Maintenance"

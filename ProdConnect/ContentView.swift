@@ -163,6 +163,7 @@ struct GearTabView: View {
                 case .inUse: return .blue
                 case .needsRepair: return .pink
                 case .retired: return .gray
+                case .recycle: return .gray
                 case .missing: return .red
                 case .blank: return .gray
             }
@@ -450,7 +451,7 @@ struct GearTabView: View {
         case .lost, .missing: return .red
         case .inUse: return .blue
         case .needsRepair: return .pink
-        case .retired, .unknown, .blank: return .gray
+        case .retired, .recycle, .unknown, .blank: return .gray
         }
     }
 
@@ -6458,6 +6459,8 @@ struct CustomizeView: View {
                         item.status = .inUse
                     } else if lowerValue.contains("repair") {
                         item.status = .needsRepair
+                    } else if lowerValue.contains("recycle") {
+                        item.status = .recycle
                     } else if lowerValue.contains("retired") {
                         item.status = .retired
                     } else if lowerValue.contains("missing") {
@@ -6619,7 +6622,7 @@ struct ImportHelpView: View {
 
                     helpCard(title: "Importing Inventory", bullets: [
                         "Supported headers: name, category, location, campus, serial, serialNumber, status, assetId, asset id, purchased, purchasedate, purchasedFrom, purchased from, cost, installDate, install date, maintenanceIssue, maintenance issue, maintenanceCost, maintenance cost, maintenanceRepairDate, maintenance repair date, maintenanceNotes, maintenance notes, imageURL, image url.",
-                        "Status values recognized: In Stock, In Use, Needs Repair, Retired, Missing.",
+                        "Status values recognized: In Stock, In Use, Needs Repair, Recycle, Retired, Missing.",
                         "Cost should be a number (no currency symbols)."
                     ])
 
@@ -12076,7 +12079,7 @@ struct ChatChannelDetailView: View {
     private let maxAttachmentBytes = 100 * 1024 * 1024
     private let maxMentionSuggestions = 8
 
-    private var isAdmin: Bool { store.user?.isAdmin == true }
+    private var canManageChannel: Bool { store.user?.isAdmin == true || store.user?.isOwner == true }
     private var isDirectMessage: Bool { channel.kind == .direct }
     private var channelTitle: String {
         guard isDirectMessage else { return channel.name }
@@ -12106,10 +12109,12 @@ struct ChatChannelDetailView: View {
         return uniqueNames.joined(separator: ", ")
     }
     private var canSendMessages: Bool {
-        if isAdmin { return true }
-        guard let email = store.user?.email else { return false }
+        if canManageChannel { return true }
+        guard let email = store.user?.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else { return false }
         if channel.isReadOnly { return false }
-        return !channel.readOnlyUserEmails.contains(email)
+        return !channel.readOnlyUserEmails.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }.contains(email)
     }
 
     var body: some View {
@@ -12156,7 +12161,7 @@ struct ChatChannelDetailView: View {
                                 Button(role: .destructive) { messageToDelete = msg } label: {
                                     Text("Delete")
                                 }
-                            } else if isAdmin {
+                            } else if canManageChannel {
                                 Button(role: .destructive) { messageToDelete = msg } label: {
                                     Text("Delete")
                                 }
@@ -12292,7 +12297,7 @@ struct ChatChannelDetailView: View {
                     Button("Add") { showAddParticipants = true }
                 }
             }
-            if isAdmin && !isDirectMessage {
+            if canManageChannel && !isDirectMessage {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button { showSettings = true } label: {
                         Image(systemName: "slider.horizontal.3")
@@ -12340,10 +12345,12 @@ struct ChatChannelDetailView: View {
 
     // MARK: - Send message
     func sendMessage() {
+        guard canSendMessages else { return }
         guard let author = store.user?.email else { return }
         let trimmedText = newMessage.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if let editingMessage = messageToEdit {
+            guard canEdit(editingMessage) else { return }
             guard !trimmedText.isEmpty else { return }
             updateMessage(editingMessage, newText: trimmedText)
             messageToEdit = nil
@@ -12461,6 +12468,7 @@ struct ChatChannelDetailView: View {
     }
 
     private func deleteMessage(_ msg: ChatMessage) {
+        guard canEdit(msg) else { return }
         let attachmentURLToDelete = msg.attachmentURL
         let updatedMessages = channel.messages.filter { $0.id != msg.id }
         persistMessages(updatedMessages) { result in
@@ -12491,8 +12499,8 @@ struct ChatChannelDetailView: View {
     }
 
     private func canEdit(_ msg: ChatMessage) -> Bool {
-        guard let email = store.user?.email else { return false }
-        return isAdmin || msg.author == email
+        guard let email = store.user?.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else { return false }
+        return canManageChannel || msg.author.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == email
     }
 
     private func setPendingAttachment(url: URL, kind: ChatAttachmentKind) {
@@ -12837,10 +12845,18 @@ struct ChannelSettingsView: View {
     @EnvironmentObject var store: ProdConnectStore
     @Environment(\.dismiss) var dismiss
     @Binding var channel: ChatChannel
+    @State private var channelName = ""
+
+    private var trimmedChannelName: String {
+        channelName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     var body: some View {
         NavigationStack {
             Form {
+                Section("Details") {
+                    TextField("Channel Name", text: $channelName)
+                }
                 Section("Permissions") {
                     Toggle("Read-only for non-admins", isOn: $channel.isReadOnly)
                     Toggle("Hidden from non-admins", isOn: $channel.isHidden)
@@ -12881,12 +12897,17 @@ struct ChannelSettingsView: View {
                 }
                 Section {
                     Button("Save") {
+                        channel.name = trimmedChannelName
                         store.saveChannel(channel)
                         dismiss()
                     }
+                    .disabled(trimmedChannelName.isEmpty)
                 }
             }
             .navigationTitle("Channel Settings")
+            .onAppear {
+                channelName = channel.name
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
@@ -14158,9 +14179,12 @@ private struct IntegrationsView: View {
             let candidates: [String?] = [
                 fields["asset_state"] as? String,
                 nestedStringValue(fields["asset_state"], key: "name"),
+                fields["lifecycle_state"] as? String,
+                nestedStringValue(fields["lifecycle_state"], key: "name"),
                 fields["state"] as? String,
                 nestedStringValue(fields["state"], key: "name"),
                 fields["asset_state_name"] as? String,
+                fields["lifecycle_state_name"] as? String,
                 fields["state_name"] as? String
             ]
             return candidates.compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }.first { !$0.isEmpty }
@@ -14168,20 +14192,32 @@ private struct IntegrationsView: View {
 
         // usage_type from Freshservice v2 is an integer: 0 = permanent, 1 = loaner — not a state
         // string. Exclude it from raw string matching to avoid false positives.
-        let raw = (
-            typeFieldState
-            ?? nestedStringValue(asset["asset_state"], key: "name")
-            ?? stringValue(asset["asset_state_name"])
-            ?? nestedStringValue(asset["state"], key: "name")
-            ?? nestedStringValue(asset["ci_status"], key: "name")
-            ?? stringValue(asset["state_name"])
-            ?? stringValue(asset["ci_status_name"])
-            ?? stringValue(asset["status"])
-            ?? ""
-        ).lowercased()
+        let statusCandidates: [String?] = [
+            typeFieldState,
+            typeFieldValue(from: asset, prefix: "asset_state"),
+            typeFieldValue(from: asset, prefix: "lifecycle_state"),
+            nestedStringValue(asset["asset_state"], key: "name"),
+            stringValue(asset["asset_state_name"]),
+            nestedStringValue(asset["lifecycle_state"], key: "name"),
+            stringValue(asset["lifecycle_state_name"]),
+            nestedStringValue(asset["state"], key: "name"),
+            nestedStringValue(asset["ci_status"], key: "name"),
+            stringValue(asset["state_name"]),
+            stringValue(asset["ci_status_name"]),
+            stringValue(asset["status"])
+        ]
+        let raw = statusCandidates
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first(where: { !$0.isEmpty })?
+            .lowercased() ?? ""
 
         if raw.contains("repair") || raw.contains("maint") { return .needsRepair }
-        if raw.contains("retired") || raw.contains("disposal") { return .retired }
+        if raw.contains("recycle") || raw.contains("recycling") {
+            return .recycle
+        }
+        if raw.contains("retired") || raw.contains("disposal") || raw.contains("disposed") || raw.contains("decommission") || raw.contains("obsolete") {
+            return .retired
+        }
         if raw.contains("missing") || raw.contains("lost") { return .missing }
         if raw.contains("checkout") || raw.contains("checked out") { return .checkedOut }
         if raw.contains("use") || raw.contains("deployed") || raw.contains("assigned") || raw.contains("loaner") { return .inUse }
@@ -15414,7 +15450,7 @@ private struct RunOfShowTabView: View {
             return items.indices.contains(nextIndex) ? items[nextIndex] : nil
         }
         let remaining = currentItem.map { item in
-            show.isLiveActive ? show.currentRemainingSeconds(at: now) : item.durationSeconds
+            show.isLiveActive ? show.signedCurrentRemainingSeconds(at: now) : item.durationSeconds
         } ?? 0
         let endTime = show.isLiveActive
             ? show.projectedEndTime(at: now)
@@ -15423,7 +15459,7 @@ private struct RunOfShowTabView: View {
         let currentNotes = currentItem?.notes.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let nextTitle = nextItem?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let endTimeText = show.isLiveActive
-            ? "ends \(endTime.formatted(date: .omitted, time: .shortened))"
+            ? "Show ends at \(endTime.formatted(date: .omitted, time: .shortened))"
             : "live not started"
         let currentItemSummary = currentItem.map { item -> String in
             let person = item.person.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -15451,7 +15487,8 @@ private struct RunOfShowTabView: View {
     }
 
     private func liveSnapshotHeader(remaining: Int, endTimeText: String, currentTitle: String, currentItemSummary: String) -> some View {
-        HStack(spacing: 0) {
+        let isOverrun = remaining < 0
+        return HStack(spacing: 0) {
             VStack(spacing: 8) {
                 Text(formattedClock(seconds: remaining))
                     .font(.system(size: 36, weight: .bold, design: .rounded))
@@ -15462,7 +15499,7 @@ private struct RunOfShowTabView: View {
             }
             .frame(width: 128)
             .padding(.vertical, 18)
-            .background(Color(red: 0.38, green: 0.77, blue: 0.2))
+            .background(isOverrun ? Color(red: 0.79, green: 0.17, blue: 0.2) : Color(red: 0.38, green: 0.77, blue: 0.2))
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("NOW")
@@ -15872,36 +15909,19 @@ private struct RunOfShowTabView: View {
 
     private func startLive(_ show: RunOfShowDocument) {
         updateShow(show) { mutable in
-            guard let first = mutable.sortedItems.first else { return }
-            let now = Date()
-            mutable.isLiveActive = true
-            mutable.liveCurrentItemID = first.id
-            mutable.liveShowStartedAt = now
-            mutable.liveItemStartedAt = now
+            mutable.startLiveSession(at: Date())
         }
     }
 
     private func moveLive(_ show: RunOfShowDocument, direction: Int) {
         updateShow(show) { mutable in
-            let items = mutable.sortedItems
-            guard let currentIndex = mutable.itemIndex(for: mutable.liveCurrentItemID) else { return }
-            let newIndex = currentIndex + direction
-            guard items.indices.contains(newIndex) else { return }
-            mutable.isLiveActive = true
-            mutable.liveCurrentItemID = items[newIndex].id
-            mutable.liveItemStartedAt = Date()
-            if mutable.liveShowStartedAt == nil {
-                mutable.liveShowStartedAt = Date()
-            }
+            mutable.moveLiveSession(direction: direction, at: Date())
         }
     }
 
     private func resetLive(_ show: RunOfShowDocument) {
         updateShow(show) { mutable in
-            mutable.isLiveActive = false
-            mutable.liveCurrentItemID = nil
-            mutable.liveShowStartedAt = nil
-            mutable.liveItemStartedAt = nil
+            mutable.resetLiveSession()
         }
     }
 
@@ -15968,9 +15988,11 @@ private struct RunOfShowTabView: View {
     }
 
     private func formattedClock(seconds: Int) -> String {
-        let minutes = max(seconds, 0) / 60
-        let remainingSeconds = max(seconds, 0) % 60
-        return String(format: "%02d:%02d", minutes, remainingSeconds)
+        let prefix = seconds < 0 ? "-" : ""
+        let absoluteSeconds = abs(seconds)
+        let minutes = absoluteSeconds / 60
+        let remainingSeconds = absoluteSeconds % 60
+        return "\(prefix)\(String(format: "%02d:%02d", minutes, remainingSeconds))"
     }
 
     private func formatDuration(seconds: Int) -> String {

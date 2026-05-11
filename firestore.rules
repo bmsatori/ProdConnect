@@ -16,6 +16,28 @@ service cloud.firestore {
         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isOwner == true;
     }
 
+    function canManageTeamData() {
+      return isAdmin() || isOwner();
+    }
+
+    function requesterEmailRaw() {
+      return isSignedIn() && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.email is string
+        ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.email
+        : (
+          isSignedIn() && request.auth.token.email is string
+            ? request.auth.token.email
+            : ""
+        );
+    }
+
+    function requesterEmail() {
+      return requesterEmailRaw().lower();
+    }
+
+    function listContainsRequesterEmail(values) {
+      return values is list && (requesterEmail() in values || requesterEmailRaw() in values);
+    }
+
     function isOnRequestersTeam(teamCode) {
       return isSignedIn() && teamCode != null && normalizedTeamCode() != null
         && teamCode.lower() == normalizedTeamCode();
@@ -79,6 +101,32 @@ service cloud.firestore {
             && request.resource.data.teamCode.lower() == normalizedTeamCode());
     }
 
+    function requestedDirectChannelIncludesRequester() {
+      return request.resource.data.kind == "direct"
+        && listContainsRequesterEmail(request.resource.data.participantEmails);
+    }
+
+    function existingDirectChannelIncludesRequester() {
+      return resource.data.kind != "direct"
+        || listContainsRequesterEmail(resource.data.participantEmails);
+    }
+
+    function existingReadOnlyEmails() {
+      return resource.data.readOnlyUserEmails is list ? resource.data.readOnlyUserEmails : [];
+    }
+
+    function channelMessagesOnlyChanged() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(["messages", "lastMessageAt"]);
+    }
+
+    function canSendMessageToExistingChannel() {
+      return belongsToUserTeam()
+        && requestedDocumentBelongsToUserTeam()
+        && existingDirectChannelIncludesRequester()
+        && resource.data.isReadOnly != true
+        && !listContainsRequesterEmail(existingReadOnlyEmails());
+    }
+
     match /users/{userId} {
       allow read: if isAdmin() || (isSignedIn() && request.auth.uid == userId)
         || (isSignedIn() && resource.data.teamCode == getUserTeamCode())
@@ -138,9 +186,16 @@ service cloud.firestore {
     }
 
     match /channels/{channelId} {
-      allow read, delete: if belongsToUserTeam();
-      allow create: if requestedDocumentBelongsToUserTeam();
-      allow update: if belongsToUserTeam() && requestedDocumentBelongsToUserTeam();
+      allow read: if belongsToUserTeam();
+      allow create: if requestedDocumentBelongsToUserTeam()
+        && (canManageTeamData() || requestedDirectChannelIncludesRequester());
+      allow update: if belongsToUserTeam()
+        && requestedDocumentBelongsToUserTeam()
+        && (
+          canManageTeamData()
+          || (channelMessagesOnlyChanged() && canSendMessageToExistingChannel())
+        );
+      allow delete: if belongsToUserTeam() && canManageTeamData();
     }
 
     match /gear/{gearId} {

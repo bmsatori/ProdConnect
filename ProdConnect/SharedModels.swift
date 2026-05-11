@@ -551,6 +551,7 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
     var liveCurrentItemID: String?
     var liveShowStartedAt: Date?
     var liveItemStartedAt: Date?
+    var liveActualRuntimeSecondsByItemID: [String: Int] = [:]
     var updatedAt: Date = Date()
 
     enum CodingKeys: String, CodingKey {
@@ -566,6 +567,7 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
         case liveCurrentItemID
         case liveShowStartedAt
         case liveItemStartedAt
+        case liveActualRuntimeSecondsByItemID
         case updatedAt
     }
 
@@ -582,6 +584,7 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
         liveCurrentItemID: String? = nil,
         liveShowStartedAt: Date? = nil,
         liveItemStartedAt: Date? = nil,
+        liveActualRuntimeSecondsByItemID: [String: Int] = [:],
         updatedAt: Date = Date()
     ) {
         self.id = id
@@ -596,6 +599,7 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
         self.liveCurrentItemID = liveCurrentItemID
         self.liveShowStartedAt = liveShowStartedAt
         self.liveItemStartedAt = liveItemStartedAt
+        self.liveActualRuntimeSecondsByItemID = liveActualRuntimeSecondsByItemID
         self.updatedAt = updatedAt
     }
 
@@ -619,6 +623,7 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
         liveCurrentItemID = try container.decodeIfPresent(String.self, forKey: .liveCurrentItemID)
         liveShowStartedAt = try container.decodeIfPresent(Date.self, forKey: .liveShowStartedAt)
         liveItemStartedAt = try container.decodeIfPresent(Date.self, forKey: .liveItemStartedAt)
+        liveActualRuntimeSecondsByItemID = try container.decodeIfPresent([String: Int].self, forKey: .liveActualRuntimeSecondsByItemID) ?? [:]
         updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? Date()
     }
 }
@@ -740,6 +745,14 @@ extension RunOfShowDocument {
         return max(currentItem.durationSeconds - currentElapsedSeconds(at: now), 0)
     }
 
+    func signedCurrentRemainingSeconds(at now: Date) -> Int {
+        guard isLiveActive else { return 0 }
+        guard let currentIndex = itemIndex(for: liveCurrentItemID),
+              sortedItems.indices.contains(currentIndex) else { return 0 }
+        let currentItem = sortedItems[currentIndex]
+        return currentItem.durationSeconds - currentElapsedSeconds(at: now)
+    }
+
     func currentOverrunSeconds(at now: Date) -> Int {
         guard isLiveActive else { return 0 }
         guard let currentIndex = itemIndex(for: liveCurrentItemID),
@@ -749,9 +762,71 @@ extension RunOfShowDocument {
     }
 
     func projectedEndTime(at now: Date) -> Date {
-        let baseStart = liveShowStartedAt ?? scheduledStart
-        let totalScheduledSeconds = totalDurationSeconds
-        return baseStart.addingTimeInterval(TimeInterval(totalScheduledSeconds + currentOverrunSeconds(at: now)))
+        guard isLiveActive,
+              let currentIndex = itemIndex(for: liveCurrentItemID),
+              sortedItems.indices.contains(currentIndex) else {
+            return scheduledStart.addingTimeInterval(TimeInterval(totalDurationSeconds))
+        }
+
+        let currentItem = sortedItems[currentIndex]
+        let remainingCurrentSeconds = max(currentItem.durationSeconds - currentElapsedSeconds(at: now), 0)
+        let futureScheduledSeconds = sortedItems
+            .dropFirst(currentIndex + 1)
+            .reduce(0) { $0 + $1.durationSeconds }
+        return now.addingTimeInterval(TimeInterval(remainingCurrentSeconds + futureScheduledSeconds))
+    }
+
+    func currentItemEndTime(at now: Date) -> Date? {
+        guard let currentIndex = itemIndex(for: liveCurrentItemID),
+              sortedItems.indices.contains(currentIndex) else { return nil }
+        let currentItem = sortedItems[currentIndex]
+        let itemStart = isLiveActive ? (liveItemStartedAt ?? now) : scheduledStart
+        return itemStart.addingTimeInterval(TimeInterval(currentItem.durationSeconds))
+    }
+
+    func actualRuntimeSeconds(for itemID: String, at now: Date) -> Int? {
+        if isLiveActive, liveCurrentItemID == itemID {
+            return currentElapsedSeconds(at: now)
+        }
+        return liveActualRuntimeSecondsByItemID[itemID]
+    }
+
+    mutating func startLiveSession(at now: Date) {
+        guard let first = sortedItems.first else { return }
+        isLiveActive = true
+        liveCurrentItemID = first.id
+        liveShowStartedAt = now
+        liveItemStartedAt = now
+        liveActualRuntimeSecondsByItemID = [:]
+    }
+
+    mutating func moveLiveSession(direction: Int, at now: Date) {
+        let items = sortedItems
+        guard let currentItemID = liveCurrentItemID,
+              let currentIndex = itemIndex(for: currentItemID) else { return }
+        let newIndex = currentIndex + direction
+        guard items.indices.contains(newIndex) else { return }
+
+        recordCurrentLiveItemRuntime(at: now)
+        isLiveActive = true
+        liveCurrentItemID = items[newIndex].id
+        liveItemStartedAt = now
+        if liveShowStartedAt == nil {
+            liveShowStartedAt = now
+        }
+    }
+
+    mutating func recordCurrentLiveItemRuntime(at now: Date) {
+        guard let currentItemID = liveCurrentItemID else { return }
+        liveActualRuntimeSecondsByItemID[currentItemID] = max(currentElapsedSeconds(at: now), 0)
+    }
+
+    mutating func resetLiveSession() {
+        isLiveActive = false
+        liveCurrentItemID = nil
+        liveShowStartedAt = nil
+        liveItemStartedAt = nil
+        liveActualRuntimeSecondsByItemID = [:]
     }
 }
 
