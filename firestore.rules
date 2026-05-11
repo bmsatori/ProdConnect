@@ -61,7 +61,7 @@ service cloud.firestore {
     }
 
     function normalizedTeamCode() {
-      return getUserTeamCode() != null ? getUserTeamCode().lower() : null;
+      return getUserTeamCode() != null ? getUserTeamCode().lower() : "";
     }
 
     function requestedTeamCode() {
