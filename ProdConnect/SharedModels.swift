@@ -546,6 +546,7 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
     var items: [RunOfShowItem]
     var stageType: RunOfShowStageType
     var stagePlotItems: [RunOfShowStagePlotItem]
+    var position: Int = 0
     var autoStartLive: Bool = false
     var isLiveActive: Bool = false
     var liveCurrentItemID: String?
@@ -562,6 +563,7 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
         case items
         case stageType
         case stagePlotItems
+        case position
         case autoStartLive
         case isLiveActive
         case liveCurrentItemID
@@ -579,6 +581,7 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
         items: [RunOfShowItem] = [],
         stageType: RunOfShowStageType = .rectangle,
         stagePlotItems: [RunOfShowStagePlotItem] = [],
+        position: Int = 0,
         autoStartLive: Bool = false,
         isLiveActive: Bool = false,
         liveCurrentItemID: String? = nil,
@@ -594,6 +597,7 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
         self.items = items
         self.stageType = stageType
         self.stagePlotItems = stagePlotItems
+        self.position = position
         self.autoStartLive = autoStartLive
         self.isLiveActive = isLiveActive
         self.liveCurrentItemID = liveCurrentItemID
@@ -618,6 +622,7 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
             if $0.position != $1.position { return $0.position < $1.position }
             return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
         }
+        position = try container.decodeIfPresent(Int.self, forKey: .position) ?? 0
         autoStartLive = try container.decodeIfPresent(Bool.self, forKey: .autoStartLive) ?? false
         isLiveActive = try container.decodeIfPresent(Bool.self, forKey: .isLiveActive) ?? false
         liveCurrentItemID = try container.decodeIfPresent(String.self, forKey: .liveCurrentItemID)
@@ -703,6 +708,13 @@ func stagePlotCSV(for show: RunOfShowDocument) -> String {
 }
 
 extension RunOfShowDocument {
+    static func sortedShows(_ shows: [RunOfShowDocument]) -> [RunOfShowDocument] {
+        shows.sorted {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.updatedAt > $1.updatedAt
+        }
+    }
+
     var sortedItems: [RunOfShowItem] {
         items.sorted {
             if $0.position != $1.position { return $0.position < $1.position }
@@ -1085,12 +1097,74 @@ struct IdeaCard: Identifiable, Codable {
     var id: String = UUID().uuidString
     var title: String
     var detail: String = ""
+    var notes: String = ""
     var tags: [String] = []
     var teamCode: String
     var createdBy: String? = nil
+    var createdAt: Date = Date()
+    var updatedAt: Date = Date()
     var implemented: Bool = false
     var completedAt: Date? = nil
     var likedBy: [String] = []
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case detail
+        case notes
+        case tags
+        case teamCode
+        case createdBy
+        case createdAt
+        case updatedAt
+        case implemented
+        case completedAt
+        case likedBy
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        title: String,
+        detail: String = "",
+        notes: String = "",
+        tags: [String] = [],
+        teamCode: String,
+        createdBy: String? = nil,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date(),
+        implemented: Bool = false,
+        completedAt: Date? = nil,
+        likedBy: [String] = []
+    ) {
+        self.id = id
+        self.title = title
+        self.detail = detail
+        self.notes = notes
+        self.tags = tags
+        self.teamCode = teamCode
+        self.createdBy = createdBy
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.implemented = implemented
+        self.completedAt = completedAt
+        self.likedBy = likedBy
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? "Untitled"
+        detail = try container.decodeIfPresent(String.self, forKey: .detail) ?? ""
+        notes = try container.decodeIfPresent(String.self, forKey: .notes) ?? ""
+        tags = try container.decodeIfPresent([String].self, forKey: .tags) ?? []
+        teamCode = try container.decodeIfPresent(String.self, forKey: .teamCode) ?? ""
+        createdBy = try container.decodeIfPresent(String.self, forKey: .createdBy)
+        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
+        implemented = try container.decodeIfPresent(Bool.self, forKey: .implemented) ?? false
+        completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
+        likedBy = try container.decodeIfPresent([String].self, forKey: .likedBy) ?? []
+    }
 }
 
 enum TicketStatus: String, Codable, CaseIterable, Equatable {

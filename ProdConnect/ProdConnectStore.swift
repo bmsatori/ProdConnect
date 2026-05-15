@@ -878,8 +878,7 @@ final class ProdConnectStore: ObservableObject {
                 .sorted(by: PatchRow.autoSort)
         }
         if runOfShows.isEmpty {
-            runOfShows = loadTeamCollectionCache(as: RunOfShowDocument.self, collection: "runOfShows", teamCode: teamCode)
-                .sorted { $0.updatedAt > $1.updatedAt }
+            runOfShows = RunOfShowDocument.sortedShows(loadTeamCollectionCache(as: RunOfShowDocument.self, collection: "runOfShows", teamCode: teamCode))
         }
     }
 
@@ -1042,7 +1041,7 @@ final class ProdConnectStore: ObservableObject {
                 let runOfShowsQuery = self.queryForUsersTeamCode(collection: "runOfShows", code: teamCode)
                 self.fetchDocumentsFromServerOnce(query: runOfShowsQuery, as: RunOfShowDocument.self, label: "Run of Show") { values in
                     guard !values.isEmpty else { return }
-                    self.runOfShows = values.sorted { $0.updatedAt > $1.updatedAt }
+                    self.runOfShows = RunOfShowDocument.sortedShows(values)
                     self.persistTeamCollectionCache(values, collection: "runOfShows", teamCode: teamCode)
                     print("Run of Show recovery loaded \(values.count) shows for team \(teamCode).")
                 }
@@ -2087,12 +2086,12 @@ final class ProdConnectStore: ObservableObject {
                     ) {
                         return
                     }
-                    self.runOfShows = values.sorted { $0.updatedAt > $1.updatedAt }
+                    self.runOfShows = RunOfShowDocument.sortedShows(values)
                     self.persistTeamCollectionCache(values, collection: "runOfShows", teamCode: code)
                 }
             }
         fetchDocumentsOnce(query: runOfShowsQuery, as: RunOfShowDocument.self, label: "Run of Show") { values in
-            self.runOfShows = values.sorted { $0.updatedAt > $1.updatedAt }
+            self.runOfShows = RunOfShowDocument.sortedShows(values)
             self.persistTeamCollectionCache(values, collection: "runOfShows", teamCode: code)
         }
 
@@ -2636,7 +2635,7 @@ final class ProdConnectStore: ObservableObject {
         } else {
             runOfShows.append(updatedShow)
         }
-        runOfShows.sort { $0.updatedAt > $1.updatedAt }
+        runOfShows = RunOfShowDocument.sortedShows(runOfShows)
         if let activeTeamCode = Self.normalizedTeamCode(updatedShow.teamCode) {
             persistTeamCollectionCache(runOfShows, collection: "runOfShows", teamCode: activeTeamCode)
         }
@@ -2721,7 +2720,20 @@ final class ProdConnectStore: ObservableObject {
             return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
         }
     }
-    func saveIdea(_ item: IdeaCard) { save(item, collection: "ideas", id: item.id) }
+    func saveIdea(_ item: IdeaCard) {
+        var idea = item
+        let now = Date()
+        if idea.createdAt > now {
+            idea.createdAt = now
+        }
+        idea.updatedAt = now
+        save(idea, collection: "ideas", id: idea.id)
+        if let index = ideas.firstIndex(where: { $0.id == idea.id }) {
+            ideas[index] = idea
+        } else {
+            ideas.append(idea)
+        }
+    }
     func saveTicket(_ item: SupportTicket) {
         var ticket = item
         let now = Date()

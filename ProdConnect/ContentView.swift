@@ -2450,8 +2450,14 @@ struct ContentView: View {
     func saveChecklist(_ item: ChecklistTemplate) { 
         save(item, collection: "checklists")
     }
-    func saveIdea(_ item: IdeaCard) { 
-        save(item, collection: "ideas")
+    func saveIdea(_ item: IdeaCard) {
+        var idea = item
+        let now = Date()
+        if idea.createdAt > now {
+            idea.createdAt = now
+        }
+        idea.updatedAt = now
+        save(idea, collection: "ideas")
     }
     func saveChannel(_ item: ChatChannel) { save(item, collection: "channels") }
     func savePatch(_ item: PatchRow, completion: ((Result<Void, Error>) -> Void)? = nil) {
@@ -5313,10 +5319,23 @@ struct ContactView: View {
     }
 }
 
-// MARK: - CustomizeView (Admin Only)
+// MARK: - SettingsView (Admin Only)
 struct CustomizeView: View {
+    private enum SettingsTab: String, CaseIterable, Identifiable {
+        case general = "General"
+        case overview = "Overview"
+        case locations = "Locations"
+        case tickets = "Tickets"
+        case integrations = "Integrations"
+        case importReset = "Import"
+
+        var id: String { rawValue }
+    }
+
     @EnvironmentObject var store: ProdConnectStore
     @AppStorage(preferredMainTabSectionsStorageKey) private var preferredMainTabSections = ""
+    @AppStorage(iOSOverviewSourcesStorageKey) private var overviewSourcesRawValue = defaultIOSOverviewSourcesRawValue
+    @State private var selectedSettingsTab: SettingsTab = .general
     @State private var newCampus = ""
     @State private var newRoom = ""
     @State private var newTicketCategory = ""
@@ -5352,6 +5371,14 @@ struct CustomizeView: View {
     @State private var externalTicketFormAccessKey = ""
     @State private var isSavingExternalTicketForm = false
     @State private var externalTicketStatusMessage = ""
+    @State private var smaartEnabled = false
+    @State private var smaartHost = ""
+    @State private var smaartPort = ""
+    @State private var smaartPath = ""
+    @State private var smaartPassword = ""
+    @State private var smaartPollInterval = ""
+    @State private var smaartStatusMessage = ""
+    @ObservedObject private var smaartController = SmaartAPIController.shared
     @State private var bulkOperationMessage = ""
     @State private var isBulkOperationInProgress = false
 
@@ -5369,6 +5396,21 @@ struct CustomizeView: View {
 
     private var canManageExternalTicketForm: Bool {
         isPrivilegedUser && (store.user?.hasTicketingFeatures == true)
+    }
+
+    private var hasOverviewFeature: Bool {
+        store.canSeeRunOfShow
+    }
+
+    private var availableSettingsTabs: [SettingsTab] {
+        SettingsTab.allCases.filter { tab in
+            switch tab {
+            case .overview:
+                return hasOverviewFeature
+            default:
+                return true
+            }
+        }
     }
 
     private var externalTicketFormURLString: String {
@@ -5606,6 +5648,27 @@ struct CustomizeView: View {
         }
     }
 
+    private var overviewSettingsSection: some View {
+        Section {
+            ForEach(IOSOverviewSource.allCases) { source in
+                Toggle(isOn: Binding(
+                    get: { selectedOverviewSources.contains(source) },
+                    set: { isIncluded in
+                        setOverviewSource(source, isIncluded: isIncluded)
+                    }
+                )) {
+                    Label(source.title, systemImage: source.systemImage)
+                }
+            }
+        } header: {
+            Text("Overview Cards")
+        } footer: {
+            Text("Choose which cards appear on the iOS Overview tab.")
+                .font(.caption)
+                .foregroundColor(.gray)
+        }
+    }
+
     private var campusSection: some View {
         Section {
             HStack {
@@ -5809,6 +5872,7 @@ struct CustomizeView: View {
         }
     }
 
+    @ViewBuilder
     private var integrationsSection: some View {
         Section("Integrations") {
             VStack(alignment: .leading, spacing: 12) {
@@ -5859,6 +5923,56 @@ struct CustomizeView: View {
                     Text(freshserviceStatusMessage)
                         .font(.caption)
                         .foregroundColor(.secondary)
+                }
+            }
+        }
+
+        if hasOverviewFeature {
+            Section("Smaart") {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Connect to the Smaart SPL Webserver to show real-time dB readings on the iOS Overview tab.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    Toggle("Enable Smaart Integration", isOn: $smaartEnabled)
+
+                    TextField("Host", text: $smaartHost)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+
+                    TextField("Port", text: $smaartPort)
+                        .keyboardType(.numberPad)
+
+                    TextField("API Path (optional)", text: $smaartPath)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+
+                    SecureField("Password (optional)", text: $smaartPassword)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+
+                    TextField("Poll Interval", text: $smaartPollInterval)
+                        .keyboardType(.decimalPad)
+
+                    Button("Save Smaart Connection") {
+                        saveSmaartSettings()
+                    }
+                    .disabled(smaartHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(smaartController.connectionStatus.indicatorColor)
+                            .frame(width: 8, height: 8)
+                        Text(smaartController.connectionStatus.label)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    if !smaartStatusMessage.isEmpty {
+                        Text(smaartStatusMessage)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
                 }
             }
         }
@@ -5941,28 +6055,83 @@ struct CustomizeView: View {
         }
     }
 
+    private var settingsTabBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(availableSettingsTabs) { tab in
+                    Button {
+                        selectedSettingsTab = tab
+                    } label: {
+                        Text(tab.rawValue)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(selectedSettingsTab == tab ? Color.white : Color.primary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(
+                                Capsule()
+                                    .fill(selectedSettingsTab == tab ? Color.accentColor : Color(.secondarySystemBackground))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.vertical, 4)
+        }
+        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+    }
+
     private var customizeBaseView: some View {
         NavigationStack {
             Form {
-                tabCustomizationSection
-                if isPrivilegedUser {
+                settingsTabBar
+
+                switch selectedSettingsTab {
+                case .general:
+                    tabCustomizationSection
+                case .overview:
+                    if hasOverviewFeature {
+                        overviewSettingsSection
+                    }
+                case .locations:
+                    if isPrivilegedUser {
                     campusAndRoomsSection
-                    ticketCategoriesSection
-                    ticketSubcategoriesSection
+                    }
+                case .tickets:
+                    if isPrivilegedUser {
+                        if canManageExternalTicketForm {
+                            externalTicketFormSection
+                        }
+                        ticketCategoriesSection
+                        ticketSubcategoriesSection
+                    }
+                case .integrations:
+                    if isPrivilegedUser {
                     if canManageIntegrations {
                         integrationsSection
                     }
-                    if canManageExternalTicketForm {
-                        externalTicketFormSection
                     }
+                case .importReset:
+                    if isPrivilegedUser {
                     importSection
                     resetSection
+                    }
                 }
             }
-            .navigationTitle("Customize")
+            .navigationTitle("Settings")
             .toolbarColorScheme(.dark, for: .navigationBar)
             .disabled(isBulkOperationInProgress)
-            .onAppear(perform: loadFreshserviceIntegrationState)
+            .onAppear {
+                loadFreshserviceIntegrationState()
+                loadSmaartSettings()
+                if !availableSettingsTabs.contains(selectedSettingsTab) {
+                    selectedSettingsTab = .general
+                }
+            }
+            .onChange(of: hasOverviewFeature) { _ in
+                if !availableSettingsTabs.contains(selectedSettingsTab) {
+                    selectedSettingsTab = .general
+                }
+            }
             .onReceive(store.$freshserviceIntegration) { _ in
                 loadFreshserviceIntegrationState()
             }
@@ -6098,6 +6267,25 @@ struct CustomizeView: View {
     private func addFeaturedSection(_ section: MainAppSection) {
         guard !featuredSections.contains(section) else { return }
         saveFeaturedSections(featuredSections + [section])
+    }
+
+    private var selectedOverviewSources: [IOSOverviewSource] {
+        decodeIOSOverviewSources(overviewSourcesRawValue)
+    }
+
+    private func setOverviewSource(_ source: IOSOverviewSource, isIncluded: Bool) {
+        var sources = selectedOverviewSources
+        if isIncluded {
+            if !sources.contains(source) {
+                sources.append(source)
+            }
+        } else {
+            sources.removeAll { $0 == source }
+        }
+        if sources.isEmpty {
+            sources = [.runOfShowLive]
+        }
+        overviewSourcesRawValue = encodeIOSOverviewSources(sources)
     }
 
     private func removeFeaturedSection(_ section: MainAppSection) {
@@ -6384,6 +6572,34 @@ struct CustomizeView: View {
                 freshserviceStatusMessage = "Save failed: \(error.localizedDescription)"
             }
         }
+    }
+
+    private func loadSmaartSettings() {
+        let settings = SmaartSettings.load()
+        smaartEnabled = settings.isEnabled
+        smaartHost = settings.host
+        smaartPort = "\(settings.port)"
+        smaartPath = settings.apiPath
+        smaartPassword = settings.password
+        smaartPollInterval = String(format: "%.2f", settings.pollIntervalSeconds)
+        if settings.isEnabled {
+            SmaartAPIController.shared.restart()
+        }
+    }
+
+    private func saveSmaartSettings() {
+        let port = Int(smaartPort.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 9090
+        let interval = Double(smaartPollInterval.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0.25
+        let settings = SmaartSettings(
+            isEnabled: smaartEnabled,
+            host: smaartHost.trimmingCharacters(in: .whitespacesAndNewlines),
+            port: port,
+            apiPath: smaartPath.trimmingCharacters(in: .whitespacesAndNewlines),
+            password: smaartPassword,
+            pollIntervalSeconds: max(0.1, interval)
+        )
+        SmaartAPIController.shared.applySettings(settings)
+        smaartStatusMessage = settings.isEnabled ? "Smaart connection saved." : "Smaart integration disabled."
     }
 
     private func testFreshserviceConnection() {
@@ -8344,9 +8560,25 @@ struct IdeasListView: View {
                         Section("Not Completed") {
                             ForEach(activeIdeas) { idea in
                                 NavigationLink { IdeaDetailView(idea: idea) } label: {
-                                    VStack(alignment: .leading) {
+                                    VStack(alignment: .leading, spacing: 4) {
                                         Text(idea.title).font(.headline)
-                                        Text(idea.tags.joined(separator: ", ")).font(.caption).foregroundColor(.secondary)
+                                        if !idea.detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                            Text(idea.detail)
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                                .lineLimit(2)
+                                        }
+                                        if !idea.notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                            Label("Notes added", systemImage: "note.text")
+                                                .font(.caption2)
+                                                .foregroundColor(.secondary)
+                                        }
+                                        if !idea.tags.isEmpty {
+                                            Text(idea.tags.joined(separator: ", ")).font(.caption).foregroundColor(.secondary)
+                                        }
+                                        Text("Updated \(idea.updatedAt.formatted(date: .abbreviated, time: .shortened))")
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
                                     }
                                 }
                             }
@@ -8361,9 +8593,22 @@ struct IdeasListView: View {
                         Section("Completed") {
                             ForEach(completedIdeas) { idea in
                                 NavigationLink { IdeaDetailView(idea: idea) } label: {
-                                    VStack(alignment: .leading) {
+                                    VStack(alignment: .leading, spacing: 4) {
                                         Text(idea.title).font(.headline)
-                                        Text(idea.tags.joined(separator: ", ")).font(.caption).foregroundColor(.secondary)
+                                        if !idea.detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                            Text(idea.detail)
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                                .lineLimit(2)
+                                        }
+                                        if !idea.notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                            Label("Notes added", systemImage: "note.text")
+                                                .font(.caption2)
+                                                .foregroundColor(.secondary)
+                                        }
+                                        if !idea.tags.isEmpty {
+                                            Text(idea.tags.joined(separator: ", ")).font(.caption).foregroundColor(.secondary)
+                                        }
                                         if let completedAt = idea.completedAt {
                                             Text("Completed: \(completedAt.formatted(date: .abbreviated, time: .shortened))").font(.caption2).foregroundColor(.secondary)
                                         }
@@ -8397,6 +8642,7 @@ struct IdeasListView: View {
 struct IdeaDetailView: View {
     @EnvironmentObject var store: ProdConnectStore
     @State var idea: IdeaCard
+    @State private var showEdit = false
     var canEdit: Bool { store.user?.isAdmin == true || store.user?.canEditIdeas == true }
     @Environment(\.dismiss) private var dismiss
 
@@ -8404,7 +8650,23 @@ struct IdeaDetailView: View {
         Form {
             Section {
                 Text(idea.title).font(.title2)
-                Text(idea.detail)
+                if !idea.detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text(idea.detail)
+                }
+            }
+
+            if !idea.notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Section("Notes") {
+                    Text(idea.notes)
+                }
+            }
+
+            Section("Activity") {
+                Text("Created \(idea.createdAt.formatted(date: .abbreviated, time: .shortened))")
+                Text("Updated \(idea.updatedAt.formatted(date: .abbreviated, time: .shortened))")
+                if let completedAt = idea.completedAt {
+                    Text("Completed \(completedAt.formatted(date: .abbreviated, time: .shortened))")
+                }
             }
 
             Section {
@@ -8431,6 +8693,21 @@ struct IdeaDetailView: View {
         }
         .navigationTitle(idea.title)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if canEdit {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Edit") {
+                        showEdit = true
+                    }
+                }
+            }
+        }
+        .sheet(isPresented: $showEdit) {
+            CreateIdeaView(idea: idea) { updated in
+                idea = updated
+                store.saveIdea(updated)
+            }
+        }
         .onAppear {
             // Ensure the system-provided back affordance is hidden and any left items removed
             // Unconditional diagnostic to ensure we see a log entry when this view appears
@@ -8456,28 +8733,54 @@ struct CreateIdeaView: View {
     @EnvironmentObject var store: ProdConnectStore
     @State private var title = ""
     @State private var detail = ""
+    @State private var notes = ""
     @State private var tags = ""
+    private let idea: IdeaCard?
     var onSave: (IdeaCard) -> Void
+
+    init(idea: IdeaCard? = nil, onSave: @escaping (IdeaCard) -> Void) {
+        self.idea = idea
+        self.onSave = onSave
+        _title = State(initialValue: idea?.title ?? "")
+        _detail = State(initialValue: idea?.detail ?? "")
+        _notes = State(initialValue: idea?.notes ?? "")
+        _tags = State(initialValue: idea?.tags.joined(separator: ", ") ?? "")
+    }
 
     var body: some View {
         NavigationStack {
             Form {
                 TextField("Title", text: $title)
-                TextEditor(text: $detail).frame(minHeight: 120)
+                Section("Idea") {
+                    TextEditor(text: $detail).frame(minHeight: 120)
+                }
+                Section("Notes") {
+                    TextEditor(text: $notes).frame(minHeight: 120)
+                }
                 TextField("Tags (comma separated)", text: $tags)
             }
-            .navigationTitle("New Idea")
+            .navigationTitle(idea == nil ? "New Idea" : "Edit Idea")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Create") {
-                        var new = IdeaCard(title: title.isEmpty ? "Untitled" : title,
-                                           detail: detail,
-                                           tags: tags.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) },
-                                           teamCode: store.teamCode ?? "")
-                        new.id = UUID().uuidString
-                        new.createdBy = Auth.auth().currentUser?.email
-                        onSave(new)
+                    Button(idea == nil ? "Create" : "Save") {
+                        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let now = Date()
+                        let updated = IdeaCard(
+                            id: idea?.id ?? UUID().uuidString,
+                            title: trimmedTitle.isEmpty ? "Untitled" : trimmedTitle,
+                            detail: detail.trimmingCharacters(in: .whitespacesAndNewlines),
+                            notes: notes.trimmingCharacters(in: .whitespacesAndNewlines),
+                            tags: tags.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty },
+                            teamCode: idea?.teamCode ?? store.teamCode ?? "",
+                            createdBy: idea?.createdBy ?? Auth.auth().currentUser?.email,
+                            createdAt: idea?.createdAt ?? now,
+                            updatedAt: now,
+                            implemented: idea?.implemented ?? false,
+                            completedAt: idea?.completedAt,
+                            likedBy: idea?.likedBy ?? []
+                        )
+                        onSave(updated)
                         dismiss()
                     }.disabled(title.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
@@ -14388,6 +14691,7 @@ private enum MainAppSection: String, CaseIterable, Identifiable {
     case chat
     case patchsheet
     case runOfShow
+    case overview
     case training
     case assets
     case integrations
@@ -14406,6 +14710,7 @@ private enum MainAppSection: String, CaseIterable, Identifiable {
         case .chat: return "Chat"
         case .patchsheet: return "Patchsheet"
         case .runOfShow: return "Run of Show"
+        case .overview: return "Overview"
         case .training: return "Training"
         case .assets: return "Assets"
         case .integrations: return "Integrations"
@@ -14413,7 +14718,7 @@ private enum MainAppSection: String, CaseIterable, Identifiable {
         case .checklist: return "Checklist"
         case .ideas: return "Ideas"
         case .tickets: return "Tickets"
-        case .customize: return "Customize"
+        case .customize: return "Settings"
         case .account: return "Account"
         case .users: return "Users"
         }
@@ -14424,6 +14729,7 @@ private enum MainAppSection: String, CaseIterable, Identifiable {
         case .chat: return "message"
         case .patchsheet: return "square.grid.3x2"
         case .runOfShow: return "list.bullet.rectangle.portrait"
+        case .overview: return "square.grid.2x2"
         case .training: return "graduationcap"
         case .assets: return "shippingbox"
         case .integrations: return "link"
@@ -14476,6 +14782,7 @@ private func availableMainAppSections(for store: ProdConnectStore) -> [MainAppSe
     }
     if store.canSeeRunOfShow {
         sections.append(.runOfShow)
+        sections.append(.overview)
     }
     if (store.user?.hasChatAndTrainingFeatures ?? false) && (isPrivilegedUser || store.user?.canSeeTraining == true) {
         sections.append(.training)
@@ -14559,6 +14866,8 @@ private func mainAppSectionDestination(_ section: MainAppSection) -> some View {
         MainTabView.PatchsheetView()
     case .runOfShow:
         RunOfShowTabView()
+    case .overview:
+        OverviewTabView()
     case .training:
         TrainingListView()
     case .assets:
@@ -14579,6 +14888,960 @@ private func mainAppSectionDestination(_ section: MainAppSection) -> some View {
         AccountView()
     case .users:
         UsersView()
+    }
+}
+
+private enum SmaartLevelColor: String, Equatable {
+    case green
+    case yellow
+    case red
+
+    var color: Color {
+        switch self {
+        case .green: return .green
+        case .yellow: return .yellow
+        case .red: return .red
+        }
+    }
+
+    static func parse(_ value: Any?) -> SmaartLevelColor? {
+        guard let raw = value as? String else { return nil }
+        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized.contains("green") || normalized.contains("normal") || normalized.contains("safe") || normalized.contains("ok") {
+            return .green
+        }
+        if normalized.contains("yellow") || normalized.contains("amber") || normalized.contains("warning") || normalized.contains("caution") {
+            return .yellow
+        }
+        if normalized.contains("red") || normalized.contains("over") || normalized.contains("clip") || normalized.contains("high") {
+            return .red
+        }
+        return nil
+    }
+}
+
+private struct SmaartChannel: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let dB: Double
+    let peakDB: Double
+    var average10MinDB: Double? = nil
+    var levelColor: SmaartLevelColor? = nil
+    var displayColor: Color { levelColor?.color ?? (isClipping ? .red : .primary) }
+    var isClipping: Bool { levelColor == .red || dB >= 120 || peakDB >= 120 }
+
+    var formattedDB: String {
+        dB <= -900 ? "—" : String(format: "%.1f dB SPL", dB)
+    }
+
+    var formattedPeak: String {
+        peakDB <= -900 ? "—" : String(format: "%.1f dB SPL", peakDB)
+    }
+
+    var compactPeak: String {
+        peakDB <= -900 ? "—" : String(format: "%.1f", peakDB)
+    }
+}
+
+private enum SmaartConnectionStatus: Equatable {
+    case disconnected
+    case connecting
+    case connected
+    case error(String)
+
+    var label: String {
+        switch self {
+        case .disconnected: return "Not connected"
+        case .connecting: return "Connecting..."
+        case .connected: return "Connected"
+        case .error(let message): return "Error: \(message)"
+        }
+    }
+
+    var isConnected: Bool { self == .connected }
+
+    var indicatorColor: Color {
+        switch self {
+        case .connected: return .green
+        case .connecting: return .yellow
+        case .disconnected: return .secondary
+        case .error: return .red
+        }
+    }
+}
+
+private struct SmaartSettings: Codable {
+    var isEnabled: Bool = false
+    var host: String = "localhost"
+    var port: Int = 9090
+    var apiPath: String = ""
+    var password: String = ""
+    var pollIntervalSeconds: Double = 0.25
+
+    private static let defaultsKey = "prodconnect.smaart.settings.v1"
+
+    static func load() -> SmaartSettings {
+        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+              let decoded = try? JSONDecoder().decode(SmaartSettings.self, from: data)
+        else { return SmaartSettings() }
+        return decoded
+    }
+
+    func save() {
+        if let data = try? JSONEncoder().encode(self) {
+            UserDefaults.standard.set(data, forKey: Self.defaultsKey)
+        }
+    }
+
+    var resolvedURL: URL? {
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedHost.isEmpty else { return nil }
+        let portString = port > 0 ? ":\(port)" : ""
+        let path = apiPath.hasPrefix("/") ? apiPath : (apiPath.isEmpty ? "" : "/\(apiPath)")
+        return URL(string: "http://\(trimmedHost)\(portString)\(path)")
+    }
+}
+
+@MainActor
+private final class SmaartAPIController: ObservableObject {
+    static let shared = SmaartAPIController()
+
+    @Published private(set) var channels: [SmaartChannel] = []
+    @Published private(set) var connectionStatus: SmaartConnectionStatus = .disconnected
+    @Published var settings: SmaartSettings = SmaartSettings.load()
+
+    private var pollingTask: Task<Void, Never>?
+    private var recentSamplesByChannelID: [String: [(date: Date, value: Double)]] = [:]
+    private var peakByChannelID: [String: Double] = [:]
+    private let session: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 3.0
+        return URLSession(configuration: configuration)
+    }()
+
+    func applySettings(_ newSettings: SmaartSettings) {
+        settings = newSettings
+        settings.save()
+        restart()
+    }
+
+    func restart() {
+        pollingTask?.cancel()
+        pollingTask = nil
+        channels = []
+        recentSamplesByChannelID = [:]
+        peakByChannelID = [:]
+        connectionStatus = .disconnected
+        guard settings.isEnabled, settings.resolvedURL != nil else { return }
+        connectionStatus = .connecting
+        pollingTask = Task {
+            while !Task.isCancelled {
+                await poll()
+                let milliseconds = max(100, Int(settings.pollIntervalSeconds * 1000))
+                try? await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000)
+            }
+        }
+    }
+
+    private func poll() async {
+        guard let url = settings.resolvedURL else {
+            connectionStatus = .error("Invalid URL")
+            return
+        }
+        do {
+            let data = try await fetchData(from: url)
+            let responseText = String(data: data, encoding: .utf8) ?? ""
+            if isHTML(responseText) {
+                for candidateURL in candidateDataURLs(from: url) {
+                    guard let candidateData = try? await fetchData(from: candidateURL),
+                          !isHTML(String(data: candidateData, encoding: .utf8) ?? "")
+                    else { continue }
+                    let parsed = parseSmaartResponse(candidateData)
+                    if !parsed.isEmpty {
+                        updateChannels(parsed)
+                        connectionStatus = .connected
+                        return
+                    }
+                }
+                channels = []
+                connectionStatus = .error("Smaart returned its web page, not meter data")
+                return
+            }
+
+            let parsed = parseSmaartResponse(data)
+            updateChannels(parsed)
+            connectionStatus = parsed.isEmpty ? .error("Connected but no channels parsed") : .connected
+        } catch {
+            if !Task.isCancelled {
+                channels = []
+                connectionStatus = .error(error.localizedDescription)
+            }
+        }
+    }
+
+    private func fetchData(from url: URL) async throws -> Data {
+        var request = URLRequest(url: url)
+        if !settings.password.isEmpty {
+            let credential = Data(":\(settings.password)".utf8).base64EncodedString()
+            request.setValue("Basic \(credential)", forHTTPHeaderField: "Authorization")
+        }
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            throw URLError(.badServerResponse)
+        }
+        return data
+    }
+
+    private func updateChannels(_ newChannels: [SmaartChannel]) {
+        let now = Date()
+        let cutoff = now.addingTimeInterval(-600)
+        channels = newChannels.map { channel in
+            var samples = recentSamplesByChannelID[channel.id, default: []]
+            if channel.dB > -900 {
+                samples.append((date: now, value: channel.dB))
+            }
+            samples.removeAll { $0.date < cutoff }
+            recentSamplesByChannelID[channel.id] = samples
+
+            let rollingAverage = samples.isEmpty ? channel.average10MinDB : samples.map(\.value).reduce(0, +) / Double(samples.count)
+            let peak = max(peakByChannelID[channel.id] ?? channel.peakDB, channel.peakDB, channel.dB)
+            peakByChannelID[channel.id] = peak
+            return SmaartChannel(
+                id: channel.id,
+                name: channel.name,
+                dB: channel.dB,
+                peakDB: peak,
+                average10MinDB: channel.average10MinDB ?? rollingAverage,
+                levelColor: channel.levelColor
+            )
+        }
+    }
+
+    private func isHTML(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return trimmed.hasPrefix("<!doctype") || trimmed.hasPrefix("<html")
+    }
+
+    private func candidateDataURLs(from rootURL: URL) -> [URL] {
+        let paths = [
+            "/data",
+            "/data.json",
+            "/meters",
+            "/meters.json",
+            "/api/data",
+            "/api/data.json",
+            "/api/spl",
+            "/api/spl.json",
+            "/api/meters",
+            "/api/meters.json",
+            "/api/v3/meterArray",
+            "/api/v3/SPL",
+            "/api/v3/plotInputs"
+        ]
+        return paths.compactMap { URL(string: $0, relativeTo: rootURL)?.absoluteURL }
+    }
+
+    private func parseSmaartResponse(_ data: Data) -> [SmaartChannel] {
+        guard let json = try? JSONSerialization.jsonObject(with: data) else { return [] }
+
+        func number(_ value: Any?) -> Double? {
+            if value is Bool { return nil }
+            if let value = value as? Double { return value }
+            if let value = value as? Int { return Double(value) }
+            if let value = value as? Float { return Double(value) }
+            if let value = value as? NSNumber { return value.doubleValue }
+            if let value = value as? String { return Double(value.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            return nil
+        }
+
+        func hasDBSignal(_ dictionary: [String: Any]) -> Bool {
+            let keys = Set(dictionary.keys.map { $0.lowercased() })
+            return !keys.isDisjoint(with: ["rms", "db", "value", "level", "leveldb", "level_db", "spl", "fast", "slow", "leq", "laeq", "lcpeak", "peak", "peakdb", "peak_db"])
+        }
+
+        func extractDB(_ dictionary: [String: Any]) -> Double {
+            for key in ["rms", "db", "dB", "value", "level", "levelDb", "level_db", "spl", "SPL", "fast", "slow", "leq", "Leq", "laeq", "LAeq", "lcpeak", "LCpeak"] {
+                if let value = number(dictionary[key]) { return value }
+            }
+            return -999.0
+        }
+
+        func extractPeak(_ dictionary: [String: Any], fallback: Double) -> Double {
+            for key in ["Peak A", "peakA", "peak_a", "peak", "peakDb", "peak_db", "Peak", "lcpeak", "LCpeak"] {
+                if let value = number(dictionary[key]) { return value }
+            }
+            return fallback
+        }
+
+        func extractAverage(_ dictionary: [String: Any]) -> Double? {
+            number(dictionary["LAeq 10"]) ?? number(dictionary["Leq 10"]) ?? number(dictionary["LCeq 10"])
+        }
+
+        func extractLevelColor(_ dictionary: [String: Any]) -> SmaartLevelColor? {
+            for key in ["targetColor", "target_color", "color", "rangeColor", "range_color", "statusColor", "status_color", "state", "status", "range"] {
+                if let color = SmaartLevelColor.parse(dictionary[key]) { return color }
+            }
+            return nil
+        }
+
+        func channelName(_ dictionary: [String: Any], index: Int) -> String {
+            (dictionary["name"] as? String) ??
+            (dictionary["channel"] as? String) ??
+            (dictionary["label"] as? String) ??
+            (dictionary["input"] as? String) ??
+            "Ch \(index + 1)"
+        }
+
+        func makeChannel(_ index: Int, _ name: String, _ dictionary: [String: Any]) -> SmaartChannel {
+            let db = extractDB(dictionary)
+            let peak = extractPeak(dictionary, fallback: db)
+            return SmaartChannel(
+                id: "\(name)-\(index)",
+                name: name,
+                dB: db,
+                peakDB: peak,
+                average10MinDB: extractAverage(dictionary),
+                levelColor: extractLevelColor(dictionary)
+            )
+        }
+
+        func channels(from dictionary: [String: Any]) -> [SmaartChannel] {
+            dictionary.sorted(by: { $0.key < $1.key }).enumerated().compactMap { index, pair in
+                if let inner = pair.value as? [String: Any], hasDBSignal(inner) {
+                    return makeChannel(index, pair.key, inner)
+                }
+                if let value = number(pair.value),
+                   pair.key.localizedCaseInsensitiveContains("spl") ||
+                   pair.key.localizedCaseInsensitiveContains("db") ||
+                   pair.key.localizedCaseInsensitiveContains("level") ||
+                   pair.key.localizedCaseInsensitiveContains("peak") {
+                    return SmaartChannel(id: "\(pair.key)-\(index)", name: pair.key, dB: value, peakDB: value, levelColor: extractLevelColor(dictionary))
+                }
+                return nil
+            }
+        }
+
+        if let array = json as? [[String: Any]] {
+            return array.enumerated().map { index, dictionary in
+                makeChannel(index, channelName(dictionary, index: index), dictionary)
+            }
+        }
+
+        if let array = json as? [Any] {
+            let parsed = array.enumerated().compactMap { index, value -> SmaartChannel? in
+                if let dictionary = value as? [String: Any] {
+                    return makeChannel(index, channelName(dictionary, index: index), dictionary)
+                }
+                if let db = number(value) {
+                    return SmaartChannel(id: "spl-\(index)", name: index == 0 ? "SPL" : "Ch \(index + 1)", dB: db, peakDB: db)
+                }
+                return nil
+            }
+            if !parsed.isEmpty { return parsed }
+        }
+
+        guard let root = json as? [String: Any] else { return [] }
+        for key in ["meters", "channels", "data", "result", "inputs", "outputs", "levels", "measurements", "payload", "value", "values", "message", "response", "meterArray"] {
+            if let array = root[key] as? [[String: Any]] {
+                return array.enumerated().map { index, dictionary in
+                    makeChannel(index, channelName(dictionary, index: index), dictionary)
+                }
+            }
+            if let dictionary = root[key] as? [String: Any] {
+                let parsed = channels(from: dictionary)
+                if !parsed.isEmpty { return parsed }
+                if let nestedData = try? JSONSerialization.data(withJSONObject: dictionary) {
+                    let nestedParsed = parseSmaartResponse(nestedData)
+                    if !nestedParsed.isEmpty { return nestedParsed }
+                }
+            }
+            if let array = root[key] as? [Any],
+               let nestedData = try? JSONSerialization.data(withJSONObject: array) {
+                let nestedParsed = parseSmaartResponse(nestedData)
+                if !nestedParsed.isEmpty { return nestedParsed }
+            }
+        }
+
+        if let splDictionary = root["spl"] as? [String: Any] {
+            let parsed = channels(from: splDictionary)
+            if !parsed.isEmpty { return parsed }
+            let db = extractDB(splDictionary)
+            if db > -999 {
+                return [SmaartChannel(id: "spl-0", name: "SPL", dB: db, peakDB: extractPeak(splDictionary, fallback: db), levelColor: extractLevelColor(splDictionary))]
+            }
+        }
+
+        let db = extractDB(root)
+        if db > -999, hasDBSignal(root) {
+            let name = (root["name"] as? String) ?? (root["channel"] as? String) ?? "SPL"
+            return [SmaartChannel(id: "root-0", name: name, dB: db, peakDB: extractPeak(root, fallback: db), average10MinDB: extractAverage(root), levelColor: extractLevelColor(root))]
+        }
+
+        return []
+    }
+}
+
+private let iOSOverviewSourcesStorageKey = "prodconnect.ios.overview.sources.v1"
+private let defaultIOSOverviewSourcesRawValue = "runOfShowLive,setlist,stagePlot,smaart,summary"
+private let iOSSelectedRunOfShowStorageKey = "prodconnect.ios.runOfShow.selectedID.v1"
+
+private enum IOSOverviewSource: String, CaseIterable, Identifiable {
+    case runOfShowLive
+    case setlist
+    case stagePlot
+    case smaart
+    case summary
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .runOfShowLive: return "Run of Show Live"
+        case .setlist: return "Setlist"
+        case .stagePlot: return "Stage Plot"
+        case .smaart: return "Smaart dB"
+        case .summary: return "ProdConnect Summary"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .runOfShowLive: return "timer"
+        case .setlist: return "list.number"
+        case .stagePlot: return "music.note.house"
+        case .smaart: return "waveform.path.ecg"
+        case .summary: return "square.grid.2x2"
+        }
+    }
+}
+
+private func decodeIOSOverviewSources(_ rawValue: String) -> [IOSOverviewSource] {
+    let decoded = rawValue
+        .split(separator: ",")
+        .compactMap { IOSOverviewSource(rawValue: String($0)) }
+    return decoded.isEmpty ? [.runOfShowLive, .setlist, .stagePlot, .smaart, .summary] : decoded
+}
+
+private func encodeIOSOverviewSources(_ sources: [IOSOverviewSource]) -> String {
+    sources.map(\.rawValue).joined(separator: ",")
+}
+
+private struct IOSOverviewWindow<Content: View>: View {
+    let source: IOSOverviewSource
+    let title: String
+    let systemImage: String
+    let subtitle: String
+    let isDropTargeted: Bool
+    @ViewBuilder var content: () -> Content
+
+    private static var minHeight: Double { 170 }
+    private static var maxHeight: Double { 720 }
+    private static var defaultHeight: Double { 300 }
+
+    @State private var storedHeight: Double
+    @GestureState private var dragDelta: Double = 0
+
+    init(
+        source: IOSOverviewSource,
+        title: String,
+        systemImage: String,
+        subtitle: String,
+        isDropTargeted: Bool,
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        self.source = source
+        self.title = title
+        self.systemImage = systemImage
+        self.subtitle = subtitle
+        self.isDropTargeted = isDropTargeted
+        self.content = content
+        let saved = UserDefaults.standard.double(forKey: Self.heightDefaultsKey(for: source))
+        self._storedHeight = State(initialValue: saved > 0 ? saved : Self.defaultHeight)
+    }
+
+    private var displayHeight: Double {
+        max(Self.minHeight, min(Self.maxHeight, storedHeight + dragDelta))
+    }
+
+    private var resizeGesture: some Gesture {
+        DragGesture(minimumDistance: 2)
+            .updating($dragDelta) { value, state, _ in
+                state = value.translation.height
+            }
+            .onEnded { value in
+                storedHeight = max(Self.minHeight, min(Self.maxHeight, storedHeight + value.translation.height))
+                UserDefaults.standard.set(storedHeight, forKey: Self.heightDefaultsKey(for: source))
+            }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+
+            Divider().opacity(0.45)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    content()
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(14)
+            }
+            .scrollIndicators(.never)
+
+            resizeHandle
+        }
+        .frame(maxWidth: .infinity, minHeight: displayHeight, maxHeight: displayHeight, alignment: .topLeading)
+        .background(Color(.secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(isDropTargeted ? Color.accentColor.opacity(0.8) : Color.secondary.opacity(0.16), lineWidth: isDropTargeted ? 2 : 1)
+        )
+    }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Image(systemName: systemImage)
+                .font(.headline)
+                .foregroundStyle(.tint)
+                .frame(width: 28, height: 28)
+                .background(Color.accentColor.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.headline)
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            Image(systemName: "line.3.horizontal")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Color.secondary.opacity(0.72))
+                .frame(width: 34, height: 34)
+                .contentShape(Rectangle())
+                .draggable(source.rawValue) {
+                    Label(source.title, systemImage: source.systemImage)
+                        .padding(8)
+                }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(Color(.tertiarySystemGroupedBackground).opacity(0.5))
+    }
+
+    private var resizeHandle: some View {
+        Rectangle()
+            .fill(Color.clear)
+            .frame(height: 18)
+            .contentShape(Rectangle())
+            .overlay {
+                Capsule()
+                    .fill(Color.secondary.opacity(0.32))
+                    .frame(width: 42, height: 4)
+            }
+            .gesture(resizeGesture)
+    }
+
+    private static func heightDefaultsKey(for source: IOSOverviewSource) -> String {
+        "prodconnect.ios.overviewTileHeight.\(source.rawValue)"
+    }
+}
+
+private struct OverviewTabView: View {
+    @EnvironmentObject private var store: ProdConnectStore
+    @AppStorage(iOSOverviewSourcesStorageKey) private var overviewSourcesRawValue = defaultIOSOverviewSourcesRawValue
+    @AppStorage(iOSSelectedRunOfShowStorageKey) private var selectedRunOfShowID = ""
+    @State private var selectedSmaartChannelID: String?
+    @State private var dropTargetSourceID: String?
+    @ObservedObject private var smaartController = SmaartAPIController.shared
+
+    private var shows: [RunOfShowDocument] {
+        RunOfShowDocument.sortedShows(store.runOfShows)
+    }
+
+    private var activeShow: RunOfShowDocument? {
+        shows.first(where: { $0.id == selectedRunOfShowID })
+            ?? shows.first(where: { $0.isLiveActive })
+            ?? shows.first
+    }
+
+    private var selectedSources: [IOSOverviewSource] {
+        decodeIOSOverviewSources(overviewSourcesRawValue)
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach(selectedSources) { source in
+                            overviewCard(for: source, show: activeShow, now: context.date)
+                                .dropDestination(for: String.self) { ids, _ in
+                                    guard let draggedID = ids.first else { return false }
+                                    moveOverviewSource(fromID: draggedID, toID: source.rawValue)
+                                    return true
+                                } isTargeted: { targeted in
+                                    dropTargetSourceID = targeted ? source.rawValue : nil
+                                }
+                                .opacity(dropTargetSourceID == source.rawValue ? 0.72 : 1)
+                        }
+                    }
+                    .padding()
+                }
+            }
+            .navigationTitle("Overview")
+            .background(Color(.systemGroupedBackground))
+        }
+    }
+
+    @ViewBuilder
+    private func overviewCard(for source: IOSOverviewSource, show: RunOfShowDocument?, now: Date) -> some View {
+        switch source {
+        case .runOfShowLive:
+            liveOverviewCard(show: show, now: now)
+        case .setlist:
+            setlistCard(show: show)
+        case .stagePlot:
+            stagePlotCard(show: show)
+        case .smaart:
+            smaartCard
+        case .summary:
+            systemSummaryCard
+        }
+    }
+
+    private func liveOverviewCard(show: RunOfShowDocument?, now: Date) -> some View {
+        let items = show?.sortedItems ?? []
+        let currentID = show?.isLiveActive == true ? show?.liveCurrentItemID : items.first?.id
+        let currentItem = currentID.flatMap { id in items.first(where: { $0.id == id }) }
+        let elapsed = show?.isLiveActive == true ? max(Int(now.timeIntervalSince(show?.liveItemStartedAt ?? now)), 0) : 0
+        let duration = currentItem?.durationSeconds ?? 0
+        let remaining = show?.isLiveActive == true ? max(duration - elapsed, 0) : duration
+        let overrun = show?.isLiveActive == true ? max(elapsed - duration, 0) : 0
+        let projectedEnd = show?.projectedEndTime(at: now) ?? now
+
+        return overviewCard(source: .runOfShowLive, title: "Run of Show Live", systemImage: "timer", subtitle: showTitle(show)) {
+            overviewRow("Now", currentItemTitle(currentItem))
+            overviewRow(overrun > 0 ? "Overrun" : "Remaining", overrun > 0 ? "+\(clock(overrun))" : clock(remaining))
+            overviewRow("Show Ends", projectedEnd.formatted(date: .omitted, time: .shortened))
+            overviewRow("Status", show?.isLiveActive == true ? "Live timer running" : "Live timer stopped")
+        }
+    }
+
+    private func setlistCard(show: RunOfShowDocument?) -> some View {
+        let items = show?.sortedItems ?? []
+        return overviewCard(source: .setlist, title: "Setlist", systemImage: "list.number", subtitle: showTitle(show)) {
+            if items.isEmpty {
+                Text("No setlist items")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            } else {
+                Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 8) {
+                    GridRow {
+                        overviewGridHeader("#")
+                        overviewGridHeader("Title")
+                        overviewGridHeader("Length")
+                        overviewGridHeader("Person")
+                    }
+                    ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                        GridRow {
+                            Text("\(index + 1)")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                            Text(trimmedTitle(item.title, fallback: "Untitled"))
+                                .font(.subheadline)
+                                .lineLimit(1)
+                            Text(item.formattedDuration)
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                            Text(trimmedTitle(item.person, fallback: "—"))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func stagePlotCard(show: RunOfShowDocument?) -> some View {
+        let items = show?.sortedStagePlotItems ?? []
+        return overviewCard(source: .stagePlot, title: "Stage Plot", systemImage: "music.note.house", subtitle: showTitle(show)) {
+            if let show {
+                IOSOverviewStagePlotSnapshot(show: show)
+                    .frame(height: 220)
+            } else {
+                Text("No stage plot")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            overviewRow("Items", "\(items.count)")
+        }
+    }
+
+    private var systemSummaryCard: some View {
+        overviewCard(source: .summary, title: "ProdConnect", systemImage: "square.grid.2x2", subtitle: "Team overview") {
+            overviewRow("Shows", "\(shows.count)")
+            overviewRow("Tickets", "\(store.tickets.count)")
+            overviewRow("Patch Rows", "\(store.patchsheet.count)")
+            overviewRow("Assets", "\(store.gear.count)")
+        }
+    }
+
+    private var smaartCard: some View {
+        let channels = smaartController.channels
+        let selectedChannel = selectedSmaartChannel(from: channels)
+        return overviewCard(
+            source: .smaart,
+            title: "Smaart dB",
+            systemImage: "waveform.path.ecg",
+            subtitle: smaartController.connectionStatus.isConnected
+                ? "\(channels.count) channel\(channels.count == 1 ? "" : "s")"
+                : smaartController.connectionStatus.label
+        ) {
+            if !SmaartAPIController.shared.settings.isEnabled {
+                Text("Smaart integration is disabled")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            } else if let selectedChannel {
+                smaartMeter(selectedChannel, channels: channels)
+            } else {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(smaartController.connectionStatus.indicatorColor)
+                        .frame(width: 10, height: 10)
+                    Text(smaartController.connectionStatus.label)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .onAppear {
+            if SmaartAPIController.shared.settings.isEnabled {
+                SmaartAPIController.shared.restart()
+            }
+        }
+    }
+
+    private func selectedSmaartChannel(from channels: [SmaartChannel]) -> SmaartChannel? {
+        if let selectedSmaartChannelID,
+           let channel = channels.first(where: { $0.id == selectedSmaartChannelID }) {
+            return channel
+        }
+        return channels.first
+    }
+
+    private func smaartMeter(_ channel: SmaartChannel, channels: [SmaartChannel]) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if channels.count > 1 {
+                Picker("Channel", selection: Binding(
+                    get: { selectedSmaartChannelID ?? channel.id },
+                    set: { selectedSmaartChannelID = $0 }
+                )) {
+                    ForEach(channels) { option in
+                        Text(option.name).tag(option.id)
+                    }
+                }
+                .pickerStyle(.menu)
+            } else {
+                Text(channel.name)
+                    .font(.subheadline.weight(.semibold))
+            }
+
+            Text(String(format: "%.1f", channel.dB))
+                .font(.system(size: 56, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(channel.displayColor)
+                .lineLimit(1)
+                .minimumScaleFactor(0.55)
+
+            Text("Current dB SPL")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 10) {
+                smaartMetric(label: "Peak", value: channel.compactPeak)
+                smaartMetric(label: "Avg 10 min", value: channel.average10MinDB.map { String(format: "%.1f", $0) } ?? "—")
+                Circle()
+                    .fill(smaartController.connectionStatus.indicatorColor)
+                    .frame(width: 12, height: 12)
+            }
+        }
+    }
+
+    private func smaartMetric(label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label)
+                .font(.caption2.weight(.semibold))
+                .textCase(.uppercase)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.headline.monospacedDigit())
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(Color(.tertiarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func overviewCard<Content: View>(
+        source: IOSOverviewSource,
+        title: String,
+        systemImage: String,
+        subtitle: String,
+        @ViewBuilder content: @escaping () -> Content
+    ) -> some View {
+        IOSOverviewWindow(
+            source: source,
+            title: title,
+            systemImage: systemImage,
+            subtitle: subtitle,
+            isDropTargeted: dropTargetSourceID == source.rawValue
+        ) {
+            content()
+        }
+    }
+
+    private func moveOverviewSource(fromID: String, toID: String) {
+        guard fromID != toID,
+              let fromSource = IOSOverviewSource(rawValue: fromID),
+              selectedSources.contains(fromSource)
+        else { return }
+        var ordered = selectedSources
+        guard let fromIndex = ordered.firstIndex(where: { $0.rawValue == fromID }),
+              let toIndex = ordered.firstIndex(where: { $0.rawValue == toID })
+        else { return }
+        let moved = ordered.remove(at: fromIndex)
+        ordered.insert(moved, at: toIndex)
+        overviewSourcesRawValue = encodeIOSOverviewSources(ordered)
+    }
+
+    private func overviewRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 86, alignment: .leading)
+            Text(value)
+                .font(.subheadline)
+                .foregroundStyle(.primary)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func overviewGridHeader(_ title: String) -> some View {
+        Text(title)
+            .font(.caption2.weight(.semibold))
+            .textCase(.uppercase)
+            .foregroundStyle(.secondary)
+    }
+
+    private func showTitle(_ show: RunOfShowDocument?) -> String {
+        guard let show else { return "No show selected" }
+        let title = show.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return title.isEmpty ? "Untitled Show" : title
+    }
+
+    private func currentItemTitle(_ item: RunOfShowItem?) -> String {
+        guard let item else { return "No active item" }
+        let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return title.isEmpty ? "Untitled Item" : title
+    }
+
+    private func setlistItemText(_ item: RunOfShowItem) -> String {
+        let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let person = item.person.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = title.isEmpty ? "Untitled Item" : title
+        return person.isEmpty ? "\(base) - \(item.formattedDuration)" : "\(base) - \(person) - \(item.formattedDuration)"
+    }
+
+    private func trimmedTitle(_ value: String, fallback: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+
+    private func clock(_ seconds: Int) -> String {
+        let clamped = max(seconds, 0)
+        return String(format: "%02d:%02d", clamped / 60, clamped % 60)
+    }
+}
+
+private struct IOSOverviewStagePlotSnapshot: View {
+    let show: RunOfShowDocument
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack {
+                stageSurface
+                    .fill(Color(.tertiarySystemGroupedBackground))
+                    .overlay(stageSurface.stroke(Color.secondary.opacity(0.25), lineWidth: 1))
+
+                ForEach(show.sortedStagePlotItems) { item in
+                    stageNode(item)
+                        .position(stagePoint(for: item, size: proxy.size))
+                }
+            }
+            .padding(10)
+            .background(Color(.systemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(Color.secondary.opacity(0.16), lineWidth: 1)
+            )
+        }
+    }
+
+    private var stageSurface: some Shape {
+        RoundedRectangle(cornerRadius: 12, style: .continuous)
+    }
+
+    private func stagePoint(for item: RunOfShowStagePlotItem, size: CGSize) -> CGPoint {
+        CGPoint(
+            x: min(max(item.x, 0.05), 0.95) * size.width,
+            y: min(max(item.y, 0.05), 0.95) * size.height
+        )
+    }
+
+    private func stageNode(_ item: RunOfShowStagePlotItem) -> some View {
+        let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return VStack(spacing: 2) {
+            Image(systemName: icon(for: item.role))
+                .font(.system(size: 12, weight: .semibold))
+            Text(title.isEmpty ? item.role.defaultTitle : title)
+                .font(.system(size: 9, weight: .semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+        }
+        .foregroundStyle(.white)
+        .frame(width: max(42, 52 * item.sizeScale), height: max(32, 42 * item.sizeScale))
+        .background(color(for: item.role), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .rotationEffect(.degrees(item.rotationDegrees))
+    }
+
+    private func icon(for role: RunOfShowStagePlotRole) -> String {
+        role.systemImageName ?? "music.note"
+    }
+
+    private func color(for role: RunOfShowStagePlotRole) -> Color {
+        switch role {
+        case .vocal: return .purple
+        case .guitar, .bassGuitar: return .orange
+        case .keyboard: return .blue
+        case .drumSet: return .red
+        case .instrument: return .green
+        case .microphoneStand: return .indigo
+        case .speaker: return .teal
+        }
     }
 }
 
@@ -14607,9 +15870,12 @@ private struct RunOfShowTabView: View {
     }
 
     @EnvironmentObject private var store: ProdConnectStore
+    @AppStorage(iOSSelectedRunOfShowStorageKey) private var persistedSelectedShowID = ""
     @State private var selectedShowID: String?
     @State private var mode: DisplayMode = .timeline
     @State private var showToDelete: RunOfShowDocument?
+    @State private var draggingShowID: String?
+    @State private var draggingItemID: String?
     @State private var showTitleDraft = ""
     @State private var selectedStagePlotItemID: String?
     @State private var editingStagePlotItemID: String?
@@ -14627,7 +15893,7 @@ private struct RunOfShowTabView: View {
     }
 
     private var shows: [RunOfShowDocument] {
-        store.runOfShows.sorted { $0.updatedAt > $1.updatedAt }
+        RunOfShowDocument.sortedShows(store.runOfShows)
     }
 
     private var selectedShow: RunOfShowDocument? {
@@ -14642,7 +15908,10 @@ private struct RunOfShowTabView: View {
                 .toolbar { toolbarContent }
                 .onAppear {
                     if selectedShowID == nil {
-                        selectedShowID = shows.first?.id
+                        selectedShowID = shows.first(where: { $0.id == persistedSelectedShowID })?.id ?? shows.first?.id
+                        if let selectedShowID {
+                            persistedSelectedShowID = selectedShowID
+                        }
                     }
                     syncShowTitleDraft()
                     syncSelectedStagePlotItem()
@@ -14656,6 +15925,13 @@ private struct RunOfShowTabView: View {
                         return
                     }
                     self.selectedShowID = ids.first
+                    persistedSelectedShowID = self.selectedShowID ?? ""
+                    syncShowTitleDraft()
+                    syncSelectedStagePlotItem()
+                    syncStagePlotDragPoints()
+                }
+                .onChange(of: selectedShowID) { newValue in
+                    persistedSelectedShowID = newValue ?? ""
                     syncShowTitleDraft()
                     syncSelectedStagePlotItem()
                     syncStagePlotDragPoints()
@@ -14670,6 +15946,7 @@ private struct RunOfShowTabView: View {
                         store.deleteRunOfShow(showToDelete)
                         if selectedShowID == showToDelete.id {
                             selectedShowID = shows.first(where: { $0.id != showToDelete.id })?.id
+                            persistedSelectedShowID = selectedShowID ?? ""
                         }
                         self.showToDelete = nil
                     }
@@ -14751,6 +16028,7 @@ private struct RunOfShowTabView: View {
     private func showContent(_ show: RunOfShowDocument) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
+                showsStrip
                 header(show)
                 modePicker
                 activeModeView(for: show)
@@ -14784,6 +16062,68 @@ private struct RunOfShowTabView: View {
         .pickerStyle(.segmented)
     }
 
+    private var showsStrip: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Shows/Events")
+                    .font(.headline)
+                Spacer()
+                if canEdit {
+                    Image(systemName: "line.3.horizontal")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(shows) { show in
+                        showChip(show)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        }
+    }
+
+    private func showChip(_ show: RunOfShowDocument) -> some View {
+        Button {
+            selectShow(show.id)
+        } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(show.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled Show" : show.title)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                Text(show.scheduledStart.formatted(date: .abbreviated, time: .shortened))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(width: 170, alignment: .leading)
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(selectedShowID == show.id ? Color.accentColor.opacity(0.18) : Color(.secondarySystemBackground))
+            )
+        }
+        .buttonStyle(.plain)
+        .draggable(show.id) {
+            Text(show.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled Show" : show.title)
+                .padding(8)
+        }
+        .dropDestination(for: String.self) { ids, _ in
+            guard canEdit, let draggedID = ids.first else { return false }
+            moveShow(fromID: draggedID, toID: show.id)
+            return true
+        } isTargeted: { targeted in
+            if targeted {
+                draggingShowID = show.id
+            } else if draggingShowID == show.id {
+                draggingShowID = nil
+            }
+        }
+        .opacity(draggingShowID == show.id ? 0.72 : 1)
+    }
+
     @ViewBuilder
     private func activeModeView(for show: RunOfShowDocument) -> some View {
         if mode == .timeline {
@@ -14801,7 +16141,7 @@ private struct RunOfShowTabView: View {
             Menu {
                 ForEach(shows) { show in
                     Button(show.title.isEmpty ? "Untitled Show" : show.title) {
-                        selectedShowID = show.id
+                        selectShow(show.id)
                     }
                 }
             } label: {
@@ -14838,7 +16178,9 @@ private struct RunOfShowTabView: View {
                 commitShowTitle(for: show)
             }
             .onDisappear {
-                commitShowTitle(for: show)
+                if selectedShowID == show.id {
+                    commitShowTitle(for: show)
+                }
             }
 
             HStack {
@@ -14980,6 +16322,22 @@ private struct RunOfShowTabView: View {
                             RoundedRectangle(cornerRadius: 0, style: .continuous)
                                 .fill(index.isMultiple(of: 2) ? Color(.secondarySystemBackground) : Color(.systemBackground))
                         )
+                        .draggable(item.id) {
+                            Text(item.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled Item" : item.title)
+                                .padding(8)
+                        }
+                        .dropDestination(for: String.self) { ids, _ in
+                            guard canEdit, let draggedID = ids.first else { return false }
+                            moveItem(show, fromID: draggedID, toID: item.id)
+                            return true
+                        } isTargeted: { targeted in
+                            if targeted {
+                                draggingItemID = item.id
+                            } else if draggingItemID == item.id {
+                                draggingItemID = nil
+                            }
+                        }
+                        .opacity(draggingItemID == item.id ? 0.72 : 1)
                     }
                 }
             }
@@ -15620,10 +16978,11 @@ private struct RunOfShowTabView: View {
             items: [
                 RunOfShowItem(title: "Welcome", lengthMinutes: 5, lengthSeconds: 0, position: 0),
                 RunOfShowItem(title: "Song 1", lengthMinutes: 5, lengthSeconds: 0, position: 1)
-            ]
+            ],
+            position: shows.count
         )
         store.saveRunOfShow(show)
-        selectedShowID = show.id
+        selectShow(show.id, commitCurrentTitle: false)
     }
 
     private func performExport(subject: ExportSubject, format: ExportFormat, show: RunOfShowDocument) {
@@ -15886,6 +17245,20 @@ private struct RunOfShowTabView: View {
         }
     }
 
+    private func moveShow(fromID: String, toID: String) {
+        guard fromID != toID else { return }
+        var ordered = shows
+        guard let fromIndex = ordered.firstIndex(where: { $0.id == fromID }),
+              let toIndex = ordered.firstIndex(where: { $0.id == toID }) else { return }
+        let moved = ordered.remove(at: fromIndex)
+        ordered.insert(moved, at: toIndex)
+        for (position, show) in ordered.enumerated() {
+            var updated = show
+            updated.position = position
+            store.saveRunOfShow(updated)
+        }
+    }
+
     private func deleteItem(_ show: RunOfShowDocument, itemID: String) {
         updateShow(show) { mutable in
             mutable.items.removeAll { $0.id == itemID }
@@ -15907,7 +17280,24 @@ private struct RunOfShowTabView: View {
         }
     }
 
+    private func moveItem(_ show: RunOfShowDocument, fromID: String, toID: String) {
+        guard fromID != toID else { return }
+        updateShow(show) { mutable in
+            var items = mutable.sortedItems
+            guard let fromIndex = items.firstIndex(where: { $0.id == fromID }),
+                  let toIndex = items.firstIndex(where: { $0.id == toID }) else { return }
+            let moved = items.remove(at: fromIndex)
+            items.insert(moved, at: toIndex)
+            mutable.items = items.enumerated().map { offset, item in
+                var updated = item
+                updated.position = offset
+                return updated
+            }
+        }
+    }
+
     private func startLive(_ show: RunOfShowDocument) {
+        selectShow(show.id)
         updateShow(show) { mutable in
             mutable.startLiveSession(at: Date())
         }
@@ -15948,6 +17338,16 @@ private struct RunOfShowTabView: View {
         DispatchQueue.main.async {
             store.saveRunOfShow(mutable)
         }
+    }
+
+    private func selectShow(_ showID: String, commitCurrentTitle: Bool = true) {
+        if commitCurrentTitle, let currentShow = selectedShow {
+            commitShowTitle(for: currentShow)
+        }
+        selectedShowID = showID
+        persistedSelectedShowID = showID
+        let nextTitle = shows.first(where: { $0.id == showID })?.title ?? ""
+        showTitleDraft = nextTitle
     }
 
     private func syncShowTitleDraft() {

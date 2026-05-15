@@ -63,6 +63,10 @@ struct ProdConnectMacApp: App {
         appDelegate.onWillTerminate = {
             ndiController.disableAllOutputsOnShutdown()
         }
+        // Start Smaart polling if it was previously enabled
+        Task { @MainActor in
+            SmaartAPIController.shared.restart()
+        }
     }
 
     var body: some Scene {
@@ -72,7 +76,7 @@ struct ProdConnectMacApp: App {
                 .environmentObject(ndiSettings)
                 .environmentObject(runOfShowControls)
                 .preferredColorScheme(.dark)
-                .frame(minWidth: 1280, minHeight: 820)
+                .frame(minWidth: 960, minHeight: 680)
         }
         .windowResizability(.contentMinSize)
         .windowToolbarStyle(.unifiedCompact)

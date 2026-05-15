@@ -554,6 +554,7 @@ private enum MacRoute: String, CaseIterable, Identifiable {
     case tickets
     case checklists
     case ideas
+    case overview
     case customize
     case users
     case account
@@ -570,6 +571,7 @@ private enum MacRoute: String, CaseIterable, Identifiable {
         case .tickets: return "Tickets"
         case .checklists: return "Checklist"
         case .ideas: return "Ideas"
+        case .overview: return "Overview"
         case .customize: return "Settings"
         case .users: return "Users"
         case .account: return "Account"
@@ -586,6 +588,7 @@ private enum MacRoute: String, CaseIterable, Identifiable {
         case .tickets: return "ticket"
         case .checklists: return "checklist"
         case .ideas: return "lightbulb"
+        case .overview: return "square.grid.2x2"
         case .customize: return "slider.horizontal.3"
         case .users: return "person.3"
         case .account: return "person.crop.circle"
@@ -599,11 +602,25 @@ private enum MacSettingsSection: String, CaseIterable, Identifiable {
     case locationsRooms = "Locations / Rooms"
     case tickets = "Tickets"
     case integrations = "Integrations"
+    case overview = "Overview"
     case ndi = "NDI"
     case midi = "MIDI"
     case users = "Users"
 
     var id: String { rawValue }
+}
+
+private struct MacOverviewSourceOption: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let systemImage: String
+}
+
+private enum MacNDIOverviewSourceID {
+    static let runOfShowLive = "runOfShowLive"
+    static let stagePlot = "stagePlot"
+    static let setlist = "setlist"
+    static let smaart = "smaart"
 }
 
 private func externalTicketFormSlug(from organizationName: String) -> String {
@@ -651,6 +668,7 @@ struct MacRootView: View {
     @EnvironmentObject private var ndiSettings: MacNDISettingsController
     @EnvironmentObject private var runOfShowControls: MacRunOfShowControlController
     @State private var selectedRoute: MacRoute? = .chat
+    @State private var draggingSidebarRoute: MacRoute?
     @State private var isShowingNotifications = false
     @State private var showsWelcomeScreen = true
     @AppStorage("prodconnect.mac.sidebarRouteOrder") private var sidebarRouteOrderStorage = ""
@@ -666,6 +684,8 @@ struct MacRootView: View {
                 return store.canSeeTrainingTab
             case .tickets:
                 return store.canUseTickets
+            case .overview:
+                return store.user?.normalizedSubscriptionTier != "free"
             case .users:
                 return store.user?.isAdmin == true || store.user?.isOwner == true
             default:
@@ -750,6 +770,11 @@ struct MacRootView: View {
                 .onChange(of: store.user?.id) { _, newValue in
                     showsWelcomeScreen = newValue != nil
                 }
+                .onChange(of: sidebarRoutes.map(\.rawValue)) { _, _ in
+                    if let selectedRoute, !sidebarRoutes.contains(selectedRoute) {
+                        self.selectedRoute = sidebarRoutes.first
+                    }
+                }
                 .sheet(isPresented: $isShowingNotifications) {
                     MacNotificationsView()
                         .environmentObject(store)
@@ -798,12 +823,24 @@ struct MacRootView: View {
                         ? Color.accentColor.opacity(0.15)
                         : Color.clear
                 )
+                .onDrag {
+                    draggingSidebarRoute = route
+                    return NSItemProvider(object: route.rawValue as NSString)
+                }
+                .onDrop(
+                    of: [.text],
+                    delegate: MacSidebarRouteDropDelegate(
+                        targetRoute: route,
+                        routes: sidebarRoutes,
+                        draggingRoute: $draggingSidebarRoute,
+                        persistRoutes: persistSidebarRoutes
+                    )
+                )
             }
-            .onMove(perform: moveSidebarRoutes)
         }
         .listStyle(.sidebar)
         .navigationTitle("ProdConnect")
-        .navigationSplitViewColumnWidth(min: 220, ideal: 220, max: 220)
+        .navigationSplitViewColumnWidth(min: 180, ideal: 205, max: 240)
         .scrollContentBackground(.hidden)
         .background(Color.black.opacity(0.2))
     }
@@ -827,6 +864,10 @@ struct MacRootView: View {
             MacChecklistView()
         case .ideas:
             MacIdeasView()
+        case .overview:
+            MacOverviewMultiview()
+                .environmentObject(store)
+                .environmentObject(ndiSettings)
         case .customize:
             MacSettingsView()
                 .environmentObject(store)
@@ -859,10 +900,36 @@ struct MacRootView: View {
         sidebarRouteOrderStorage = routes.map(\.rawValue).joined(separator: ",")
     }
 
-    private func moveSidebarRoutes(from source: IndexSet, to destination: Int) {
-        var routes = sidebarRoutes
-        routes.move(fromOffsets: source, toOffset: destination)
-        persistSidebarRoutes(routes)
+}
+
+private struct MacSidebarRouteDropDelegate: DropDelegate {
+    let targetRoute: MacRoute
+    let routes: [MacRoute]
+    @Binding var draggingRoute: MacRoute?
+    let persistRoutes: ([MacRoute]) -> Void
+
+    func dropEntered(info: DropInfo) {
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard let draggingRoute,
+              draggingRoute != targetRoute,
+              let fromIndex = routes.firstIndex(of: draggingRoute),
+              let toIndex = routes.firstIndex(of: targetRoute) else {
+            self.draggingRoute = nil
+            return false
+        }
+
+        var reordered = routes
+        let moved = reordered.remove(at: fromIndex)
+        reordered.insert(moved, at: toIndex)
+        persistRoutes(reordered)
+        self.draggingRoute = nil
+        return true
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
     }
 }
 
@@ -2072,6 +2139,7 @@ private struct MacPatchsheetView: View {
         guard let user = store.user else { return false }
         return hasNDIFeature && (user.isAdmin || user.isOwner)
     }
+
     private var nameColumnTitle: String {
         selectedCategory == "Lighting" ? "Fixture" : "Name"
     }
@@ -2572,6 +2640,7 @@ enum MacNDIOrientation: String, CaseIterable, Codable, Identifiable {
 }
 
 enum MacNDIFeedSourceType: String, CaseIterable, Codable, Identifiable {
+    case overview
     case patchsheet
     case tickets
     case runOfShow
@@ -2582,6 +2651,7 @@ enum MacNDIFeedSourceType: String, CaseIterable, Codable, Identifiable {
 
     var title: String {
         switch self {
+        case .overview: return "Overview Grid"
         case .patchsheet: return "Patchsheet"
         case .tickets: return "Tickets"
         case .runOfShow: return "Run of Show"
@@ -2622,6 +2692,7 @@ struct MacNDIFeedConfiguration: Identifiable, Codable, Equatable {
     var id: String = UUID().uuidString
     var title: String = "ProdConnect Feed"
     var sourceType: MacNDIFeedSourceType = .patchsheet
+    var overviewRouteIDs: [String] = MacNDIFeedConfiguration.defaultOverviewRouteIDs
     var category: String = "Audio"
     var ticketStatusFilter: MacTicketNDIStatusFilter = .all
     var runOfShowID: String?
@@ -2634,6 +2705,7 @@ struct MacNDIFeedConfiguration: Identifiable, Codable, Equatable {
         case id
         case title
         case sourceType
+        case overviewRouteIDs
         case category
         case ticketStatusFilter
         case runOfShowID
@@ -2647,6 +2719,7 @@ struct MacNDIFeedConfiguration: Identifiable, Codable, Equatable {
         id: String = UUID().uuidString,
         title: String = "ProdConnect Feed",
         sourceType: MacNDIFeedSourceType = .patchsheet,
+        overviewRouteIDs: [String] = MacNDIFeedConfiguration.defaultOverviewRouteIDs,
         category: String = "Audio",
         ticketStatusFilter: MacTicketNDIStatusFilter = .all,
         runOfShowID: String? = nil,
@@ -2658,6 +2731,7 @@ struct MacNDIFeedConfiguration: Identifiable, Codable, Equatable {
         self.id = id
         self.title = title
         self.sourceType = sourceType
+        self.overviewRouteIDs = overviewRouteIDs
         self.category = category
         self.ticketStatusFilter = ticketStatusFilter
         self.runOfShowID = runOfShowID
@@ -2672,6 +2746,7 @@ struct MacNDIFeedConfiguration: Identifiable, Codable, Equatable {
         id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
         title = try container.decodeIfPresent(String.self, forKey: .title) ?? "ProdConnect Feed"
         sourceType = try container.decodeIfPresent(MacNDIFeedSourceType.self, forKey: .sourceType) ?? .patchsheet
+        overviewRouteIDs = try container.decodeIfPresent([String].self, forKey: .overviewRouteIDs) ?? Self.defaultOverviewRouteIDs
         category = try container.decodeIfPresent(String.self, forKey: .category) ?? "Audio"
         ticketStatusFilter = try container.decodeIfPresent(MacTicketNDIStatusFilter.self, forKey: .ticketStatusFilter) ?? .all
         runOfShowID = try container.decodeIfPresent(String.self, forKey: .runOfShowID)
@@ -2679,6 +2754,1225 @@ struct MacNDIFeedConfiguration: Identifiable, Codable, Equatable {
         showsHeaders = try container.decodeIfPresent(Bool.self, forKey: .showsHeaders) ?? true
         scale = try container.decodeIfPresent(Double.self, forKey: .scale) ?? 1.2
         orientation = try container.decodeIfPresent(MacNDIOrientation.self, forKey: .orientation) ?? .landscape
+    }
+
+    static let defaultOverviewRouteIDs = [
+        MacRoute.patchsheet.rawValue,
+        MacRoute.runOfShow.rawValue,
+        MacNDIOverviewSourceID.runOfShowLive,
+        MacNDIOverviewSourceID.stagePlot,
+        MacRoute.gear.rawValue,
+        MacRoute.tickets.rawValue
+    ]
+}
+
+// MARK: - Smaart Integration
+
+enum SmaartLevelColor: String, Equatable {
+    case green
+    case yellow
+    case red
+
+    var color: Color {
+        switch self {
+        case .green: return .green
+        case .yellow: return .yellow
+        case .red: return .red
+        }
+    }
+
+    static func parse(_ value: Any?) -> SmaartLevelColor? {
+        guard let raw = value as? String else { return nil }
+        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let components = normalized
+            .replacingOccurrences(of: "#", with: "")
+            .replacingOccurrences(of: "rgb", with: "")
+            .replacingOccurrences(of: "rgba", with: "")
+            .replacingOccurrences(of: "(", with: "")
+            .replacingOccurrences(of: ")", with: "")
+            .replacingOccurrences(of: ";", with: ",")
+            .split(separator: ",")
+            .compactMap { Double($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        if components.count >= 3 {
+            let red = components[0]
+            let green = components[1]
+            let blue = components[2]
+            if red > 180, green < 140, blue < 140 { return .red }
+            if red > 180, green > 150, blue < 140 { return .yellow }
+            if green > 140, red < 160, blue < 160 { return .green }
+        }
+        if normalized.hasPrefix("#") || normalized.count == 6 {
+            let hex = normalized.replacingOccurrences(of: "#", with: "")
+            if hex.hasPrefix("ff") || hex.hasPrefix("e6") || hex.hasPrefix("cc") {
+                if hex.dropFirst(2).hasPrefix("ff") || hex.dropFirst(2).hasPrefix("cc") {
+                    return .yellow
+                }
+                return .red
+            }
+            if hex.dropFirst(2).hasPrefix("ff") || hex.dropFirst(2).hasPrefix("cc") {
+                return .green
+            }
+        }
+        if normalized.contains("green") || normalized.contains("normal") || normalized.contains("safe") || normalized.contains("ok") {
+            return .green
+        }
+        if normalized.contains("yellow") || normalized.contains("amber") || normalized.contains("warning") || normalized.contains("warn") || normalized.contains("caution") {
+            return .yellow
+        }
+        if normalized.contains("red") || normalized.contains("over") || normalized.contains("clip") || normalized.contains("high") || normalized.contains("danger") {
+            return .red
+        }
+        return nil
+    }
+}
+
+struct SmaartChannel: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let dB: Double
+    let peakDB: Double
+    var average10MinDB: Double? = nil
+    var levelColor: SmaartLevelColor? = nil
+    var displayColor: Color { levelColor?.color ?? (isClipping ? .red : .primary) }
+    var statusColor: Color { levelColor?.color ?? (isClipping ? .red : Color.secondary.opacity(0.7)) }
+    var isClipping: Bool { levelColor == .red || dB >= 120 || peakDB >= 120 }
+
+    var formattedDB: String {
+        dB <= -900 ? "—" : String(format: "%.1f dB SPL", dB)
+    }
+    var formattedPeak: String {
+        peakDB <= -900 ? "—" : String(format: "%.1f dB SPL", peakDB)
+    }
+    var compactPeak: String {
+        peakDB <= -900 ? "—" : String(format: "%.1f", peakDB)
+    }
+    var formattedAverage10Min: String {
+        guard let average10MinDB else { return "—" }
+        return String(format: "%.1f dB SPL", average10MinDB)
+    }
+}
+
+enum SmaartConnectionStatus: Equatable {
+    case disconnected
+    case connecting
+    case connected
+    case error(String)
+
+    var label: String {
+        switch self {
+        case .disconnected: return "Not connected"
+        case .connecting: return "Connecting…"
+        case .connected: return "Connected"
+        case .error(let msg): return "Error: \(msg)"
+        }
+    }
+    var isConnected: Bool { self == .connected }
+    var indicatorColor: Color {
+        switch self {
+        case .connected: return .green
+        case .connecting: return .yellow
+        case .disconnected: return .secondary
+        case .error: return .red
+        }
+    }
+}
+
+struct SmaartSettings: Codable {
+    var isEnabled: Bool = false
+    var host: String = "localhost"
+    var port: Int = 9090
+    var apiPath: String = ""
+    var password: String = ""
+    var pollIntervalSeconds: Double = 0.25
+
+    private static let defaultsKey = "prodconnect.smaart.settings.v1"
+
+    static func load() -> SmaartSettings {
+        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+              let decoded = try? JSONDecoder().decode(SmaartSettings.self, from: data)
+        else { return SmaartSettings() }
+        return decoded
+    }
+
+    func save() {
+        if let data = try? JSONEncoder().encode(self) {
+            UserDefaults.standard.set(data, forKey: SmaartSettings.defaultsKey)
+        }
+    }
+
+    var resolvedURL: URL? {
+        let portStr = port > 0 ? ":\(port)" : ""
+        let path = apiPath.hasPrefix("/") ? apiPath : (apiPath.isEmpty ? "" : "/\(apiPath)")
+        return URL(string: "http://\(host.trimmingCharacters(in: .whitespacesAndNewlines))\(portStr)\(path)")
+    }
+}
+
+@MainActor
+final class SmaartAPIController: ObservableObject {
+    static let shared = SmaartAPIController()
+
+    @Published private(set) var channels: [SmaartChannel] = []
+    @Published private(set) var connectionStatus: SmaartConnectionStatus = .disconnected
+    @Published private(set) var lastRawResponse: String = ""
+    @Published var settings: SmaartSettings = SmaartSettings.load()
+
+    private var pollingTask: Task<Void, Never>?
+    private var webSocketTask: URLSessionWebSocketTask?
+    private var recentSamplesByChannelID: [String: [(date: Date, value: Double)]] = [:]
+    private var peakByChannelID: [String: Double] = [:]
+    private let session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 3.0
+        return URLSession(configuration: config)
+    }()
+
+    func applySettings(_ newSettings: SmaartSettings) {
+        settings = newSettings
+        settings.save()
+        restart()
+    }
+
+    func restart() {
+        pollingTask?.cancel()
+        pollingTask = nil
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        webSocketTask = nil
+        channels = []
+        recentSamplesByChannelID = [:]
+        peakByChannelID = [:]
+        lastRawResponse = ""
+        connectionStatus = .disconnected
+        guard settings.isEnabled, settings.resolvedURL != nil else { return }
+        connectionStatus = .connecting
+        if shouldUseSmaartWebSocket {
+            pollingTask = Task { await streamSmaartWebSocket() }
+        } else {
+            pollingTask = Task {
+            while !Task.isCancelled {
+                await poll()
+                let ms = max(100, Int(settings.pollIntervalSeconds * 1000))
+                try? await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
+            }
+            }
+        }
+    }
+
+    private var shouldUseSmaartWebSocket: Bool {
+        let path = settings.apiPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        return path.isEmpty || path == "/"
+    }
+
+    private func poll() async {
+        guard let url = settings.resolvedURL else {
+            connectionStatus = .error("Invalid URL")
+            return
+        }
+        do {
+            if settings.apiPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+               settings.apiPath.trimmingCharacters(in: .whitespacesAndNewlines) == "/" {
+                let wsResponses = await webSocketResponses(from: url)
+                for wsResponse in wsResponses {
+                    let parsed = parseSmaartResponse(wsResponse.data)
+                    if !parsed.isEmpty {
+                        lastRawResponse = wsResponse.preview
+                        updateChannels(parsed)
+                        connectionStatus = .connected
+                        return
+                    }
+                    lastRawResponse = wsResponse.preview
+                }
+                if !wsResponses.isEmpty {
+                    channels = []
+                    connectionStatus = .error("Connected to Smaart WebSocket, but no SPL channels parsed — see raw response")
+                    return
+                }
+            }
+
+            let (data, finalURL) = try await fetchData(from: url)
+            lastRawResponse = String(data: data, encoding: .utf8).map {
+                $0.count > 800 ? String($0.prefix(800)) + "…" : $0
+            } ?? "(binary data)"
+            // Detect HTML — root URL returned the web viewer, not the data endpoint
+            let responseText = String(data: data, encoding: .utf8) ?? ""
+            if responseText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("<!doctype") ||
+               responseText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("<html") {
+                for wsResponse in await webSocketResponses(from: url) {
+                    let parsed = parseSmaartResponse(wsResponse.data)
+                    if !parsed.isEmpty {
+                        lastRawResponse = wsResponse.preview
+                        updateChannels(parsed)
+                        connectionStatus = .connected
+                        return
+                    }
+                    lastRawResponse = wsResponse.preview
+                }
+                var triedURLs: [URL] = []
+                for apiResponse in await apiV3CommandResponses(from: url) {
+                    let parsed = parseSmaartResponse(apiResponse.data)
+                    if !parsed.isEmpty {
+                        lastRawResponse = apiResponse.preview
+                        updateChannels(parsed)
+                        connectionStatus = .connected
+                        return
+                    }
+                }
+                for candidateURL in await candidateDataURLs(from: url, html: responseText) {
+                    triedURLs.append(candidateURL)
+                    guard let (jsonData, _) = try? await fetchData(from: candidateURL) else { continue }
+                    let text = String(data: jsonData, encoding: .utf8) ?? ""
+                    guard !isHTML(text) else { continue }
+                    let parsed = parseSmaartResponse(jsonData)
+                    if !parsed.isEmpty {
+                        lastRawResponse = text.count > 800 ? String(text.prefix(800)) + "…" : text
+                        updateChannels(parsed)
+                        connectionStatus = .connected
+                        return
+                    }
+                    lastRawResponse = text.count > 800 ? String(text.prefix(800)) + "…" : text
+                }
+                if !triedURLs.isEmpty {
+                    lastRawResponse = await smaartDebugSummary(rootURL: url, html: responseText, triedURLs: triedURLs)
+                }
+                connectionStatus = .error("Smaart returned its web page, not meter data. Leave API Path blank to auto-detect, or use the SPL webviewer data path.")
+                channels = []
+                return
+            }
+            let parsed = parseSmaartResponse(data)
+            updateChannels(parsed)
+            connectionStatus = parsed.isEmpty ? .error("Connected but no channels parsed — see raw response") : .connected
+            _ = finalURL
+        } catch {
+            if !Task.isCancelled {
+                connectionStatus = .error(error.localizedDescription)
+                channels = []
+            }
+        }
+    }
+
+    private func updateChannels(_ newChannels: [SmaartChannel]) {
+        let now = Date()
+        let cutoff = now.addingTimeInterval(-600)
+        channels = newChannels.map { channel in
+            let sampleValue = channel.dB
+            var samples = recentSamplesByChannelID[channel.id, default: []]
+            if sampleValue > -900 {
+                samples.append((date: now, value: sampleValue))
+            }
+            samples.removeAll { $0.date < cutoff }
+            recentSamplesByChannelID[channel.id] = samples
+
+            let rollingAverage = samples.isEmpty
+                ? channel.average10MinDB
+                : samples.map(\.value).reduce(0, +) / Double(samples.count)
+            let peak = max(peakByChannelID[channel.id] ?? channel.peakDB, channel.peakDB, sampleValue)
+            peakByChannelID[channel.id] = peak
+            return SmaartChannel(
+                id: channel.id,
+                name: channel.name,
+                dB: channel.dB,
+                peakDB: peak,
+                average10MinDB: channel.average10MinDB ?? rollingAverage,
+                levelColor: channel.levelColor
+            )
+        }
+    }
+
+    private func fetchData(from url: URL) async throws -> (Data, URL) {
+        var request = URLRequest(url: url)
+        if !settings.password.isEmpty {
+            let cred = Data(":\(settings.password)".utf8).base64EncodedString()
+            request.setValue("Basic \(cred)", forHTTPHeaderField: "Authorization")
+        }
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            throw URLError(.badServerResponse)
+        }
+        return (data, url)
+    }
+
+    private struct SmaartAPIResponse {
+        let data: Data
+        let preview: String
+    }
+
+    private final class ContinuationGate<Value> {
+        private let lock = NSLock()
+        private var hasResumed = false
+        private let continuation: CheckedContinuation<Value, Never>
+
+        init(_ continuation: CheckedContinuation<Value, Never>) {
+            self.continuation = continuation
+        }
+
+        func resume(returning value: Value) {
+            lock.lock()
+            let shouldResume = !hasResumed
+            hasResumed = true
+            lock.unlock()
+            guard shouldResume else { return }
+            continuation.resume(returning: value)
+        }
+    }
+
+    private enum SmaartWebSocketReceiveResult {
+        case message(URLSessionWebSocketTask.Message)
+        case failure(String)
+    }
+
+    private struct SmaartStreamEndpoint {
+        let name: String
+        let path: String
+    }
+
+    private func streamSmaartWebSocket() async {
+        guard let rootURL = settings.resolvedURL
+        else {
+            connectionStatus = .error("Invalid Smaart URL")
+            return
+        }
+
+        while !Task.isCancelled {
+            let streamEndpoints = await smaartMetricStreamEndpoints(rootURL: rootURL)
+            let candidateURLs = streamEndpoints.isEmpty
+                ? []
+                : streamEndpoints.compactMap { webSocketURL(for: $0.path, rootURL: rootURL) }
+            var foundLiveStream = false
+            var attemptSummaries: [String] = []
+
+            for wsURL in candidateURLs {
+                guard !Task.isCancelled else { return }
+                var request = URLRequest(url: wsURL)
+                request.timeoutInterval = 3.0
+                if !settings.password.isEmpty {
+                    let cred = Data(":\(settings.password)".utf8).base64EncodedString()
+                    request.setValue("Basic \(cred)", forHTTPHeaderField: "Authorization")
+                }
+
+                let task = session.webSocketTask(with: request)
+                webSocketTask = task
+                task.resume()
+                _ = await sendWebSocketString(#"{"action":"set","properties":[{"targetFPS":20}]}"#, on: task, timeoutSeconds: 1.0)
+
+                let shouldSendGet = wsURL.path == "/api/v3/" || wsURL.path == "/api/v4/"
+                if shouldSendGet, let sendError = await sendWebSocketString(#"{"action":"get"}"#, on: task, timeoutSeconds: 3.0) {
+                    attemptSummaries.append("WebSocket \(wsURL.absoluteString)\nSend failed: \(sendError)")
+                    if !Task.isCancelled {
+                        connectionStatus = .error("Smaart WebSocket send failed: \(sendError)")
+                        lastRawResponse = attemptSummaries.last ?? ""
+                    }
+                    task.cancel(with: .goingAway, reason: nil)
+                    continue
+                }
+
+                connectionStatus = .connecting
+                    lastRawResponse = "WebSocket \(wsURL.absoluteString)\nListening for SPL updates"
+                var lastMessageAt = Date()
+                var lastDebugUpdateAt = Date.distantPast
+                var parsedAnyReading = false
+                var messageCount = 0
+
+                while !Task.isCancelled {
+                    let result = await receiveWebSocketMessage(task, timeoutSeconds: 5.0)
+                    switch result {
+                    case .message(let message):
+                        lastMessageAt = Date()
+                        messageCount += 1
+                        let data: Data
+                        let text: String
+                        switch message {
+                        case .string(let messageText):
+                            text = messageText
+                            data = Data(messageText.utf8)
+                        case .data(let messageData):
+                            data = messageData
+                            text = String(data: messageData, encoding: .utf8) ?? "(binary data)"
+                        @unknown default:
+                            continue
+                        }
+
+                        let preview = text.count > 1200 ? String(text.prefix(1200)) + "..." : text
+                        if !parsedAnyReading || Date().timeIntervalSince(lastDebugUpdateAt) >= 5 {
+                            lastRawResponse = preview
+                            lastDebugUpdateAt = Date()
+                        }
+                        attemptSummaries.append("WebSocket \(wsURL.absoluteString)\nMessage \(messageCount):\n\(preview)")
+                        let parsed = parseSmaartResponse(data)
+                        if !parsed.isEmpty {
+                            updateChannels(parsed)
+                            connectionStatus = .connected
+                            parsedAnyReading = true
+                            foundLiveStream = true
+                        }
+
+                        if !parsedAnyReading && messageCount >= 2 {
+                            break
+                        }
+                    case .failure(let message):
+                        attemptSummaries.append("WebSocket \(wsURL.absoluteString)\nReceive failed: \(message)")
+                        if !parsedAnyReading && message.localizedCaseInsensitiveContains("timed out") {
+                            break
+                        } else if Date().timeIntervalSince(lastMessageAt) >= 4.5 {
+                            _ = await sendWebSocketString(#"{"action":"get"}"#, on: task, timeoutSeconds: 1.0)
+                        } else {
+                            lastRawResponse = "WebSocket \(wsURL.absoluteString)\nReceive failed: \(message)"
+                        }
+                        if message.localizedCaseInsensitiveContains("cancel") || message.localizedCaseInsensitiveContains("closed") {
+                            break
+                        }
+                    }
+                }
+
+                task.cancel(with: .goingAway, reason: nil)
+                if webSocketTask === task {
+                    webSocketTask = nil
+                }
+                if foundLiveStream {
+                    break
+                }
+            }
+
+            if !Task.isCancelled {
+                if channels.isEmpty {
+                    connectionStatus = .error("Connected to Smaart, but no SPL meter stream was found — see raw response")
+                    if candidateURLs.isEmpty {
+                        let discoveryResponse = lastRawResponse.trimmingCharacters(in: .whitespacesAndNewlines)
+                        lastRawResponse = discoveryResponse.isEmpty
+                            ? "No active calibrated SPL inputs were returned by Smaart. In Smaart, make sure at least one calibrated input is active/logging."
+                            : "No active calibrated SPL stream endpoints were returned.\n\n\(discoveryResponse)"
+                    } else {
+                        lastRawResponse = await smaartStreamDebugSummary(rootURL: rootURL, candidateURLs: candidateURLs, attemptSummaries: attemptSummaries)
+                    }
+                } else {
+                    connectionStatus = .connected
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    private func webSocketURL(for path: String, rootURL: URL) -> URL? {
+        if path.hasPrefix("ws://") || path.hasPrefix("wss://") {
+            return URL(string: path)
+        }
+        guard var components = URLComponents(url: rootURL, resolvingAgainstBaseURL: false) else { return nil }
+        components.scheme = "ws"
+        let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
+        if normalizedPath.contains("%") {
+            components.percentEncodedPath = normalizedPath
+        } else {
+            components.path = normalizedPath
+        }
+        components.query = nil
+        return components.url
+    }
+
+    private func smaartMetricStreamEndpoints(rootURL: URL) async -> [SmaartStreamEndpoint] {
+        guard let responseData = await sendSmaartAPIRequest(
+            ["action": "get", "target": "activeCalibratedInputs"],
+            rootURL: rootURL,
+            apiPaths: ["/api/v4/", "/api/v3/"],
+            expectedResponse: { data in
+                !self.extractSmaartStreamEndpoints(from: data).isEmpty
+            }
+        ) else { return [] }
+        lastRawResponse = String(data: responseData, encoding: .utf8).map {
+            $0.count > 1200 ? String($0.prefix(1200)) + "..." : $0
+        } ?? "(binary data)"
+        return extractSmaartStreamEndpoints(from: responseData)
+    }
+
+    private func sendSmaartAPIRequest(
+        _ payload: [String: Any],
+        rootURL: URL,
+        apiPaths: [String],
+        expectedResponse: (Data) -> Bool
+    ) async -> Data? {
+        guard let body = try? JSONSerialization.data(withJSONObject: payload),
+              let requestText = String(data: body, encoding: .utf8)
+        else { return nil }
+
+        var debugMessages: [String] = []
+        for apiPath in apiPaths {
+            guard var components = URLComponents(url: rootURL, resolvingAgainstBaseURL: false) else { continue }
+            components.scheme = "ws"
+            components.path = apiPath
+            components.query = nil
+            guard let apiURL = components.url else { continue }
+
+            var request = URLRequest(url: apiURL)
+            request.timeoutInterval = 3.0
+            if !settings.password.isEmpty {
+                let cred = Data(":\(settings.password)".utf8).base64EncodedString()
+                request.setValue("Basic \(cred)", forHTTPHeaderField: "Authorization")
+            }
+
+            let task = session.webSocketTask(with: request)
+            task.resume()
+
+            debugMessages.append("WebSocket \(apiURL.absoluteString)\nSent:\n\(requestText)")
+
+            if let sendError = await sendWebSocketString(requestText, on: task, timeoutSeconds: 3.0) {
+                debugMessages.append("WebSocket \(apiURL.absoluteString)\nSend failed: \(sendError)")
+                task.cancel(with: .goingAway, reason: nil)
+                continue
+            }
+
+            var didHitTerminalReceiveFailure = false
+            for index in 1...8 {
+                switch await receiveWebSocketMessage(task, timeoutSeconds: 4.0) {
+                case .message(let message):
+                    let data: Data
+                    let text: String
+                    switch message {
+                    case .string(let messageText):
+                        text = messageText
+                        data = Data(messageText.utf8)
+                    case .data(let messageData):
+                        data = messageData
+                        text = String(data: messageData, encoding: .utf8) ?? "(binary data)"
+                    @unknown default:
+                        continue
+                    }
+                    let preview = text.count > 800 ? String(text.prefix(800)) + "..." : text
+                    debugMessages.append("WebSocket \(apiURL.absoluteString)\nMessage \(index):\n\(preview)")
+                    if expectedResponse(data) {
+                        task.cancel(with: .goingAway, reason: nil)
+                        lastRawResponse = preview
+                        return data
+                    }
+                case .failure(let message):
+                    debugMessages.append("WebSocket \(apiURL.absoluteString)\nReceive failed: \(message)")
+                    didHitTerminalReceiveFailure = true
+                }
+                if didHitTerminalReceiveFailure { break }
+            }
+            task.cancel(with: .goingAway, reason: nil)
+        }
+        lastRawResponse = debugMessages.joined(separator: "\n\n")
+        return nil
+    }
+
+    private func extractSmaartStreamEndpoints(from data: Data) -> [SmaartStreamEndpoint] {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let response = json["response"] as? [String: Any],
+              let devices = response["devices"] as? [[String: Any]]
+        else { return [] }
+
+        return devices.flatMap { device -> [SmaartStreamEndpoint] in
+            let deviceName = device["deviceName"] as? String ?? "Smaart"
+            let channels = device["activeCalibratedChannels"] as? [[String: Any]] ?? []
+            return channels.compactMap { channel in
+                guard let endpoint = channel["streamEndpoint"] as? String, !endpoint.isEmpty else { return nil }
+                let channelName = channel["channelName"] as? String ?? deviceName
+                return SmaartStreamEndpoint(name: channelName, path: endpoint)
+            }
+        }
+    }
+
+    private func smaartWebSocketURLs(rootURL: URL) async -> [URL] {
+        var urls: [URL] = []
+        func append(_ path: String) {
+            guard var components = URLComponents(url: rootURL, resolvingAgainstBaseURL: false) else { return }
+            components.scheme = "ws"
+            components.path = path
+            components.query = nil
+            if let url = components.url {
+                urls.append(url)
+            }
+        }
+
+        append("/api/v3/")
+        append("/api/v4/")
+        append("/api/v3/stream")
+        append("/api/v3/stream/")
+        append("/api/v3/SPL")
+        append("/api/v3/spl")
+        append("/api/v3/meter")
+        append("/api/v3/meters")
+        append("/api/v3/meterArray")
+        append("/stream")
+        append("/stream/")
+        append("/spl")
+        append("/SPL")
+        append("/meters")
+        append("/meterArray")
+        append("/splStream")
+        append("/meterStream")
+        append("/live")
+        append("/live/spl")
+
+        if let rootData = try? await fetchData(from: rootURL).0,
+           let html = String(data: rootData, encoding: .utf8) {
+            for assetURL in assetURLs(in: html, relativeTo: rootURL).prefix(8) {
+                guard let (assetData, _) = try? await fetchData(from: assetURL),
+                      let assetText = String(data: assetData, encoding: .utf8)
+                else { continue }
+                for path in webSocketPaths(in: assetText) {
+                    append(path)
+                }
+            }
+        }
+
+        var seen = Set<String>()
+        return urls.filter { seen.insert($0.absoluteString).inserted }
+    }
+
+    private func webSocketPaths(in text: String) -> [String] {
+        let pattern = #"["']([^"']*(?:api/v3|stream|spl|meter|endpoint)[^"']*)["']"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
+        let nsText = text as NSString
+        return regex.matches(in: text, range: NSRange(location: 0, length: nsText.length)).compactMap { match in
+            guard match.numberOfRanges > 1 else { return nil }
+            var raw = nsText.substring(with: match.range(at: 1))
+            guard !raw.contains("{"), !raw.contains("}"), !raw.contains("\\") else { return nil }
+            if raw.hasPrefix("ws://") || raw.hasPrefix("wss://") {
+                return URL(string: raw)?.path
+            }
+            if raw.hasPrefix("/") {
+                return raw
+            }
+            if raw.hasPrefix("api/") {
+                return "/\(raw)"
+            }
+            return nil
+        }
+    }
+
+    private func smaartStreamDebugSummary(rootURL: URL, candidateURLs: [URL], attemptSummaries: [String]) async -> String {
+        var sections: [String] = ["Smaart stream debug summary:"]
+        if !attemptSummaries.isEmpty {
+            sections.append(attemptSummaries.prefix(10).joined(separator: "\n\n"))
+        }
+        sections.append("Tried WebSocket endpoints:\n" + candidateURLs.map(\.absoluteString).joined(separator: "\n"))
+
+        if let rootData = try? await fetchData(from: rootURL).0,
+           let html = String(data: rootData, encoding: .utf8) {
+            for assetURL in assetURLs(in: html, relativeTo: rootURL).prefix(8) {
+                guard let (assetData, _) = try? await fetchData(from: assetURL),
+                      let assetText = String(data: assetData, encoding: .utf8)
+                else { continue }
+                let snippet = javascriptSnippet(from: assetText, needles: ["streamEndpoint", "new WebSocket", "meterArray", "setFramerate", "createMeter", "api/v3", "addReadyHandler", "serverProbe", "Smaart", "host +"])
+                if !snippet.isEmpty {
+                    sections.append("JS \(assetURL.absoluteString)\n\(snippet)")
+                }
+            }
+        }
+
+        return sections.joined(separator: "\n\n")
+    }
+
+    private func webSocketResponses(from rootURL: URL) async -> [SmaartAPIResponse] {
+        guard var components = URLComponents(url: rootURL, resolvingAgainstBaseURL: false) else { return [] }
+        components.scheme = "ws"
+        components.path = "/api/v3/"
+        components.query = nil
+        guard let wsURL = components.url else { return [] }
+
+        var request = URLRequest(url: wsURL)
+        request.timeoutInterval = 3.0
+        if !settings.password.isEmpty {
+            let cred = Data(":\(settings.password)".utf8).base64EncodedString()
+            request.setValue("Basic \(cred)", forHTTPHeaderField: "Authorization")
+        }
+
+        let task = session.webSocketTask(with: request)
+        task.resume()
+        defer { task.cancel(with: .goingAway, reason: nil) }
+
+        if let sendError = await sendWebSocketString(#"{"action":"get"}"#, on: task, timeoutSeconds: 3.0) {
+            return [SmaartAPIResponse(data: Data(), preview: "WebSocket \(wsURL.absoluteString)\nSend failed: \(sendError)")]
+        }
+
+        var responses: [SmaartAPIResponse] = []
+        for _ in 0..<4 {
+            let result = await receiveWebSocketMessage(task, timeoutSeconds: 2.0)
+            switch result {
+            case .failure(let message):
+                if responses.isEmpty {
+                    responses.append(SmaartAPIResponse(
+                        data: Data(),
+                        preview: "WebSocket \(wsURL.absoluteString)\nSent {\"action\":\"get\"}\nReceive failed: \(message)"
+                    ))
+                }
+                return responses
+            case .message(let message):
+                switch message {
+            case .string(let text):
+                let data = Data(text.utf8)
+                responses.append(SmaartAPIResponse(
+                    data: data,
+                    preview: "WebSocket \(wsURL.absoluteString)\nSent {\"action\":\"get\"}\n\(text.prefix(1200))"
+                ))
+            case .data(let data):
+                let text = String(data: data, encoding: .utf8) ?? "(binary data)"
+                responses.append(SmaartAPIResponse(
+                    data: data,
+                    preview: "WebSocket \(wsURL.absoluteString)\nSent {\"action\":\"get\"}\n\(text.prefix(1200))"
+                ))
+            @unknown default:
+                break
+                }
+            }
+        }
+
+        if responses.isEmpty {
+            return [SmaartAPIResponse(data: Data(), preview: "WebSocket \(wsURL.absoluteString)\nConnected, but no response to {\"action\":\"get\"}")]
+        }
+        return responses
+    }
+
+    private func sendWebSocketString(_ text: String, on task: URLSessionWebSocketTask, timeoutSeconds: Double) async -> String? {
+        await withCheckedContinuation { continuation in
+            let gate = ContinuationGate<String?>(continuation)
+            let timeout = DispatchWorkItem {
+                gate.resume(returning: "Timed out after \(String(format: "%.1f", timeoutSeconds))s")
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeoutSeconds, execute: timeout)
+            task.send(.string(text)) { error in
+                timeout.cancel()
+                gate.resume(returning: error?.localizedDescription)
+            }
+        }
+    }
+
+    private func receiveWebSocketMessage(_ task: URLSessionWebSocketTask, timeoutSeconds: Double) async -> SmaartWebSocketReceiveResult {
+        await withCheckedContinuation { continuation in
+            let gate = ContinuationGate<SmaartWebSocketReceiveResult>(continuation)
+            let timeout = DispatchWorkItem {
+                gate.resume(returning: .failure("Timed out after \(String(format: "%.1f", timeoutSeconds))s"))
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeoutSeconds, execute: timeout)
+            task.receive { result in
+                timeout.cancel()
+                switch result {
+                case .success(let message):
+                    gate.resume(returning: .message(message))
+                case .failure(let error):
+                    gate.resume(returning: .failure(error.localizedDescription))
+                }
+            }
+        }
+    }
+
+    private func apiV3CommandResponses(from rootURL: URL) async -> [SmaartAPIResponse] {
+        guard let apiURL = URL(string: "/api/v3/", relativeTo: rootURL)?.absoluteURL else { return [] }
+        let payloads: [[String: Any]] = [
+            ["command": "meterArray"],
+            ["command": "getMeterArray"],
+            ["command": "getMeters"],
+            ["command": "getSPL"],
+            ["command": "SPL"],
+            ["request": "meterArray"],
+            ["request": "SPL"],
+            ["method": "meterArray"],
+            ["method": "get", "path": "meterArray"],
+            ["method": "get", "path": "SPL"],
+            ["jsonrpc": "2.0", "id": 1, "method": "get", "params": ["meterArray"]],
+            ["jsonrpc": "2.0", "id": 1, "method": "get", "params": ["SPL"]]
+        ]
+
+        var responses: [SmaartAPIResponse] = []
+        for payload in payloads {
+            guard let body = try? JSONSerialization.data(withJSONObject: payload) else { continue }
+            var request = URLRequest(url: apiURL)
+            request.httpMethod = "POST"
+            request.httpBody = body
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            if !settings.password.isEmpty {
+                let cred = Data(":\(settings.password)".utf8).base64EncodedString()
+                request.setValue("Basic \(cred)", forHTTPHeaderField: "Authorization")
+            }
+            guard let (data, response) = try? await session.data(for: request),
+                  let http = response as? HTTPURLResponse
+            else { continue }
+            let text = String(data: data, encoding: .utf8) ?? "(binary data)"
+            let command = String(data: body, encoding: .utf8) ?? "{}"
+            let preview = "POST \(apiURL.absoluteString)\n\(command)\nStatus \(http.statusCode)\n\(text.prefix(800))"
+            if (200...299).contains(http.statusCode) {
+                responses.append(SmaartAPIResponse(data: data, preview: preview))
+            }
+        }
+        return responses
+    }
+
+    private func isHTML(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return trimmed.hasPrefix("<!doctype") || trimmed.hasPrefix("<html") || trimmed.hasPrefix("<")
+    }
+
+    private func candidateDataURLs(from rootURL: URL, html: String) async -> [URL] {
+        let commonPaths = [
+            "/data",
+            "/data.json",
+            "/spl",
+            "/spl.json",
+            "/meters",
+            "/meters.json",
+            "/api",
+            "/api/",
+            "/api/data",
+            "/api/data.json",
+            "/api/spl",
+            "/api/spl.json",
+            "/api/meters",
+            "/api/meters.json",
+            "/api/channels",
+            "/api/inputs",
+            "/api/v1",
+            "/api/v1/data",
+            "/api/v1/spl",
+            "/api/v1/meters",
+            "/api/v1/channels",
+            "/api/v3/",
+            "/api/v3/meterArray",
+            "/api/v3/SPL",
+            "/api/v3/input",
+            "/api/v3/plotInputs"
+        ]
+        var paths = commonPaths
+        paths.append(contentsOf: endpointPaths(in: html))
+
+        for assetURL in assetURLs(in: html, relativeTo: rootURL).prefix(8) {
+            guard let (assetData, _) = try? await fetchData(from: assetURL),
+                  let assetText = String(data: assetData, encoding: .utf8)
+            else { continue }
+            paths.append(contentsOf: endpointPaths(in: assetText))
+        }
+
+        var seen = Set<String>()
+        return paths.compactMap { path in
+            let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty,
+                  !trimmed.hasPrefix("#"),
+                  !trimmed.lowercased().hasPrefix("javascript:")
+            else { return nil }
+
+            let resolved = URL(string: trimmed, relativeTo: rootURL)?.absoluteURL
+            guard let resolved, seen.insert(resolved.absoluteString).inserted else { return nil }
+            return resolved
+        }
+    }
+
+    private func smaartDebugSummary(rootURL: URL, html: String, triedURLs: [URL]) async -> String {
+        var lines: [String] = ["Smaart debug summary:"]
+        let importantURLs = triedURLs.filter { url in
+            let path = url.path.lowercased()
+            return path == "/api/v3/" ||
+                   path.contains("meterarray") ||
+                   path.contains("/spl") ||
+                   path.contains("plotinputs")
+        }.prefix(12)
+
+        for url in importantURLs {
+            var request = URLRequest(url: url)
+            if !settings.password.isEmpty {
+                let cred = Data(":\(settings.password)".utf8).base64EncodedString()
+                request.setValue("Basic \(cred)", forHTTPHeaderField: "Authorization")
+            }
+            if let (data, response) = try? await session.data(for: request),
+               let http = response as? HTTPURLResponse {
+                let text = String(data: data, encoding: .utf8) ?? "(binary data)"
+                lines.append("GET \(url.absoluteString)\nStatus \(http.statusCode)\n\(text.prefix(260))")
+            } else {
+                lines.append("GET \(url.absoluteString)\nNo response")
+            }
+        }
+
+        for assetURL in assetURLs(in: html, relativeTo: rootURL).prefix(4) {
+            guard let (data, _) = try? await fetchData(from: assetURL),
+                  let text = String(data: data, encoding: .utf8)
+            else { continue }
+            let snippet = javascriptSnippet(from: text)
+            if !snippet.isEmpty {
+                lines.append("JS \(assetURL.absoluteString)\n\(snippet)")
+            }
+        }
+
+        lines.append("Tried \(triedURLs.count) GET endpoints.")
+        return lines.joined(separator: "\n\n")
+    }
+
+    private func javascriptSnippet(from text: String, needles: [String] = ["api/v3", "XMLHttpRequest", ".open(", "fetch(", "WebSocket", "meterArray"]) -> String {
+        let nsText = text as NSString
+        var snippets: [String] = []
+        for needle in needles {
+            guard let range = text.range(of: needle, options: .caseInsensitive) else { continue }
+            let offset = text.distance(from: text.startIndex, to: range.lowerBound)
+            let start = max(0, offset - 220)
+            let length = min(nsText.length - start, 520)
+            snippets.append(nsText.substring(with: NSRange(location: start, length: length)))
+        }
+        return snippets.prefix(3).joined(separator: "\n---\n")
+    }
+
+    private func endpointPaths(in text: String) -> [String] {
+        let pattern = #"["']([^"']*(?:api|data|spl|meter|level|channel|input)[^"']*)["']"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
+        let nsText = text as NSString
+        return regex.matches(in: text, range: NSRange(location: 0, length: nsText.length)).compactMap { match in
+            guard match.numberOfRanges > 1 else { return nil }
+            let raw = nsText.substring(with: match.range(at: 1))
+            guard !raw.contains("{"),
+                  !raw.contains("}"),
+                  !raw.contains("\\"),
+                  !raw.contains(" "),
+                  !raw.hasSuffix(".css"),
+                  !raw.hasSuffix(".js"),
+                  !raw.hasSuffix(".png"),
+                  !raw.hasSuffix(".jpg"),
+                  !raw.hasSuffix(".gif")
+            else { return nil }
+            return raw
+        }
+    }
+
+    private func assetURLs(in html: String, relativeTo rootURL: URL) -> [URL] {
+        let pattern = #"(?:src|href)=["']([^"']+\.(?:js|json))["']"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
+        let nsHTML = html as NSString
+        return regex.matches(in: html, range: NSRange(location: 0, length: nsHTML.length)).compactMap { match in
+            guard match.numberOfRanges > 1 else { return nil }
+            return URL(string: nsHTML.substring(with: match.range(at: 1)), relativeTo: rootURL)?.absoluteURL
+        }
+    }
+
+    private func parseSmaartResponse(_ data: Data) -> [SmaartChannel] {
+        guard let json = try? JSONSerialization.jsonObject(with: data) else { return [] }
+
+        // Helper: extract dB value from a dict using many possible key names
+        func number(_ value: Any?) -> Double? {
+            if value is Bool { return nil }
+            if let v = value as? Double { return v }
+            if let v = value as? Int { return Double(v) }
+            if let v = value as? Float { return Double(v) }
+            if let v = value as? NSNumber { return v.doubleValue }
+            if let v = value as? String { return Double(v.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            return nil
+        }
+
+        func hasDBSignal(_ d: [String: Any]) -> Bool {
+            let keys = Set(d.keys.map { $0.lowercased() })
+            return !keys.isDisjoint(with: ["rms", "db", "value", "level", "leveldb", "level_db", "spl", "fast", "slow", "leq", "laeq", "lcpeak", "peak", "peakdb", "peak_db"])
+        }
+
+        func extractDB(_ d: [String: Any]) -> Double {
+            for key in ["rms", "db", "dB", "value", "level", "levelDb", "level_db", "spl", "SPL", "fast", "slow", "leq", "Leq", "laeq", "LAeq", "lcpeak", "LCpeak"] {
+                if let v = number(d[key]) { return v }
+            }
+            return -999.0
+        }
+        func extractPeak(_ d: [String: Any], fallback: Double) -> Double {
+            for key in ["Peak A", "peakA", "peak_a", "peak", "peakDb", "peak_db", "Peak", "lcpeak", "LCpeak"] {
+                if let v = number(d[key]) { return v }
+            }
+            return fallback
+        }
+        func normalizedMetricName(_ value: String) -> String {
+            value
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+                .replacingOccurrences(of: "_", with: " ")
+                .replacingOccurrences(of: "-", with: " ")
+                .replacingOccurrences(of: "  ", with: " ")
+        }
+        func collectMetricValues(_ metrics: [[String: Any]]) -> [String: Double] {
+            var metricValues: [String: Double] = [:]
+            let nameKeys = ["name", "label", "title", "metric", "meter", "type", "id"]
+            let valueKeys = ["value", "db", "dB", "level", "levelDb", "level_db", "spl", "SPL"]
+
+            for metric in metrics {
+                for (key, value) in metric {
+                    if let numeric = number(value) {
+                        metricValues[key] = numeric
+                        metricValues[normalizedMetricName(key)] = numeric
+                    }
+                }
+
+                let metricName = nameKeys.compactMap { metric[$0] as? String }.first
+                let metricValue = valueKeys.compactMap { number(metric[$0]) }.first
+                if let metricName, let metricValue {
+                    metricValues[metricName] = metricValue
+                    metricValues[normalizedMetricName(metricName)] = metricValue
+                }
+            }
+
+            return metricValues
+        }
+        func metricValue(_ values: [String: Double], _ names: [String]) -> Double? {
+            for name in names {
+                if let value = values[name] { return value }
+                if let value = values[normalizedMetricName(name)] { return value }
+            }
+            return nil
+        }
+        func extractLevelColor(_ d: [String: Any]) -> SmaartLevelColor? {
+            for key in ["targetColor", "target_color", "color", "rangeColor", "range_color", "statusColor", "status_color", "state", "status", "range"] {
+                if let color = SmaartLevelColor.parse(d[key]) { return color }
+            }
+            for value in d.values {
+                if let nested = value as? [String: Any],
+                   let color = extractLevelColor(nested) {
+                    return color
+                }
+                if let nestedArray = value as? [[String: Any]] {
+                    for nested in nestedArray {
+                        if let color = extractLevelColor(nested) {
+                            return color
+                        }
+                    }
+                }
+            }
+            return nil
+        }
+        func makeChannel(_ index: Int, _ name: String, _ d: [String: Any]) -> SmaartChannel {
+            let db = extractDB(d)
+            let peak = extractPeak(d, fallback: db)
+            let average10 = number(d["LAeq 10"]) ?? number(d["Leq 10"]) ?? number(d["LCeq 10"])
+            return SmaartChannel(id: "\(name)\(index)", name: name, dB: db, peakDB: peak, average10MinDB: average10, levelColor: extractLevelColor(d))
+        }
+
+        func channelName(_ d: [String: Any], index: Int) -> String {
+            (d["name"] as? String) ??
+            (d["channel"] as? String) ??
+            (d["label"] as? String) ??
+            (d["input"] as? String) ??
+            "Ch \(index + 1)"
+        }
+
+        func channels(from dictionary: [String: Any]) -> [SmaartChannel] {
+            dictionary.sorted(by: { $0.key < $1.key }).enumerated().compactMap { i, kv in
+                if let inner = kv.value as? [String: Any] {
+                    guard hasDBSignal(inner) else { return nil }
+                    return makeChannel(i, kv.key, inner)
+                }
+                if let value = kv.value as? Double {
+                    guard kv.key.localizedCaseInsensitiveContains("spl") ||
+                          kv.key.localizedCaseInsensitiveContains("db") ||
+                          kv.key.localizedCaseInsensitiveContains("level") ||
+                          kv.key.localizedCaseInsensitiveContains("leq") ||
+                          kv.key.localizedCaseInsensitiveContains("peak")
+                    else { return nil }
+                    return SmaartChannel(id: "\(kv.key)\(i)", name: kv.key, dB: value, peakDB: value, levelColor: extractLevelColor(dictionary))
+                }
+                if let value = kv.value as? Int {
+                    guard kv.key.localizedCaseInsensitiveContains("spl") ||
+                          kv.key.localizedCaseInsensitiveContains("db") ||
+                          kv.key.localizedCaseInsensitiveContains("level") ||
+                          kv.key.localizedCaseInsensitiveContains("leq") ||
+                          kv.key.localizedCaseInsensitiveContains("peak")
+                    else { return nil }
+                    return SmaartChannel(id: "\(kv.key)\(i)", name: kv.key, dB: Double(value), peakDB: Double(value), levelColor: extractLevelColor(dictionary))
+                }
+                return nil
+            }
+        }
+
+        // Format 1: array of dicts  [{name, rms, peak}, ...]
+        if let arr = json as? [[String: Any]] {
+            return arr.enumerated().map { i, d in
+                makeChannel(i, channelName(d, index: i), d)
+            }
+        }
+
+        if let arr = json as? [Any] {
+            let parsed = arr.enumerated().compactMap { i, value -> SmaartChannel? in
+                if let d = value as? [String: Any] {
+                    return makeChannel(i, channelName(d, index: i), d)
+                }
+                if let db = number(value) {
+                    return SmaartChannel(id: "spl\(i)", name: i == 0 ? "SPL" : "Ch \(i + 1)", dB: db, peakDB: db)
+                }
+                return nil
+            }
+            if !parsed.isEmpty { return parsed }
+        }
+
+        if let root = json as? [String: Any] {
+            if let metrics = root["metrics"] as? [[String: Any]] {
+                let metricValues = collectMetricValues(metrics)
+                let current = metricValue(metricValues, [
+                    "SPL A Slow",
+                    "SPL Slow",
+                    "SPL A Fast",
+                    "SPL Fast",
+                    "SPL",
+                    "LAeq 1",
+                    "Leq 1"
+                ])
+                if let current {
+                    let peak = metricValue(metricValues, ["Peak A", "LCpeak", "Peak"]) ?? -999.0
+                    let average10 = metricValue(metricValues, ["LAeq 10", "Leq 10", "LCeq 10"])
+                    let name = (root["channelName"] as? String) ??
+                        (root["deviceName"] as? String) ??
+                        "SPL"
+                    return [SmaartChannel(
+                        id: "smaart-\(name)",
+                        name: name,
+                        dB: current,
+                        peakDB: peak,
+                        average10MinDB: average10,
+                        levelColor: extractLevelColor(root)
+                    )]
+                }
+            }
+
+            // Format 2: {meters: [...]} or {channels: [...]} or {data: [...]} or {result: [...]}
+            for key in ["meters", "channels", "data", "result", "inputs", "outputs", "levels", "measurements", "payload", "value", "values", "message", "response", "meterArray"] {
+                if let arr = root[key] as? [[String: Any]] {
+                    return arr.enumerated().map { i, d in
+                        makeChannel(i, channelName(d, index: i), d)
+                    }
+                }
+                if let dict = root[key] as? [String: Any] {
+                    if let nestedData = try? JSONSerialization.data(withJSONObject: dict) {
+                        let nestedParsed = parseSmaartResponse(nestedData)
+                        if !nestedParsed.isEmpty { return nestedParsed }
+                    }
+                    let parsed = channels(from: dict)
+                    if !parsed.isEmpty { return parsed }
+                }
+                if let arr = root[key] as? [Any],
+                   let nestedData = try? JSONSerialization.data(withJSONObject: arr) {
+                    let nestedParsed = parseSmaartResponse(nestedData)
+                    if !nestedParsed.isEmpty { return nestedParsed }
+                }
+            }
+
+            let nestedCandidates = root.compactMap { _, value -> [String: Any]? in
+                value as? [String: Any]
+            }
+            for candidate in nestedCandidates {
+                if let nestedData = try? JSONSerialization.data(withJSONObject: candidate) {
+                    let nestedParsed = parseSmaartResponse(nestedData)
+                    if !nestedParsed.isEmpty { return nestedParsed }
+                }
+            }
+
+            // Format 3: {spl: {fast, peak}} — single-channel
+            if let splDict = root["spl"] as? [String: Any] {
+                let db = extractDB(splDict)
+                if db > -999 {
+                    let peak = extractPeak(splDict, fallback: db)
+                    return [SmaartChannel(id: "spl0", name: "SPL", dB: db, peakDB: peak, levelColor: extractLevelColor(splDict))]
+                }
+            }
+
+            // Format 4: {spl: {channelName: {fast, peak, ...}, ...}}  (Smaart v8/v9 SPL Webserver)
+            if let splDict = root["spl"] as? [String: Any] {
+                let parsed = channels(from: splDict)
+                if !parsed.isEmpty { return parsed }
+            }
+
+            // Format 5: flat single-channel root dict {rms, peak, name?}
+            let db = extractDB(root)
+            if db > -999, hasDBSignal(root) {
+                let name = (root["name"] as? String) ?? (root["channel"] as? String) ?? "SPL"
+                let peak = extractPeak(root, fallback: db)
+                return [SmaartChannel(id: "root0", name: name, dB: db, peakDB: peak, levelColor: extractLevelColor(root))]
+            }
+        }
+
+        return []
     }
 }
 
@@ -2724,7 +4018,63 @@ final class MacNDISettingsController: ObservableObject {
             }
             .store(in: &cancellables)
 
+        store.$gear
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.syncOutputs()
+            }
+            .store(in: &cancellables)
+
+        store.$lessons
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.syncOutputs()
+            }
+            .store(in: &cancellables)
+
+        store.$checklists
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.syncOutputs()
+            }
+            .store(in: &cancellables)
+
+        store.$ideas
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.syncOutputs()
+            }
+            .store(in: &cancellables)
+
+        store.$channels
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.syncOutputs()
+            }
+            .store(in: &cancellables)
+
+        store.$teamMembers
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.syncOutputs()
+            }
+            .store(in: &cancellables)
+
         store.$user
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.syncOutputs()
+            }
+            .store(in: &cancellables)
+
+        SmaartAPIController.shared.$channels
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.syncOutputs()
+            }
+            .store(in: &cancellables)
+
+        SmaartAPIController.shared.$connectionStatus
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
                 self?.syncOutputs()
@@ -2789,18 +4139,117 @@ final class MacNDISettingsController: ObservableObject {
 
     func updateFeedValue<Value>(_ value: Value, at index: Int, keyPath: WritableKeyPath<MacNDIFeedConfiguration, Value>) {
         guard feeds.indices.contains(index) else { return }
-        DispatchQueue.main.async {
-            guard self.feeds.indices.contains(index) else { return }
-            self.feeds[index][keyPath: keyPath] = value
-        }
+        feeds[index][keyPath: keyPath] = value
     }
 
     func updateRunOfShowID(_ runOfShowID: String?, at index: Int) {
         guard feeds.indices.contains(index) else { return }
         let normalizedID = runOfShowID?.isEmpty == true ? nil : runOfShowID
+        feeds[index].runOfShowID = normalizedID
+    }
+
+    func overviewFeeds() -> [(index: Int, feed: MacNDIFeedConfiguration)] {
+        Array(feeds.enumerated())
+            .filter { $0.element.sourceType == .overview }
+            .map { (index: $0.offset, feed: $0.element) }
+    }
+
+    func addOverviewFeedIfNeeded() {
+        guard canManageNDI else { return }
+        if feeds.contains(where: { $0.sourceType == .overview }) { return }
+        feeds.append(
+            MacNDIFeedConfiguration(
+                title: "ProdConnect Overview",
+                sourceType: .overview,
+                overviewRouteIDs: MacNDIFeedConfiguration.defaultOverviewRouteIDs,
+                scale: 1.0
+            )
+        )
+    }
+
+    fileprivate func availableOverviewSources() -> [MacOverviewSourceOption] {
+        guard hasNDIFeature else { return [] }
+        var options = MacRoute.allCases.compactMap { route -> MacOverviewSourceOption? in
+            let isVisible: Bool
+            switch route {
+            case .chat:
+                isVisible = store.canSeeChat
+            case .runOfShow:
+                isVisible = store.canSeeRunOfShow
+            case .training:
+                isVisible = store.canSeeTrainingTab
+            case .tickets:
+                isVisible = store.canUseTickets
+            case .overview, .customize, .account:
+                isVisible = false
+            case .users:
+                isVisible = store.user?.isAdmin == true || store.user?.isOwner == true
+            default:
+                isVisible = true
+            }
+            guard isVisible else { return nil }
+            let overriddenTitle: String = route == .runOfShow ? "Shows" : route.title
+            return MacOverviewSourceOption(id: route.rawValue, title: overriddenTitle, systemImage: route.icon)
+        }
+
+        if store.canSeeRunOfShow {
+            options.append(
+                MacOverviewSourceOption(
+                    id: MacNDIOverviewSourceID.runOfShowLive,
+                    title: "Run of Show Live",
+                    systemImage: "timer"
+                )
+            )
+            options.append(
+                MacOverviewSourceOption(
+                    id: MacNDIOverviewSourceID.setlist,
+                    title: "Setlist",
+                    systemImage: "list.number"
+                )
+            )
+            options.append(
+                MacOverviewSourceOption(
+                    id: MacNDIOverviewSourceID.stagePlot,
+                    title: "Stage Plot",
+                    systemImage: "music.note.house"
+                )
+            )
+        }
+
+        if hasNDIFeature, SmaartAPIController.shared.settings.isEnabled {
+            options.append(
+                MacOverviewSourceOption(
+                    id: MacNDIOverviewSourceID.smaart,
+                    title: "Smaart dB",
+                    systemImage: "waveform.path.ecg"
+                )
+            )
+        }
+
+        return options
+    }
+
+    fileprivate func overviewSources(for feed: MacNDIFeedConfiguration) -> [MacOverviewSourceOption] {
+        let available = availableOverviewSources()
+        let availableSet = Set(available.map(\.id))
+        let selectedIDs = feed.overviewRouteIDs.filter { availableSet.contains($0) }
+        let selected = selectedIDs.compactMap { id in available.first(where: { $0.id == id }) }
+        return selected.isEmpty ? Array(available.prefix(4)) : selected
+    }
+
+    fileprivate func setOverviewSource(_ source: MacOverviewSourceOption, isIncluded: Bool, at index: Int) {
+        guard feeds.indices.contains(index) else { return }
         DispatchQueue.main.async {
             guard self.feeds.indices.contains(index) else { return }
-            self.feeds[index].runOfShowID = normalizedID
+            var ids = self.feeds[index].overviewRouteIDs
+            if isIncluded {
+                if !ids.contains(source.id) {
+                    ids.append(source.id)
+                }
+            } else {
+                ids.removeAll { $0 == source.id }
+            }
+            self.feeds[index].overviewRouteIDs = ids
         }
     }
 
@@ -2811,7 +4260,7 @@ final class MacNDISettingsController: ObservableObject {
     }
 
     func runOfShows() -> [RunOfShowDocument] {
-        store.runOfShows.sorted { $0.updatedAt > $1.updatedAt }
+        RunOfShowDocument.sortedShows(store.runOfShows)
     }
 
     func runOfShow(for feed: MacNDIFeedConfiguration) -> RunOfShowDocument? {
@@ -2831,6 +4280,8 @@ final class MacNDISettingsController: ObservableObject {
 
     func descriptorText(for feed: MacNDIFeedConfiguration) -> String {
         switch feed.sourceType {
+        case .overview:
+            return "\(overviewSources(for: feed).count) sources in the overview grid"
         case .patchsheet:
             return "\(patches(for: feed.category).count) selected patches in \(feed.category)"
         case .tickets:
@@ -2867,11 +4318,26 @@ final class MacNDISettingsController: ObservableObject {
         }
 
         for feed in feeds {
-            controller(for: feed.id).update(
+            let shouldOwnController = feed.isLive || previewVisibleFeedIDs.contains(feed.id)
+            guard shouldOwnController else {
+                if let controller = controllers.removeValue(forKey: feed.id) {
+                    controller.close()
+                }
+                continue
+            }
+
+            let feedController = controller(for: feed.id)
+            if feed.sourceType == .overview {
+                feedController.liveOverviewTilesProvider = { [weak self] in
+                    self?.overviewTiles(for: feed, rowLimit: 20, now: Date()) ?? []
+                }
+            }
+            feedController.update(
                 configuration: MacPatchsheetNDIOutputConfiguration(
                     isActive: feed.isLive,
                     title: feed.title,
                     sourceType: feed.sourceType,
+                    overviewTiles: feed.sourceType == .overview ? overviewTiles(for: feed, rowLimit: 20, now: Date()) : [],
                     category: feed.category,
                     runOfShow: runOfShow(for: feed),
                     tickets: tickets(for: feed),
@@ -2924,6 +4390,269 @@ final class MacNDISettingsController: ObservableObject {
         let controller = MacPatchsheetNDIOutputWindowController()
         controllers[feedID] = controller
         return controller
+    }
+
+    fileprivate func overviewTiles(for feed: MacNDIFeedConfiguration) -> [MacOverviewTileData] {
+        overviewTiles(for: feed, rowLimit: 30, now: Date())
+    }
+
+    fileprivate func overviewTiles(for feed: MacNDIFeedConfiguration, now: Date) -> [MacOverviewTileData] {
+        overviewTiles(for: feed, rowLimit: 30, now: now)
+    }
+
+    private func overviewTiles(for feed: MacNDIFeedConfiguration, rowLimit: Int?, now: Date) -> [MacOverviewTileData] {
+        overviewSources(for: feed).map { overviewTile(for: $0, rowLimit: rowLimit, now: now) }
+    }
+
+    private func liveOverviewRunOfShow() -> RunOfShowDocument? {
+        let shows = runOfShows()
+        return shows.first(where: { $0.isLiveActive }) ?? shows.first
+    }
+
+    private func limitedRows(_ rows: [String], rowLimit: Int?) -> [String] {
+        guard let rowLimit else { return rows }
+        return Array(rows.prefix(rowLimit))
+    }
+
+    private func overviewTile(for source: MacOverviewSourceOption, rowLimit: Int?, now: Date) -> MacOverviewTileData {
+        if source.id == MacNDIOverviewSourceID.runOfShowLive {
+            let show = liveOverviewRunOfShow()
+            let items = show?.sortedItems ?? []
+            let currentID = show?.isLiveActive == true ? show?.liveCurrentItemID : items.first?.id
+            let currentItem = currentID.flatMap { id in items.first(where: { $0.id == id }) }
+            let elapsed = show?.isLiveActive == true ? max(Int(now.timeIntervalSince(show?.liveItemStartedAt ?? now)), 0) : 0
+            let currentDuration = currentItem?.durationSeconds ?? 0
+            let remaining = show?.isLiveActive == true ? max(currentDuration - elapsed, 0) : currentDuration
+            let overrun = show?.isLiveActive == true ? max(elapsed - currentDuration, 0) : 0
+            let isOverrun = overrun > 0
+            let projectedEnd = show?.projectedEndTime(at: now) ?? now
+            return MacOverviewTileData(
+                id: source.id,
+                title: source.title,
+                subtitle: show?.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? show?.title ?? "Selected show" : "Selected show",
+                systemImage: source.systemImage,
+                accent: isOverrun ? .red : .green,
+                rows: limitedRows([
+                    currentItem?.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? "Now: \(currentItem?.title ?? "")" : "No active item",
+                    isOverrun ? "Item overrun: \(runOfShowOverrunClock(seconds: overrun))" : "Item remaining: \(runOfShowFormattedClock(seconds: remaining))",
+                    "Show ends: \(projectedEnd.formatted(date: .omitted, time: .shortened))",
+                    "\(items.count) show items",
+                    show?.isLiveActive == true ? "Live timer running" : "Live timer stopped"
+                ], rowLimit: rowLimit)
+            )
+        }
+
+        if source.id == MacNDIOverviewSourceID.setlist {
+            let show = liveOverviewRunOfShow()
+            let items = show?.sortedItems ?? []
+            let limit = rowLimit ?? items.count
+            return MacOverviewTileData(
+                id: source.id,
+                title: source.title,
+                subtitle: show?.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? show!.title : "No show selected",
+                systemImage: source.systemImage,
+                accent: .green,
+                rows: [],
+                columnHeaders: ["Title", "Length", "Person"],
+                columnRows: Array(items.prefix(limit).map { item in
+                    let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let person = item.person.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return [
+                        title.isEmpty ? "Untitled" : title,
+                        item.formattedDuration,
+                        person.isEmpty ? "—" : person
+                    ]
+                })
+            )
+        }
+
+        if source.id == MacNDIOverviewSourceID.stagePlot {
+            let show = liveOverviewRunOfShow()
+            return MacOverviewTileData(
+                id: source.id,
+                title: source.title,
+                subtitle: show?.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? show!.title : "Stage Plot",
+                systemImage: source.systemImage,
+                accent: .teal,
+                rows: [],
+                stagePlotShow: show ?? RunOfShowDocument(title: "", teamCode: "", items: [])
+            )
+        }
+
+        if source.id == MacNDIOverviewSourceID.smaart {
+            let smaartChannels = SmaartAPIController.shared.channels
+            let status = SmaartAPIController.shared.connectionStatus
+            let selectedChannelID = UserDefaults.standard.string(forKey: MacOverviewTileData.smaartSelectedChannelDefaultsKey)
+            let selectedChannel = selectedChannelID.flatMap { id in
+                smaartChannels.first(where: { $0.id == id })
+            } ?? smaartChannels.first
+            let subtitle: String = status.isConnected
+                ? "\(smaartChannels.count) channel\(smaartChannels.count == 1 ? "" : "s")"
+                : status.label
+            return MacOverviewTileData(
+                id: source.id,
+                title: source.title,
+                subtitle: subtitle,
+                systemImage: source.systemImage,
+                accent: status.isConnected ? .green : .orange,
+                rows: smaartChannels.isEmpty ? [status.label] : [],
+                columnHeaders: smaartChannels.count > 1 ? ["Channel", "RMS", "Peak"] : [],
+                columnRows: selectedChannel == nil
+                    ? []
+                    : Array(smaartChannels.filter { $0.id != selectedChannel?.id }.prefix(rowLimit ?? smaartChannels.count).map { ch in
+                        [ch.name, ch.formattedDB, ch.formattedPeak]
+                    }),
+                smaartChannel: selectedChannel,
+                smaartChannels: smaartChannels,
+                smaartConnectionStatus: status
+            )
+        }
+
+        guard let route = MacRoute(rawValue: source.id) else {
+            return MacOverviewTileData(id: source.id, title: source.title, subtitle: "Overview source", systemImage: source.systemImage, accent: .gray, rows: [])
+        }
+
+        switch route {
+        case .chat:
+            let channels = store.channels.sorted { ($0.lastMessageAt ?? .distantPast) > ($1.lastMessageAt ?? .distantPast) }
+            return MacOverviewTileData(
+                id: source.id,
+                title: source.title,
+                subtitle: "\(channels.count) channels",
+                systemImage: source.systemImage,
+                accent: .blue,
+                rows: limitedRows(channels.map { $0.name.isEmpty ? "Untitled channel" : $0.name }, rowLimit: rowLimit)
+            )
+        case .patchsheet:
+            let patches = store.patchsheet.sorted(by: PatchRow.autoSort)
+            let patchLimit = rowLimit.map { $0 } ?? patches.count
+            return MacOverviewTileData(
+                id: source.id,
+                title: route.title,
+                subtitle: "\(patches.count) patch rows",
+                systemImage: route.icon,
+                accent: .cyan,
+                rows: [],
+                columnHeaders: ["Name", "Input", "Output"],
+                columnRows: Array(patches.prefix(patchLimit).map { patch in
+                    [
+                        patch.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : patch.name,
+                        patch.input.trimmingCharacters(in: .whitespacesAndNewlines),
+                        patch.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                    ]
+                })
+            )
+        case .runOfShow:
+            let shows = RunOfShowDocument.sortedShows(store.runOfShows)
+            return MacOverviewTileData(
+                id: source.id,
+                title: source.title,
+                subtitle: "\(shows.count) shows",
+                systemImage: route.icon,
+                accent: .green,
+                rows: limitedRows(shows.map { $0.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled show" : $0.title }, rowLimit: rowLimit)
+            )
+        case .training:
+            let lessons = store.lessons.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+            return MacOverviewTileData(
+                id: source.id,
+                title: route.title,
+                subtitle: "\(lessons.count) lessons",
+                systemImage: route.icon,
+                accent: .purple,
+                rows: limitedRows(lessons.map { $0.title.isEmpty ? "Untitled lesson" : $0.title }, rowLimit: rowLimit)
+            )
+        case .gear:
+            let gear = store.gear.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            let gearLimit = rowLimit.map { $0 } ?? gear.count
+            return MacOverviewTileData(
+                id: source.id,
+                title: route.title,
+                subtitle: "\(gear.count) assets",
+                systemImage: route.icon,
+                accent: .orange,
+                rows: [],
+                columnHeaders: ["Name", "Location"],
+                columnRows: Array(gear.prefix(gearLimit).map { item in
+                    let location = [item.campus.isEmpty ? item.location : item.campus, item.room].filter { !$0.isEmpty }.joined(separator: " / ")
+                    return [item.name.isEmpty ? "Untitled" : item.name, location]
+                })
+            )
+        case .tickets:
+            let tickets = store.visibleTickets.sorted { $0.updatedAt > $1.updatedAt }
+            let ticketLimit = rowLimit.map { $0 } ?? tickets.count
+            return MacOverviewTileData(
+                id: source.id,
+                title: route.title,
+                subtitle: "\(tickets.count) visible tickets",
+                systemImage: route.icon,
+                accent: .red,
+                rows: [],
+                columnHeaders: ["Title", "Status"],
+                columnRows: Array(tickets.prefix(ticketLimit).map { ticket in
+                    [ticket.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : ticket.title, ticket.status.rawValue]
+                })
+            )
+        case .checklists:
+            let checklists = store.checklists.sorted { $0.position < $1.position }
+            return MacOverviewTileData(
+                id: source.id,
+                title: route.title,
+                subtitle: "\(checklists.count) checklists",
+                systemImage: route.icon,
+                accent: .mint,
+                rows: limitedRows(checklists.map { $0.title.isEmpty ? "Untitled checklist" : $0.title }, rowLimit: rowLimit)
+            )
+        case .ideas:
+            let ideas = store.ideas.sorted { $0.updatedAt > $1.updatedAt }
+            return MacOverviewTileData(
+                id: source.id,
+                title: route.title,
+                subtitle: "\(ideas.count) ideas",
+                systemImage: route.icon,
+                accent: .yellow,
+                rows: limitedRows(ideas.map { $0.title.isEmpty ? "Untitled idea" : $0.title }, rowLimit: rowLimit)
+            )
+        case .users:
+            let members = store.teamMembers.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+            return MacOverviewTileData(
+                id: source.id,
+                title: route.title,
+                subtitle: "\(members.count) team members",
+                systemImage: route.icon,
+                accent: .indigo,
+                rows: limitedRows(members.map { $0.displayName.isEmpty ? $0.email : $0.displayName }, rowLimit: rowLimit)
+            )
+        case .overview, .customize, .account:
+            return MacOverviewTileData(id: source.id, title: route.title, subtitle: "Settings", systemImage: route.icon, accent: .gray, rows: [])
+        }
+    }
+
+    private func overviewPatchRowText(_ patch: PatchRow) -> String {
+        let name = patch.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled patch" : patch.name
+        let input = patch.input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let output = patch.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        let notes = patch.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        let universe = patch.universe?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        var details: [String] = []
+
+        if !input.isEmpty {
+            details.append("In \(input)")
+        }
+        if !output.isEmpty {
+            details.append("Out \(output)")
+        }
+        if patch.category == "Lighting", !universe.isEmpty {
+            details.append("U \(universe)")
+        }
+        if let channelCount = patch.channelCount, channelCount > 0 {
+            details.append("\(channelCount)ch")
+        }
+        if !notes.isEmpty {
+            details.append(notes)
+        }
+
+        return details.isEmpty ? name : "\(name) - \(details.joined(separator: " | "))"
     }
 
     private func persistFeeds() {
@@ -3105,7 +4834,7 @@ final class MacRunOfShowControlController: ObservableObject {
     }
 
     var shows: [RunOfShowDocument] {
-        store.runOfShows.sorted { $0.updatedAt > $1.updatedAt }
+        RunOfShowDocument.sortedShows(store.runOfShows)
     }
 
     var selectedShow: RunOfShowDocument? {
@@ -3412,6 +5141,416 @@ final class MacRunOfShowControlController: ObservableObject {
     }
 }
 
+private struct MacOverviewMultiview: View {
+    @EnvironmentObject private var store: ProdConnectStore
+    @EnvironmentObject private var ndiSettings: MacNDISettingsController
+    @State private var localOverviewRouteIDs = MacNDIFeedConfiguration.defaultOverviewRouteIDs
+
+    private var canManageNDI: Bool {
+        guard let user = store.user else { return false }
+        return user.normalizedSubscriptionTier != "free" && (user.isAdmin || user.isOwner)
+    }
+
+    private var overviewFeedItem: (index: Int, feed: MacNDIFeedConfiguration)? {
+        ndiSettings.overviewFeeds().first
+    }
+
+    private var displayFeed: MacNDIFeedConfiguration {
+        if let feed = overviewFeedItem?.feed {
+            return feed
+        }
+        return MacNDIFeedConfiguration(
+            title: "ProdConnect Overview",
+            sourceType: .overview,
+            overviewRouteIDs: localOverviewRouteIDs,
+            scale: 1.0
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            HStack(alignment: .center, spacing: 16) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Overview")
+                        .font(.system(size: 28, weight: .bold))
+                    Text("A summary of your selected ProdConnect windows.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                if let item = overviewFeedItem {
+                    Toggle("Send over NDI", isOn: feedBinding(item.index, \.isLive))
+                        .disabled(!canManageNDI)
+                } else {
+                    Button("Configure in Settings") { }
+                        .buttonStyle(.bordered)
+                        .disabled(true)
+                }
+            }
+
+            ScrollView {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    overviewTilesGrid(tiles: ndiSettings.overviewTiles(for: displayFeed, now: context.date))
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func overviewTilesGrid(tiles: [MacOverviewTileData]) -> some View {
+        VStack(spacing: 20) {
+            if tiles.isEmpty {
+                ContentUnavailableView(
+                    "No Overview Sources",
+                    systemImage: "square.grid.2x2",
+                    description: Text("Select sources in Settings → Overview.")
+                )
+                .frame(height: 260)
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    twoColumnOverviewTiles(tiles)
+                    oneColumnOverviewTiles(tiles)
+                }
+            }
+        }
+    }
+
+    private func twoColumnOverviewTiles(_ tiles: [MacOverviewTileData]) -> some View {
+        let leftTiles = tiles.enumerated().filter { $0.offset % 2 == 0 }.map(\.element)
+        let rightTiles = tiles.enumerated().filter { $0.offset % 2 == 1 }.map(\.element)
+        return HStack(alignment: .top, spacing: 20) {
+            VStack(spacing: 20) {
+                ForEach(leftTiles) { tile in
+                    MacOverviewTileCard(tile: tile, onDrop: { draggedID in moveTile(fromID: draggedID, toID: tile.id) })
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            VStack(spacing: 20) {
+                ForEach(rightTiles) { tile in
+                    MacOverviewTileCard(tile: tile, onDrop: { draggedID in moveTile(fromID: draggedID, toID: tile.id) })
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+    }
+
+    private func oneColumnOverviewTiles(_ tiles: [MacOverviewTileData]) -> some View {
+        VStack(spacing: 20) {
+            ForEach(tiles) { tile in
+                MacOverviewTileCard(tile: tile, onDrop: { draggedID in moveTile(fromID: draggedID, toID: tile.id) })
+            }
+        }
+    }
+
+    private func moveTile(fromID: String, toID: String) {
+        guard fromID != toID else { return }
+        if let item = overviewFeedItem {
+            var ids = item.feed.overviewRouteIDs
+            guard let fromIndex = ids.firstIndex(of: fromID),
+                  let toIndex = ids.firstIndex(of: toID) else { return }
+            ids.move(fromOffsets: IndexSet(integer: fromIndex), toOffset: toIndex > fromIndex ? toIndex + 1 : toIndex)
+            ndiSettings.updateFeedValue(ids, at: item.index, keyPath: \.overviewRouteIDs)
+        } else {
+            var ids = localOverviewRouteIDs
+            guard let fromIndex = ids.firstIndex(of: fromID),
+                  let toIndex = ids.firstIndex(of: toID) else { return }
+            ids.move(fromOffsets: IndexSet(integer: fromIndex), toOffset: toIndex > fromIndex ? toIndex + 1 : toIndex)
+            localOverviewRouteIDs = ids
+        }
+    }
+
+    private func feedBinding<Value>(_ index: Int, _ keyPath: WritableKeyPath<MacNDIFeedConfiguration, Value>) -> Binding<Value> {
+        Binding(
+            get: { ndiSettings.feeds[index][keyPath: keyPath] },
+            set: { ndiSettings.updateFeedValue($0, at: index, keyPath: keyPath) }
+        )
+    }
+}
+
+private struct MacOverviewTileCard: View {
+    let tile: MacOverviewTileData
+    var onDrop: ((String) -> Void)? = nil
+
+    private static let minHeight: Double = 160
+    private static let maxHeight: Double = 700
+    private static let defaultHeight: Double = 280
+
+    @State private var storedHeight: Double
+    @GestureState private var dragDelta: Double = 0
+    @State private var isDropTargeted = false
+    @State private var selectedSmaartChannelID: String?
+
+    init(tile: MacOverviewTileData, onDrop: ((String) -> Void)? = nil) {
+        self.tile = tile
+        self.onDrop = onDrop
+        let saved = UserDefaults.standard.double(forKey: "prodconnect.overviewTileHeight.\(tile.id)")
+        self._storedHeight = State(initialValue: saved > 0 ? saved : Self.defaultHeight)
+        self._selectedSmaartChannelID = State(initialValue: UserDefaults.standard.string(forKey: MacOverviewTileData.smaartSelectedChannelDefaultsKey))
+    }
+
+    private var displayHeight: Double {
+        max(Self.minHeight, min(Self.maxHeight, storedHeight + dragDelta))
+    }
+
+    private var resizeGesture: some Gesture {
+        DragGesture(minimumDistance: 2)
+            .updating($dragDelta) { value, state, _ in
+                state = value.translation.height
+            }
+            .onEnded { value in
+                storedHeight = max(Self.minHeight, min(Self.maxHeight, storedHeight + value.translation.height))
+                UserDefaults.standard.set(storedHeight, forKey: "prodconnect.overviewTileHeight.\(tile.id)")
+            }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 12) {
+                Image(systemName: tile.systemImage)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(tile.accent)
+                    .frame(width: 32, height: 32)
+                    .background(tile.accent.opacity(0.16), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(tile.title)
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                    Text(tile.subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Color.secondary.opacity(0.5))
+                    .padding(.leading, 4)
+                    .draggable(tile.id)
+                    .onHover { isHovering in
+                        if isHovering { NSCursor.openHand.push() } else { NSCursor.pop() }
+                    }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .background(Color.white.opacity(0.03))
+
+            Divider().opacity(0.5)
+
+            if let show = tile.stagePlotShow {
+                MacStagePlotCanvas(show: show)
+                    .padding(10)
+            } else if let channel = selectedSmaartChannel {
+                smaartMeter(channel)
+            } else if !tile.columnRows.isEmpty {
+                columnTable
+            } else if tile.rows.isEmpty {
+                Text("No items to show")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 14)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(tile.rows.enumerated()), id: \.offset) { _, row in
+                            Text(row.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : row)
+                                .font(.system(size: 13))
+                                .foregroundStyle(Color.primary)
+                                .lineLimit(1)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 10)
+                                .overlay(alignment: .bottom) {
+                                    Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 1)
+                                }
+                        }
+                    }
+                }
+                .scrollIndicators(.never)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: displayHeight, maxHeight: displayHeight, alignment: .topLeading)
+        .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(isDropTargeted ? tile.accent.opacity(0.8) : tile.accent.opacity(0.24), lineWidth: isDropTargeted ? 2 : 1)
+        )
+        .overlay(alignment: .bottom) {
+            resizeHandle
+        }
+        .dropDestination(for: String.self) { items, _ in
+            guard let draggedID = items.first, draggedID != tile.id else { return false }
+            onDrop?(draggedID)
+            return true
+        } isTargeted: { targeted in
+            isDropTargeted = targeted
+        }
+    }
+
+    private var selectedSmaartChannel: SmaartChannel? {
+        guard !tile.smaartChannels.isEmpty else { return tile.smaartChannel }
+        if let selectedSmaartChannelID,
+           let channel = tile.smaartChannels.first(where: { $0.id == selectedSmaartChannelID }) {
+            return channel
+        }
+        return tile.smaartChannel ?? tile.smaartChannels.first
+    }
+
+    private func selectSmaartChannel(_ channel: SmaartChannel) {
+        selectedSmaartChannelID = channel.id
+        UserDefaults.standard.set(channel.id, forKey: MacOverviewTileData.smaartSelectedChannelDefaultsKey)
+    }
+
+    private func smaartMeter(_ channel: SmaartChannel) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Menu {
+                    ForEach(tile.smaartChannels) { option in
+                        Button {
+                            selectSmaartChannel(option)
+                        } label: {
+                            HStack {
+                                Text(option.name)
+                                if option.id == channel.id {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(channel.name)
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundStyle(.primary)
+                        if tile.smaartChannels.count > 1 {
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .disabled(tile.smaartChannels.count <= 1)
+                Spacer()
+            }
+
+            Text(String(format: "%.1f", channel.dB))
+                .font(.system(size: 64, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(channel.displayColor)
+                .lineLimit(1)
+                .minimumScaleFactor(0.55)
+
+            Text("Current dB SPL")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 10) {
+                smaartMetric(label: "Peak", value: channel.compactPeak)
+                smaartMetric(label: "Avg 10 min", value: channel.average10MinDB.map { String(format: "%.1f", $0) } ?? "—")
+                Circle()
+                    .fill(tile.smaartConnectionStatus.indicatorColor)
+                    .frame(width: 13, height: 13)
+                    .padding(.leading, 4)
+            }
+
+            if !tile.columnRows.isEmpty {
+                Divider().opacity(0.45)
+                columnTable
+            }
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.black.opacity(0.24))
+    }
+
+    private func smaartMetric(label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label)
+                .font(.system(size: 11, weight: .semibold))
+                .textCase(.uppercase)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(size: 20, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var columnTable: some View {
+        VStack(spacing: 0) {
+            if !tile.columnHeaders.isEmpty {
+                HStack(spacing: 0) {
+                    ForEach(Array(tile.columnHeaders.enumerated()), id: \.offset) { colIndex, header in
+                        Text(header)
+                            .font(.system(size: 10, weight: .semibold))
+                            .textCase(.uppercase)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: colIndex == 0 ? .infinity : 130, alignment: .leading)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                    }
+                }
+                .background(Color.white.opacity(0.04))
+                Divider().opacity(0.5)
+            }
+            ScrollView {
+                VStack(spacing: 0) {
+                    ForEach(Array(tile.columnRows.enumerated()), id: \.offset) { _, cols in
+                        HStack(spacing: 0) {
+                            ForEach(Array(cols.enumerated()), id: \.offset) { colIndex, cell in
+                                Text(cell.isEmpty ? "—" : cell)
+                                    .font(.system(size: 12, weight: colIndex == 0 ? .semibold : .regular))
+                                    .foregroundStyle(colIndex == 0 ? Color.primary : Color.secondary)
+                                    .lineLimit(1)
+                                    .frame(maxWidth: colIndex == 0 ? .infinity : 130, alignment: .leading)
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 9)
+                            }
+                        }
+                        .overlay(alignment: .bottom) {
+                            Rectangle().fill(Color.primary.opacity(0.07)).frame(height: 1)
+                        }
+                    }
+                }
+            }
+            .scrollIndicators(.never)
+        }
+    }
+
+    private var resizeHandle: some View {
+        Rectangle()
+            .fill(Color.clear)
+            .frame(height: 16)
+            .contentShape(Rectangle())
+            .overlay(alignment: .center) {
+                Capsule()
+                    .fill(Color.white.opacity(0.18))
+                    .frame(width: 36, height: 3)
+            }
+            .gesture(resizeGesture)
+            .onHover { isHovering in
+                if isHovering {
+                    NSCursor.resizeUpDown.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+    }
+}
+
 struct MacSettingsView: View {
     @EnvironmentObject private var store: ProdConnectStore
     @EnvironmentObject private var ndiSettings: MacNDISettingsController
@@ -3431,6 +5570,17 @@ struct MacSettingsView: View {
         return hasNDIFeature && (user.isAdmin || user.isOwner)
     }
 
+    private var availableSettingsSections: [MacSettingsSection] {
+        MacSettingsSection.allCases.filter { section in
+            switch section {
+            case .overview:
+                return hasNDIFeature
+            default:
+                return true
+            }
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Text("Settings")
@@ -3448,12 +5598,22 @@ struct MacSettingsView: View {
         }
         .padding(20)
         .frame(minWidth: 860, minHeight: 620)
+        .onAppear {
+            if !availableSettingsSections.contains(selectedSection) {
+                selectedSection = .integrations
+            }
+        }
+        .onChange(of: hasNDIFeature) { _, _ in
+            if !availableSettingsSections.contains(selectedSection) {
+                selectedSection = .integrations
+            }
+        }
     }
 
     private var settingsTabBar: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 10) {
-                ForEach(MacSettingsSection.allCases) { section in
+                ForEach(availableSettingsSections) { section in
                     Button {
                         selectedSection = section
                     } label: {
@@ -3477,6 +5637,13 @@ struct MacSettingsView: View {
         case .importData, .locationsRooms, .tickets, .integrations:
             MacCustomizeView(section: selectedSection)
                 .environmentObject(store)
+        case .overview:
+            if !hasNDIFeature {
+                Text("Overview grid and NDI output are available on paid subscriptions.")
+                    .foregroundStyle(.secondary)
+            } else {
+                overviewSettingsSection
+            }
         case .ndi:
             if !hasNDIFeature {
                 Text("NDI settings are available on paid subscriptions.")
@@ -3677,6 +5844,117 @@ struct MacSettingsView: View {
         }
     }
 
+    private var overviewSettingsSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Overview Grid")
+                        .font(.title2.weight(.semibold))
+                    Text("Choose the Mac windows to combine into one grid feed.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Create Overview Feed") {
+                    ndiSettings.addOverviewFeedIfNeeded()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canManageNDI)
+            }
+
+            if !canManageNDI {
+                Text("Only admins and owners can manage overview NDI settings.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if ndiSettings.overviewFeeds().isEmpty {
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("No overview feed configured.")
+                            .font(.headline)
+                        Text("Create an overview feed, then select the windows to show and turn on Live to send it over NDI.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 6)
+                }
+            }
+
+            ForEach(ndiSettings.overviewFeeds(), id: \.feed.id) { item in
+                let index = item.index
+                let feed = item.feed
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack {
+                            TextField("Feed Name", text: feedBinding(index, \.title))
+                                .textFieldStyle(.roundedBorder)
+                            Toggle("Send over NDI", isOn: feedBinding(index, \.isLive))
+                            Picker("Orientation", selection: feedBinding(index, \.orientation)) {
+                                ForEach(MacNDIOrientation.allCases) { orientation in
+                                    Text(orientation.title).tag(orientation)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .frame(width: 220)
+                            Button("Remove") {
+                                ndiSettings.removeFeed(id: feed.id)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+
+                        HStack {
+                            Text("Grid Scale")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Slider(value: feedBinding(index, \.scale), in: 0.75...1.35, step: 0.05)
+                            Text("\(Int((feed.scale * 100).rounded()))%")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                                .frame(width: 48, alignment: .trailing)
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Windows")
+                                .font(.headline)
+                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: 10)], spacing: 10) {
+                                ForEach(ndiSettings.availableOverviewSources()) { source in
+                                    Toggle(
+                                        isOn: Binding(
+                                            get: { feed.overviewRouteIDs.contains(source.id) },
+                                            set: { ndiSettings.setOverviewSource(source, isIncluded: $0, at: index) }
+                                        )
+                                    ) {
+                                        Label(source.title, systemImage: source.systemImage)
+                                    }
+                                    .toggleStyle(.checkbox)
+                                    .disabled(!canManageNDI)
+                                }
+                            }
+                        }
+
+                        MacOverviewGridNDIPreview(
+                            tiles: ndiSettings.overviewTiles(for: feed),
+                            outputName: feed.title,
+                            isActive: feed.isLive,
+                            scale: min(feed.scale, 1.0),
+                            sizesToContent: true
+                        )
+                    }
+                    .disabled(!canManageNDI)
+                } label: {
+                    Text("Overview Feed")
+                        .font(.headline)
+                }
+            }
+        }
+        .onAppear {
+            ndiSettings.addOverviewFeedIfNeeded()
+            ndiSettings.closeAllPreviews()
+        }
+    }
+
     private func midiMappingEditor(title: String, action: MacRunOfShowMIDIAction) -> some View {
         let binding = runOfShowControls.binding(for: action)
         let messageNumberLabel = binding.wrappedValue.messageType == .noteOn ? "Note #\(binding.wrappedValue.value)" : "CC #\(binding.wrappedValue.value)"
@@ -3768,6 +6046,13 @@ struct MacSettingsView: View {
     @ViewBuilder
     private func ndiPreview(for feed: MacNDIFeedConfiguration) -> some View {
         switch feed.sourceType {
+        case .overview:
+            MacOverviewGridNDIPreview(
+                tiles: ndiSettings.overviewTiles(for: feed),
+                outputName: feed.title,
+                isActive: feed.isLive,
+                scale: min(feed.scale, 1.0)
+            )
         case .patchsheet:
             MacPatchsheetNDIPreview(
                 patches: ndiSettings.patches(for: feed.category),
@@ -3818,6 +6103,7 @@ private struct MacPatchsheetNDIOutputConfiguration {
     let isActive: Bool
     let title: String
     let sourceType: MacNDIFeedSourceType
+    let overviewTiles: [MacOverviewTileData]
     let category: String
     let runOfShow: RunOfShowDocument?
     let tickets: [SupportTicket]
@@ -3831,6 +6117,23 @@ private struct MacPatchsheetNDIOutputConfiguration {
     let orientation: MacNDIOrientation
 }
 
+private struct MacOverviewTileData: Identifiable {
+    static let smaartSelectedChannelDefaultsKey = "prodconnect.overview.smaart.selectedChannelID"
+
+    let id: String
+    let title: String
+    let subtitle: String
+    let systemImage: String
+    let accent: Color
+    let rows: [String]
+    var columnHeaders: [String] = []
+    var columnRows: [[String]] = []
+    var stagePlotShow: RunOfShowDocument? = nil
+    var smaartChannel: SmaartChannel? = nil
+    var smaartChannels: [SmaartChannel] = []
+    var smaartConnectionStatus: SmaartConnectionStatus = .disconnected
+}
+
 @MainActor
 private final class MacPatchsheetNDIOutputWindowController {
     private var window: NSWindow?
@@ -3838,6 +6141,7 @@ private final class MacPatchsheetNDIOutputWindowController {
     private var frameTimer: Timer?
     private let sender = MacNDISender()
     var isWindowVisible: Bool { window != nil }
+    var liveOverviewTilesProvider: (() -> [MacOverviewTileData])? = nil
 
     func update(configuration: MacPatchsheetNDIOutputConfiguration) {
         currentConfiguration = configuration
@@ -3915,6 +6219,13 @@ private final class MacPatchsheetNDIOutputWindowController {
     private func outputPreviewView(for configuration: MacPatchsheetNDIOutputConfiguration, title: String) -> some View {
         Group {
             switch configuration.sourceType {
+            case .overview:
+                MacOverviewGridNDIPreview(
+                    tiles: configuration.overviewTiles,
+                    outputName: title,
+                    isActive: sender.isReadyToSend,
+                    scale: configuration.scale
+                )
             case .patchsheet:
                 MacPatchsheetNDIPreview(
                     patches: configuration.patches,
@@ -3975,7 +6286,26 @@ private final class MacPatchsheetNDIOutputWindowController {
     }
 
     private func sendCurrentFrameIfPossible() {
-        guard sender.isReadyToSend, let currentConfiguration else { return }
+        guard sender.isReadyToSend, var currentConfiguration else { return }
+        if currentConfiguration.sourceType == .overview, let provider = liveOverviewTilesProvider {
+            currentConfiguration = MacPatchsheetNDIOutputConfiguration(
+                isActive: currentConfiguration.isActive,
+                title: currentConfiguration.title,
+                sourceType: currentConfiguration.sourceType,
+                overviewTiles: provider(),
+                category: currentConfiguration.category,
+                runOfShow: currentConfiguration.runOfShow,
+                tickets: currentConfiguration.tickets,
+                patches: currentConfiguration.patches,
+                nameColumnTitle: currentConfiguration.nameColumnTitle,
+                inputColumnTitle: currentConfiguration.inputColumnTitle,
+                outputColumnTitle: currentConfiguration.outputColumnTitle,
+                showsUniverseColumn: currentConfiguration.showsUniverseColumn,
+                showsHeaders: currentConfiguration.showsHeaders,
+                scale: currentConfiguration.scale,
+                orientation: currentConfiguration.orientation
+            )
+        }
         let resolvedTitle = currentConfiguration.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "ProdConnect Patchsheet"
             : currentConfiguration.title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4244,6 +6574,246 @@ private final class MacNDISender {
             | (UInt32(utf8[1]) << 8)
             | (UInt32(utf8[2]) << 16)
             | (UInt32(utf8[3]) << 24)
+    }
+}
+
+private struct MacOverviewGridNDIPreview: View {
+    let tiles: [MacOverviewTileData]
+    let outputName: String
+    let isActive: Bool
+    let scale: Double
+    var allowsTileScrolling = false
+    var sizesToContent = false
+
+    private var columns: [GridItem] {
+        [
+            GridItem(.flexible(), spacing: 14 * scale),
+            GridItem(.flexible(), spacing: 14 * scale)
+        ]
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16 * scale) {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 4 * scale) {
+                    Text(outputName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "ProdConnect Overview" : outputName)
+                        .font(.system(size: 28 * scale, weight: .bold))
+                        .foregroundStyle(.white)
+                    Text("\(tiles.count) selected window\(tiles.count == 1 ? "" : "s")")
+                        .font(.system(size: 12 * scale, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.68))
+                }
+                Spacer()
+                Text(isActive ? "LIVE" : "PREVIEW")
+                    .font(.system(size: 10 * scale, weight: .bold))
+                    .padding(.horizontal, 10 * scale)
+                    .padding(.vertical, 6 * scale)
+                    .background((isActive ? Color.green : Color.gray).opacity(0.22))
+                    .clipShape(Capsule())
+                    .foregroundStyle(isActive ? Color.green : Color.white.opacity(0.75))
+            }
+
+            if tiles.isEmpty {
+                VStack(spacing: 10 * scale) {
+                    Image(systemName: "square.grid.2x2")
+                        .font(.system(size: 34 * scale))
+                        .foregroundStyle(Color.white.opacity(0.5))
+                    Text("No windows selected")
+                        .font(.system(size: 22 * scale, weight: .semibold))
+                        .foregroundStyle(.white)
+                    Text("Select windows in Settings to populate this overview.")
+                        .font(.system(size: 13 * scale))
+                        .foregroundStyle(Color.white.opacity(0.64))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                let leftTiles = tiles.enumerated().filter { $0.offset % 2 == 0 }.map(\.element)
+                let rightTiles = tiles.enumerated().filter { $0.offset % 2 == 1 }.map(\.element)
+                HStack(alignment: .top, spacing: 14 * scale) {
+                    VStack(spacing: 14 * scale) {
+                        ForEach(leftTiles) { tile in
+                            overviewTile(tile)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    VStack(spacing: 14 * scale) {
+                        ForEach(rightTiles) { tile in
+                            overviewTile(tile)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                }
+            }
+        }
+        .padding(20 * scale)
+        .frame(maxWidth: .infinity, maxHeight: sizesToContent ? nil : .infinity, alignment: .topLeading)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(red: 0.04, green: 0.07, blue: 0.11),
+                    Color(red: 0.02, green: 0.03, blue: 0.06)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+    }
+
+    private var tileRows: [[MacOverviewTileData]] {
+        stride(from: 0, to: tiles.count, by: 2).map { index in
+            Array(tiles[index..<min(index + 2, tiles.count)])
+        }
+    }
+
+    private func overviewTile(_ tile: MacOverviewTileData) -> some View {
+        VStack(alignment: .leading, spacing: 10 * scale) {
+            HStack(spacing: 10 * scale) {
+                Image(systemName: tile.systemImage)
+                    .font(.system(size: 15 * scale, weight: .semibold))
+                    .foregroundStyle(tile.accent)
+                    .frame(width: 28 * scale, height: 28 * scale)
+                    .background(tile.accent.opacity(0.16))
+                    .clipShape(RoundedRectangle(cornerRadius: 7 * scale, style: .continuous))
+                VStack(alignment: .leading, spacing: 2 * scale) {
+                    Text(tile.title)
+                        .font(.system(size: 18 * scale, weight: .bold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    Text(tile.subtitle)
+                        .font(.system(size: 11 * scale, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.62))
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+
+            if let show = tile.stagePlotShow {
+                MacStagePlotCanvas(show: show, scale: scale)
+                    .padding(4 * scale)
+            } else if let channel = tile.smaartChannel {
+                ndiSmaartMeter(channel, extraRows: tile.columnRows, connectionStatus: tile.smaartConnectionStatus)
+            } else if !tile.columnRows.isEmpty {
+                ndiColumnRows(tile.columnRows)
+            } else if tile.rows.isEmpty {
+                Text("No items to show")
+                    .font(.system(size: 12 * scale))
+                    .foregroundStyle(Color.white.opacity(0.56))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            } else {
+                if allowsTileScrolling {
+                    ScrollView {
+                        tileRows(tile.rows)
+                    }
+                    .scrollIndicators(.visible)
+                } else {
+                    tileRows(Array(tile.rows.prefix(8)))
+                }
+            }
+        }
+        .padding(14 * scale)
+        .frame(maxWidth: .infinity, minHeight: storedTileHeight(tile) * scale, maxHeight: storedTileHeight(tile) * scale, alignment: .topLeading)
+        .background(Color.white.opacity(0.055))
+        .clipShape(RoundedRectangle(cornerRadius: 12 * scale, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12 * scale, style: .continuous)
+                .stroke(tile.accent.opacity(0.24), lineWidth: 1)
+        )
+    }
+
+    private func ndiSmaartMeter(_ channel: SmaartChannel, extraRows: [[String]], connectionStatus: SmaartConnectionStatus) -> some View {
+        VStack(alignment: .leading, spacing: 9 * scale) {
+            Text(channel.name)
+                .font(.system(size: 14 * scale, weight: .semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+
+            Text(String(format: "%.1f", channel.dB))
+                .font(.system(size: 48 * scale, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(channel.levelColor?.color ?? .white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.55)
+
+            Text("Current dB SPL")
+                .font(.system(size: 11 * scale, weight: .medium))
+                .foregroundStyle(Color.white.opacity(0.62))
+
+            HStack(spacing: 8 * scale) {
+                ndiSmaartMetric(label: "Peak", value: channel.compactPeak)
+                ndiSmaartMetric(label: "Avg 10 min", value: channel.average10MinDB.map { String(format: "%.1f", $0) } ?? "—")
+                Circle()
+                    .fill(connectionStatus.indicatorColor)
+                    .frame(width: 10 * scale, height: 10 * scale)
+            }
+
+            if !extraRows.isEmpty {
+                ndiColumnRows(extraRows)
+                    .padding(.top, 4 * scale)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func ndiSmaartMetric(label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2 * scale) {
+            Text(label)
+                .font(.system(size: 9 * scale, weight: .bold))
+                .textCase(.uppercase)
+                .foregroundStyle(Color.white.opacity(0.58))
+            Text(value)
+                .font(.system(size: 18 * scale, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 9 * scale)
+        .padding(.vertical, 7 * scale)
+        .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 7 * scale, style: .continuous))
+    }
+
+    private func storedTileHeight(_ tile: MacOverviewTileData) -> Double {
+        let saved = UserDefaults.standard.double(forKey: "prodconnect.overviewTileHeight.\(tile.id)")
+        return saved > 0 ? saved : 280
+    }
+
+    private func ndiColumnRows(_ columnRows: [[String]]) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(columnRows.enumerated()), id: \.offset) { _, cols in
+                HStack(spacing: 0) {
+                    ForEach(Array(cols.enumerated()), id: \.offset) { colIndex, cell in
+                        Text(cell.isEmpty ? "—" : cell)
+                            .font(.system(size: 12 * scale, weight: colIndex == 0 ? .semibold : .regular))
+                            .foregroundStyle(colIndex == 0 ? Color.white : Color.white.opacity(0.75))
+                            .lineLimit(1)
+                            .frame(maxWidth: colIndex == 0 ? .infinity : 110 * scale, alignment: .leading)
+                    }
+                }
+                .padding(.vertical, 5 * scale)
+                .overlay(alignment: .bottom) {
+                    Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1)
+                }
+            }
+        }
+    }
+
+    private func tileRows(_ rows: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+                Text(row.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : row)
+                    .font(.system(size: 12 * scale, weight: index == 0 ? .semibold : .regular))
+                    .foregroundStyle(index == 0 ? Color.white : Color.white.opacity(0.78))
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 6 * scale)
+                    .overlay(alignment: .bottom) {
+                        Rectangle()
+                            .fill(Color.white.opacity(0.06))
+                            .frame(height: 1)
+                    }
+            }
+        }
     }
 }
 
@@ -4706,6 +7276,125 @@ private struct MacStagePlotNDIPreview: View {
             }
         } else {
             EmptyView()
+        }
+    }
+}
+
+private struct MacStagePlotCanvas: View {
+    let show: RunOfShowDocument?
+    var scale: Double = 1.0
+
+    var body: some View {
+        let items = show?.sortedStagePlotItems ?? []
+        ZStack {
+            surfaceShape(type: show?.stageType ?? .rectangle)
+            VStack {
+                Text("UPSTAGE")
+                    .font(.system(size: 9 * scale, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.55))
+                Spacer()
+                HStack {
+                    Text("STAGE RIGHT")
+                    Spacer()
+                    Text("STAGE LEFT")
+                }
+                .font(.system(size: 8 * scale, weight: .semibold))
+                .foregroundStyle(Color.white.opacity(0.38))
+                Text("DOWNSTAGE")
+                    .font(.system(size: 9 * scale, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.55))
+            }
+            .padding(12 * scale)
+            if items.isEmpty {
+                VStack(spacing: 6 * scale) {
+                    Image(systemName: "music.note.house")
+                        .font(.system(size: 22 * scale))
+                        .foregroundStyle(Color.white.opacity(0.38))
+                    Text("No stage plot items")
+                        .font(.system(size: 12 * scale))
+                        .foregroundStyle(Color.white.opacity(0.5))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                GeometryReader { proxy in
+                    let size = proxy.size
+                    let padX = 20 * scale
+                    let padY = 28 * scale
+                    ForEach(items) { item in
+                        node(item)
+                            .scaleEffect(item.sizeScale)
+                            .rotationEffect(.degrees(item.rotationDegrees))
+                            .position(
+                                x: padX + item.x * max(size.width - padX * 2, 1),
+                                y: padY + item.y * max(size.height - padY * 2, 1)
+                            )
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func surfaceShape(type: RunOfShowStageType) -> some View {
+        let gradient = LinearGradient(
+            colors: [Color(red: 0.13, green: 0.13, blue: 0.16), Color(red: 0.07, green: 0.07, blue: 0.1)],
+            startPoint: .top, endPoint: .bottom
+        )
+        return ZStack {
+            switch type {
+            case .rectangle:
+                RoundedRectangle(cornerRadius: 14 * scale, style: .continuous).fill(gradient)
+                RoundedRectangle(cornerRadius: 14 * scale, style: .continuous).stroke(Color.white.opacity(0.12), lineWidth: 1).padding(10 * scale)
+            case .archedFront:
+                MacStagePlotArchedFrontShape(curveDepth: 0.18, cornerRadius: 14 * scale).fill(gradient)
+                MacStagePlotArchedFrontShape(curveDepth: 0.18, cornerRadius: 14 * scale).stroke(Color.white.opacity(0.12), lineWidth: 1).padding(10 * scale)
+            case .round:
+                Circle().fill(gradient)
+                Circle().stroke(Color.white.opacity(0.12), lineWidth: 1).padding(10 * scale)
+            }
+        }
+    }
+
+    @ViewBuilder private func node(_ item: RunOfShowStagePlotItem) -> some View {
+        let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? item.role.defaultTitle : item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let color = roleColor(item.role)
+        if item.role.usesSymbolArtwork, let symbolName = item.role.systemImageName {
+            VStack(spacing: 4 * scale) {
+                ZStack {
+                    Circle().fill(color.opacity(0.22)).frame(width: 30 * scale, height: 30 * scale)
+                    Image(systemName: symbolName).font(.system(size: 16 * scale, weight: .semibold)).foregroundStyle(.white)
+                }
+                Text(title).font(.system(size: 9 * scale, weight: .semibold)).foregroundStyle(.white).lineLimit(1)
+                    .padding(.horizontal, 6 * scale).padding(.vertical, 3 * scale)
+                    .background(Color.black.opacity(0.32)).clipShape(Capsule())
+            }
+            .padding(7 * scale)
+            .background(RoundedRectangle(cornerRadius: 10 * scale, style: .continuous).fill(Color.white.opacity(0.06)))
+            .overlay(RoundedRectangle(cornerRadius: 10 * scale, style: .continuous).stroke(Color.white.opacity(0.18), lineWidth: 1))
+        } else {
+            VStack(alignment: .leading, spacing: 2 * scale) {
+                Text(title).font(.system(size: 10 * scale, weight: .semibold)).foregroundStyle(.white).lineLimit(1)
+                if !item.subtitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text(item.subtitle).font(.system(size: 8 * scale)).foregroundStyle(Color.white.opacity(0.72)).lineLimit(1)
+                }
+            }
+            .padding(.horizontal, 8 * scale).padding(.vertical, 6 * scale)
+            .frame(minWidth: 70 * scale, maxWidth: 130 * scale, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 9 * scale, style: .continuous).fill(color.opacity(0.86)))
+            .overlay(RoundedRectangle(cornerRadius: 9 * scale, style: .continuous).stroke(Color.white.opacity(0.26), lineWidth: 1))
+        }
+    }
+
+    private func roleColor(_ role: RunOfShowStagePlotRole) -> Color {
+        switch role {
+        case .instrument: return Color(red: 0.25, green: 0.52, blue: 0.94)
+        case .vocal: return Color(red: 0.88, green: 0.33, blue: 0.46)
+        case .drumSet: return Color(red: 0.77, green: 0.41, blue: 0.18)
+        case .guitar: return Color(red: 0.98, green: 0.66, blue: 0.19)
+        case .bassGuitar: return Color(red: 0.28, green: 0.77, blue: 0.58)
+        case .microphoneStand: return Color(red: 0.69, green: 0.37, blue: 0.93)
+        case .keyboard: return Color(red: 0.36, green: 0.72, blue: 0.96)
+        case .speaker: return Color(red: 0.54, green: 0.59, blue: 0.66)
         }
     }
 }
@@ -5209,6 +7898,8 @@ private struct MacRunOfShowView: View {
     @EnvironmentObject private var runOfShowControls: MacRunOfShowControlController
     @State private var selectedShowID: String?
     @State private var showToDelete: RunOfShowDocument?
+    @State private var draggingShowID: String?
+    @State private var draggingItemID: String?
     @State private var selectedStagePlotItemID: String?
     @State private var editingStagePlotItemID: String?
     @State private var stagePlotDragPoints: [String: CGPoint] = [:]
@@ -5226,7 +7917,7 @@ private struct MacRunOfShowView: View {
     }
 
     private var shows: [RunOfShowDocument] {
-        store.runOfShows.sorted { $0.updatedAt > $1.updatedAt }
+        RunOfShowDocument.sortedShows(store.runOfShows)
     }
 
     private var selectedShow: RunOfShowDocument? {
@@ -5235,30 +7926,25 @@ private struct MacRunOfShowView: View {
     }
 
     var body: some View {
-        HStack(spacing: 20) {
-            sidebar
-                .frame(width: 280, alignment: .topLeading)
+        GeometryReader { proxy in
+            let isCompact = proxy.size.width < 980
 
-            if let show = selectedShow {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
-                        showHeader(show)
-                        timelineGrid(for: show)
-                        stagePlotPanel(for: show)
-                        livePanel(for: show)
+            Group {
+                if isCompact {
+                    VStack(spacing: 16) {
+                        sidebar
+                            .frame(maxWidth: .infinity, minHeight: 170, maxHeight: 190, alignment: .topLeading)
+                        runOfShowDetail
                     }
-                    .padding(20)
+                } else {
+                    HStack(spacing: 20) {
+                        sidebar
+                            .frame(width: min(280, max(230, proxy.size.width * 0.26)), alignment: .topLeading)
+                        runOfShowDetail
+                    }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .navigationTitle("Run of Show")
-            } else {
-                ContentUnavailableView(
-                    "No Run of Show",
-                    systemImage: "list.bullet.rectangle.portrait",
-                    description: Text("Create a show to build your timeline and live view.")
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
         }
         .overlay {
             if isShowingExportSheet {
@@ -5266,8 +7952,7 @@ private struct MacRunOfShowView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(.horizontal, 20)
-        .padding(.vertical, 16)
+        .padding(16)
         .onAppear {
             if selectedShowID == nil {
                 selectedShowID = shows.first?.id
@@ -5326,10 +8011,35 @@ private struct MacRunOfShowView: View {
         }
     }
 
+    @ViewBuilder
+    private var runOfShowDetail: some View {
+        if let show = selectedShow {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    showHeader(show)
+                    timelineGrid(for: show)
+                    stagePlotPanel(for: show)
+                    livePanel(for: show)
+                }
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .navigationTitle("Run of Show")
+        } else {
+            ContentUnavailableView(
+                "No Shows/Events",
+                systemImage: "list.bullet.rectangle.portrait",
+                description: Text("Create a show to build your timeline and live view.")
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Run of Show")
+                Text("Shows/Events")
                     .font(.system(size: 20, weight: .bold))
                 Spacer()
                 Button {
@@ -5363,6 +8073,22 @@ private struct MacRunOfShowView: View {
                             )
                         }
                         .buttonStyle(.plain)
+                        .draggable(show.id) {
+                            Text(show.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled Show" : show.title)
+                                .padding(8)
+                        }
+                        .dropDestination(for: String.self) { ids, _ in
+                            guard canEdit, let draggedID = ids.first else { return false }
+                            moveShow(fromID: draggedID, toID: show.id)
+                            return true
+                        } isTargeted: { targeted in
+                            if targeted {
+                                draggingShowID = show.id
+                            } else if draggingShowID == show.id {
+                                draggingShowID = nil
+                            }
+                        }
+                        .opacity(draggingShowID == show.id ? 0.72 : 1)
                     }
                 }
             }
@@ -5449,41 +8175,60 @@ private struct MacRunOfShowView: View {
     }
 
     private func timelineGrid(for show: RunOfShowDocument) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 0) {
-                timelineHeaderCell("Time", width: 110)
-                timelineHeaderCell("Length", width: 90)
-                timelineHeaderCell("Actual", width: 90)
-                timelineHeaderCell("Title", width: 260)
-                timelineHeaderCell("Person", width: 180)
-                timelineHeaderCell("Notes", width: 230)
-                timelineHeaderCell("", width: 110)
-            }
-            .background(Color.white.opacity(0.05))
-
-            ForEach(Array(show.sortedItems.enumerated()), id: \.element.id) { index, item in
+        ScrollView(.horizontal, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 0) {
-                    timelineValueCell(startTimeText(for: show, itemIndex: index), width: 110)
-                    timelineLengthCell(show: show, item: item)
-                    timelineActualRuntimeCell(show: show, item: item)
-                    timelineEditableCell(title: "Title", text: item.title, width: 260) { newValue in
-                        updateItem(show, itemID: item.id) { $0.title = newValue }
-                    }
-                    timelineEditableCell(title: "Person", text: item.person, width: 180) { newValue in
-                        updateItem(show, itemID: item.id) { $0.person = newValue }
-                    }
-                    timelineEditableCell(title: "Notes", text: item.notes, width: 230) { newValue in
-                        updateItem(show, itemID: item.id) { $0.notes = newValue }
-                    }
-                    timelineActionsCell(show: show, item: item, index: index)
+                    timelineHeaderCell("Time", width: 110)
+                    timelineHeaderCell("Length", width: 90)
+                    timelineHeaderCell("Actual", width: 90)
+                    timelineHeaderCell("Title", width: 260)
+                    timelineHeaderCell("Person", width: 180)
+                    timelineHeaderCell("Notes", width: 230)
+                    timelineHeaderCell("", width: 110)
                 }
-                .background(index.isMultiple(of: 2) ? Color.white.opacity(0.02) : Color.clear)
-                .overlay(alignment: .bottom) {
-                    Rectangle()
-                        .fill(Color.white.opacity(0.05))
-                        .frame(height: 1)
+                .background(Color.white.opacity(0.05))
+
+                ForEach(Array(show.sortedItems.enumerated()), id: \.element.id) { index, item in
+                    HStack(spacing: 0) {
+                        timelineValueCell(startTimeText(for: show, itemIndex: index), width: 110)
+                        timelineLengthCell(show: show, item: item)
+                        timelineActualRuntimeCell(show: show, item: item)
+                        timelineEditableCell(title: "Title", text: item.title, width: 260) { newValue in
+                            updateItem(show, itemID: item.id) { $0.title = newValue }
+                        }
+                        timelineEditableCell(title: "Person", text: item.person, width: 180) { newValue in
+                            updateItem(show, itemID: item.id) { $0.person = newValue }
+                        }
+                        timelineEditableCell(title: "Notes", text: item.notes, width: 230) { newValue in
+                            updateItem(show, itemID: item.id) { $0.notes = newValue }
+                        }
+                        timelineActionsCell(show: show, item: item, index: index)
+                    }
+                    .background(index.isMultiple(of: 2) ? Color.white.opacity(0.02) : Color.clear)
+                    .overlay(alignment: .bottom) {
+                        Rectangle()
+                            .fill(Color.white.opacity(0.05))
+                            .frame(height: 1)
+                    }
+                    .draggable(item.id) {
+                        Text(item.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled Item" : item.title)
+                            .padding(8)
+                    }
+                    .dropDestination(for: String.self) { ids, _ in
+                        guard canEdit, let draggedID = ids.first else { return false }
+                        moveItem(show, fromID: draggedID, toID: item.id)
+                        return true
+                    } isTargeted: { targeted in
+                        if targeted {
+                            draggingItemID = item.id
+                        } else if draggingItemID == item.id {
+                            draggingItemID = nil
+                        }
+                    }
+                    .opacity(draggingItemID == item.id ? 0.72 : 1)
                 }
             }
+            .frame(minWidth: 1070, alignment: .leading)
         }
         .background(Color.white.opacity(0.02))
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -6163,12 +8908,13 @@ private struct MacRunOfShowView: View {
     }
 
     private func timelineEditableCell(title: String, text: String, width: CGFloat, setter: @escaping (String) -> Void) -> some View {
-        TextField(title, text: Binding(get: { text }, set: setter))
-            .textFieldStyle(.plain)
-            .frame(width: width, alignment: .leading)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 12)
-            .disabled(!canEdit)
+        MacRunOfShowInlineTextField(
+            title: title,
+            text: text,
+            width: width,
+            isEditable: canEdit,
+            setter: setter
+        )
     }
 
     private func timelineLengthCell(show: RunOfShowDocument, item: RunOfShowItem) -> some View {
@@ -6265,13 +9011,14 @@ private struct MacRunOfShowView: View {
     private func addShow() {
         guard canEdit else { return }
         let show = RunOfShowDocument(
-            title: "New Run of Show",
+            title: "New Show",
             teamCode: store.teamCode ?? "",
             scheduledStart: Date(),
             items: [
                 RunOfShowItem(title: "Welcome", lengthMinutes: 5, lengthSeconds: 0, position: 0),
                 RunOfShowItem(title: "Song 1", lengthMinutes: 5, lengthSeconds: 0, position: 1)
-            ]
+            ],
+            position: shows.count
         )
         store.saveRunOfShow(show)
         selectedShowID = show.id
@@ -6691,6 +9438,20 @@ private struct MacRunOfShowView: View {
         }
     }
 
+    private func moveShow(fromID: String, toID: String) {
+        guard fromID != toID else { return }
+        var ordered = shows
+        guard let fromIndex = ordered.firstIndex(where: { $0.id == fromID }),
+              let toIndex = ordered.firstIndex(where: { $0.id == toID }) else { return }
+        let moved = ordered.remove(at: fromIndex)
+        ordered.insert(moved, at: toIndex)
+        for (position, show) in ordered.enumerated() {
+            var updated = show
+            updated.position = position
+            store.saveRunOfShow(updated)
+        }
+    }
+
     private func moveItem(_ show: RunOfShowDocument, from index: Int, direction: Int) {
         updateShow(show) { mutable in
             var items = mutable.sortedItems
@@ -6698,6 +9459,22 @@ private struct MacRunOfShowView: View {
             guard items.indices.contains(index), items.indices.contains(newIndex) else { return }
             let moved = items.remove(at: index)
             items.insert(moved, at: newIndex)
+            mutable.items = items.enumerated().map { offset, item in
+                var updated = item
+                updated.position = offset
+                return updated
+            }
+        }
+    }
+
+    private func moveItem(_ show: RunOfShowDocument, fromID: String, toID: String) {
+        guard fromID != toID else { return }
+        updateShow(show) { mutable in
+            var items = mutable.sortedItems
+            guard let fromIndex = items.firstIndex(where: { $0.id == fromID }),
+                  let toIndex = items.firstIndex(where: { $0.id == toID }) else { return }
+            let moved = items.remove(at: fromIndex)
+            items.insert(moved, at: toIndex)
             mutable.items = items.enumerated().map { offset, item in
                 var updated = item
                 updated.position = offset
@@ -7033,6 +9810,44 @@ private struct MacRunOfShowView: View {
         let minutes = max(seconds, 0) / 60
         let remainingSeconds = max(seconds, 0) % 60
         return String(format: "-%02d:%02d", minutes, remainingSeconds)
+    }
+}
+
+private struct MacRunOfShowInlineTextField: View {
+    let title: String
+    let text: String
+    let width: CGFloat
+    let isEditable: Bool
+    let setter: (String) -> Void
+
+    @State private var draft: String
+    @FocusState private var isFocused: Bool
+
+    init(title: String, text: String, width: CGFloat, isEditable: Bool, setter: @escaping (String) -> Void) {
+        self.title = title
+        self.text = text
+        self.width = width
+        self.isEditable = isEditable
+        self.setter = setter
+        _draft = State(initialValue: text)
+    }
+
+    var body: some View {
+        TextField(title, text: $draft)
+            .focused($isFocused)
+            .textFieldStyle(.plain)
+            .frame(width: width, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 12)
+            .disabled(!isEditable)
+            .onChange(of: draft) { _, newValue in
+                setter(newValue)
+            }
+            .onChange(of: text) { _, newValue in
+                if !isFocused && draft != newValue {
+                    draft = newValue
+                }
+            }
     }
 }
 
@@ -13133,6 +15948,7 @@ private struct MacIdeasView: View {
     @State private var editingIdea: IdeaCard?
     @State private var title = ""
     @State private var detail = ""
+    @State private var notes = ""
     @State private var tags = ""
     
     private var canSaveIdea: Bool {
@@ -13217,7 +16033,15 @@ private struct MacIdeasView: View {
                 GroupBox(editingIdea == nil ? "Add Idea" : "Edit Idea") {
                     VStack(alignment: .leading, spacing: 10) {
                         TextField("Title", text: $title)
+                        Text("Idea")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                         TextEditor(text: $detail)
+                            .frame(minHeight: 120)
+                        Text("Notes")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        TextEditor(text: $notes)
                             .frame(minHeight: 120)
                         TextField("Tags (comma separated)", text: $tags)
                         Button("Save Idea") {
@@ -13240,14 +16064,18 @@ private struct MacIdeasView: View {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         let existingIdea = editingIdea
+        let now = Date()
         store.saveIdea(
             IdeaCard(
                 id: existingIdea?.id ?? UUID().uuidString,
                 title: title.trimmingCharacters(in: .whitespacesAndNewlines),
                 detail: detail.trimmingCharacters(in: .whitespacesAndNewlines),
+                notes: notes.trimmingCharacters(in: .whitespacesAndNewlines),
                 tags: parsedTags,
-                teamCode: store.teamCode ?? "",
+                teamCode: existingIdea?.teamCode ?? store.teamCode ?? "",
                 createdBy: existingIdea?.createdBy ?? store.user?.email,
+                createdAt: existingIdea?.createdAt ?? now,
+                updatedAt: now,
                 implemented: existingIdea?.implemented ?? false,
                 completedAt: existingIdea?.completedAt,
                 likedBy: existingIdea?.likedBy ?? []
@@ -13261,6 +16089,7 @@ private struct MacIdeasView: View {
         editingIdea = idea
         title = idea.title
         detail = idea.detail
+        notes = idea.notes
         tags = idea.tags.joined(separator: ", ")
         isShowingAddIdea = true
     }
@@ -13316,12 +16145,20 @@ private struct MacIdeasView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                 }
+                if !idea.notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Label("Notes added", systemImage: "note.text")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
                 if !idea.tags.isEmpty {
                     Text(idea.tags.joined(separator: ", "))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
+                Text("Updated \(idea.updatedAt.formatted(date: .abbreviated, time: .shortened))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
                 if let completedAt = idea.completedAt {
                     Text("Completed: \(completedAt.formatted(date: .abbreviated, time: .shortened))")
                         .font(.caption2)
@@ -13376,6 +16213,7 @@ private struct MacIdeasView: View {
         editingIdea = nil
         title = ""
         detail = ""
+        notes = ""
         tags = ""
     }
 }
@@ -13439,6 +16277,13 @@ private struct MacCustomizeView: View {
     @State private var externalTicketFormAccessKey = ""
     @State private var isSavingExternalTicketForm = false
     @State private var externalTicketStatusMessage = ""
+    @State private var smaartEnabled = false
+    @State private var smaartHost = "localhost"
+    @State private var smaartPort = "9090"
+    @State private var smaartPath = ""
+    @State private var smaartPassword = ""
+    @State private var smaartPollInterval = "1.0"
+    @ObservedObject private var smaartController = SmaartAPIController.shared
     @State private var bulkOperationMessage = ""
     @State private var isBulkOperationInProgress = false
 
@@ -13476,6 +16321,11 @@ private struct MacCustomizeView: View {
     private var canManageExternalTicketForm: Bool {
         (store.user?.isAdmin == true || store.user?.isOwner == true)
             && (store.user?.hasTicketingFeatures == true)
+    }
+
+    private var hasOverviewFeature: Bool {
+        guard let user = store.user else { return false }
+        return user.normalizedSubscriptionTier != "free"
     }
 
     private var canImportTickets: Bool {
@@ -13519,7 +16369,10 @@ private struct MacCustomizeView: View {
         .padding()
         .background(Color.clear)
         .disabled(isBulkOperationInProgress)
-        .onAppear(perform: loadFreshserviceIntegrationState)
+        .onAppear {
+            loadFreshserviceIntegrationState()
+            loadSmaartSettings()
+        }
         .onChange(of: store.freshserviceIntegration) { _, _ in
             loadFreshserviceIntegrationState()
         }
@@ -13569,7 +16422,7 @@ private struct MacCustomizeView: View {
             ticketsContent
         case .integrations:
             integrationsContent
-        case .ndi, .midi, .users:
+        case .overview, .ndi, .midi, .users:
             EmptyView()
         }
     }
@@ -13649,6 +16502,10 @@ private struct MacCustomizeView: View {
 
     private var ticketsContent: some View {
         VStack(alignment: .leading, spacing: 18) {
+            if canManageExternalTicketForm {
+                externalTicketFormGroup
+            }
+
             HStack(alignment: .top, spacing: 20) {
                 GroupBox("Ticket Categories") {
                     VStack(alignment: .leading, spacing: 10) {
@@ -13708,6 +16565,44 @@ private struct MacCustomizeView: View {
                         .frame(minHeight: 220)
                         .scrollContentBackground(.hidden)
                     }
+                }
+            }
+        }
+    }
+
+    private var externalTicketFormGroup: some View {
+        GroupBox("External Ticket Form") {
+            VStack(alignment: .leading, spacing: 12) {
+                Toggle("Enable External Form", isOn: $externalTicketFormEnabled)
+
+                if !externalTicketFormURLString.isEmpty {
+                    TextField("Public Link", text: .constant(externalTicketFormURLString))
+                        .textFieldStyle(.roundedBorder)
+
+                    Button("Copy Public Link") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(externalTicketFormURLString, forType: .string)
+                        externalTicketStatusMessage = "External ticket form link copied."
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                Button {
+                    saveCustomizeExternalTicketForm()
+                } label: {
+                    if isSavingExternalTicketForm {
+                        ProgressView()
+                    } else {
+                        Text("Save External Form")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isSavingExternalTicketForm)
+
+                if !externalTicketStatusMessage.isEmpty {
+                    Text(externalTicketStatusMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
         }
@@ -13869,42 +16764,88 @@ private struct MacCustomizeView: View {
                 }
             }
 
-            if canManageExternalTicketForm {
-                GroupBox("External Ticket Form") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Toggle("Enable External Form", isOn: $externalTicketFormEnabled)
+            if hasOverviewFeature {
+            GroupBox("Smaart") {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Connect to the Smaart SPL Webserver to display real-time dB measurements in the Overview.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
 
-                        if !externalTicketFormURLString.isEmpty {
-                            TextField("Public Link", text: .constant(externalTicketFormURLString))
+                    Toggle("Enable Smaart Integration", isOn: $smaartEnabled)
+
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Host").font(.caption).foregroundStyle(.secondary)
+                            TextField("localhost", text: $smaartHost)
                                 .textFieldStyle(.roundedBorder)
-
-                            Button("Copy Public Link") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(externalTicketFormURLString, forType: .string)
-                                externalTicketStatusMessage = "External ticket form link copied."
-                            }
-                            .buttonStyle(.bordered)
                         }
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Port").font(.caption).foregroundStyle(.secondary)
+                            TextField("9090", text: $smaartPort)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 80)
+                        }
+                    }
 
-                        Button {
-                            saveCustomizeExternalTicketForm()
-                        } label: {
-                            if isSavingExternalTicketForm {
-                                ProgressView()
-                            } else {
-                                Text("Save External Form")
-                            }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("API Path (optional; leave blank to auto-detect)").font(.caption).foregroundStyle(.secondary)
+                        TextField("Auto-detect", text: $smaartPath)
+                            .textFieldStyle(.roundedBorder)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Password (optional)").font(.caption).foregroundStyle(.secondary)
+                        SecureField("Password", text: $smaartPassword)
+                            .textFieldStyle(.roundedBorder)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Poll Interval (seconds)").font(.caption).foregroundStyle(.secondary)
+                        TextField("0.25", text: $smaartPollInterval)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 80)
+                    }
+
+                    HStack(spacing: 12) {
+                        Button("Save") {
+                            saveSmaartSettings()
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(isSavingExternalTicketForm)
 
-                        if !externalTicketStatusMessage.isEmpty {
-                            Text(externalTicketStatusMessage)
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(smaartController.connectionStatus.isConnected ? Color.green : Color.orange)
+                                .frame(width: 8, height: 8)
+                            Text(smaartController.connectionStatus.label)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                     }
+
+                    if !smaartController.lastRawResponse.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Last Raw Response (for debugging):")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            ScrollView(.vertical) {
+                                Text(smaartController.lastRawResponse)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(.primary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .textSelection(.enabled)
+                            }
+                            .frame(maxHeight: 120)
+                            .padding(8)
+                            .background(Color.white.opacity(0.04))
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                        }
+                    }
+
+                    Text("For SPL readings, enable Smaart's SPL Webviewer/webserver. Smaart's main API uses WebSocket commands; this overview tile reads HTTP JSON meter data when available.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                 }
+            }
             }
         }
     }
@@ -14113,6 +17054,27 @@ private struct MacCustomizeView: View {
         if externalTicketFormAccessKey.isEmpty, canManageExternalTicketForm {
             externalTicketFormAccessKey = store.generateExternalTicketAccessKey()
         }
+    }
+
+    private func loadSmaartSettings() {
+        let s = smaartController.settings
+        smaartEnabled = s.isEnabled
+        smaartHost = s.host
+        smaartPort = "\(s.port)"
+        smaartPath = s.apiPath
+        smaartPassword = s.password
+        smaartPollInterval = String(format: "%.2f", s.pollIntervalSeconds)
+    }
+
+    private func saveSmaartSettings() {
+        var s = SmaartSettings()
+        s.isEnabled = smaartEnabled
+        s.host = smaartHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        s.port = Int(smaartPort.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 9090
+        s.apiPath = smaartPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        s.password = smaartPassword
+        s.pollIntervalSeconds = max(0.1, Double(smaartPollInterval) ?? 0.25)
+        smaartController.applySettings(s)
     }
 
     private func saveCustomizeExternalTicketForm() {
