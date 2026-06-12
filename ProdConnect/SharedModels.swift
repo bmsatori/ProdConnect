@@ -13,6 +13,9 @@ struct PatchRow: Identifiable, Codable {
     var channelCount: Int?
     var universe: String?
     var ndiEnabled: Bool = false
+    var micboardEnabled: Bool = false
+    var micboardMicrophone: String = ""
+    var micboardInEarMonitor: String = ""
     var position: Int = 0
 
     enum CodingKeys: String, CodingKey {
@@ -28,6 +31,9 @@ struct PatchRow: Identifiable, Codable {
         case channelCount
         case universe
         case ndiEnabled
+        case micboardEnabled
+        case micboardMicrophone
+        case micboardInEarMonitor
         case position
     }
 
@@ -44,6 +50,9 @@ struct PatchRow: Identifiable, Codable {
         channelCount: Int? = nil,
         universe: String? = nil,
         ndiEnabled: Bool = false,
+        micboardEnabled: Bool = false,
+        micboardMicrophone: String = "",
+        micboardInEarMonitor: String = "",
         position: Int = 0
     ) {
         self.id = id
@@ -58,6 +67,9 @@ struct PatchRow: Identifiable, Codable {
         self.channelCount = channelCount
         self.universe = universe
         self.ndiEnabled = ndiEnabled
+        self.micboardEnabled = micboardEnabled
+        self.micboardMicrophone = micboardMicrophone
+        self.micboardInEarMonitor = micboardInEarMonitor
         self.position = position
     }
 
@@ -75,6 +87,9 @@ struct PatchRow: Identifiable, Codable {
         channelCount = try container.decodeIfPresent(Int.self, forKey: .channelCount)
         universe = try container.decodeIfPresent(String.self, forKey: .universe)
         ndiEnabled = try container.decodeIfPresent(Bool.self, forKey: .ndiEnabled) ?? false
+        micboardEnabled = try container.decodeIfPresent(Bool.self, forKey: .micboardEnabled) ?? false
+        micboardMicrophone = try container.decodeIfPresent(String.self, forKey: .micboardMicrophone) ?? ""
+        micboardInEarMonitor = try container.decodeIfPresent(String.self, forKey: .micboardInEarMonitor) ?? ""
         position = try container.decodeIfPresent(Int.self, forKey: .position) ?? 0
     }
 }
@@ -410,6 +425,130 @@ struct RunOfShowItem: Identifiable, Codable, Equatable {
     }
 }
 
+struct RunOfShowEventTrackingRecord: Identifiable, Codable, Equatable {
+    var id: String = UUID().uuidString
+    var itemID: String
+    var position: Int
+    var title: String
+    var subtitle: String
+    var plannedSeconds: Int
+    var actualSeconds: Int
+    var startedAt: Date
+    var endedAt: Date
+    var splPeakDB: Double?
+    var splAverageDB: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case itemID
+        case position
+        case title
+        case subtitle
+        case plannedSeconds
+        case actualSeconds
+        case startedAt
+        case endedAt
+        case splPeakDB
+        case splAverageDB
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        itemID: String,
+        position: Int,
+        title: String,
+        subtitle: String = "",
+        plannedSeconds: Int,
+        actualSeconds: Int,
+        startedAt: Date,
+        endedAt: Date,
+        splPeakDB: Double? = nil,
+        splAverageDB: Double? = nil
+    ) {
+        self.id = id
+        self.itemID = itemID
+        self.position = position
+        self.title = title
+        self.subtitle = subtitle
+        self.plannedSeconds = plannedSeconds
+        self.actualSeconds = actualSeconds
+        self.startedAt = startedAt
+        self.endedAt = endedAt
+        self.splPeakDB = splPeakDB
+        self.splAverageDB = splAverageDB
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        itemID = try container.decodeIfPresent(String.self, forKey: .itemID) ?? ""
+        position = try container.decodeIfPresent(Int.self, forKey: .position) ?? 0
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
+        subtitle = try container.decodeIfPresent(String.self, forKey: .subtitle) ?? ""
+        plannedSeconds = try container.decodeIfPresent(Int.self, forKey: .plannedSeconds) ?? 0
+        actualSeconds = try container.decodeIfPresent(Int.self, forKey: .actualSeconds) ?? 0
+        startedAt = try container.decodeIfPresent(Date.self, forKey: .startedAt) ?? Date()
+        endedAt = try container.decodeIfPresent(Date.self, forKey: .endedAt) ?? startedAt
+        splPeakDB = try container.decodeIfPresent(Double.self, forKey: .splPeakDB)
+        splAverageDB = try container.decodeIfPresent(Double.self, forKey: .splAverageDB)
+    }
+}
+
+struct RunOfShowTrackingSession: Identifiable, Codable, Equatable {
+    var id: String = UUID().uuidString
+    var title: String
+    var startedAt: Date
+    var completedAt: Date
+    var plannedSeconds: Int
+    var actualSeconds: Int
+    var records: [RunOfShowEventTrackingRecord]
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case startedAt
+        case completedAt
+        case plannedSeconds
+        case actualSeconds
+        case records
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        title: String,
+        startedAt: Date,
+        completedAt: Date,
+        plannedSeconds: Int,
+        actualSeconds: Int,
+        records: [RunOfShowEventTrackingRecord]
+    ) {
+        self.id = id
+        self.title = title
+        self.startedAt = startedAt
+        self.completedAt = completedAt
+        self.plannedSeconds = plannedSeconds
+        self.actualSeconds = actualSeconds
+        self.records = records.sorted {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.startedAt < $1.startedAt
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
+        startedAt = try container.decodeIfPresent(Date.self, forKey: .startedAt) ?? Date()
+        completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt) ?? startedAt
+        plannedSeconds = try container.decodeIfPresent(Int.self, forKey: .plannedSeconds) ?? 0
+        actualSeconds = try container.decodeIfPresent(Int.self, forKey: .actualSeconds) ?? 0
+        records = (try container.decodeIfPresent([RunOfShowEventTrackingRecord].self, forKey: .records) ?? []).sorted {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.startedAt < $1.startedAt
+        }
+    }
+}
+
 enum RunOfShowStagePlotRole: String, CaseIterable, Codable, Identifiable {
     case instrument = "Instrument"
     case vocal = "Vocal"
@@ -431,7 +570,7 @@ extension RunOfShowStagePlotRole {
         case .instrument, .vocal:
             return nil
         case .drumSet:
-            return "drumsticks.fill"
+            return "music.note"
         case .guitar:
             return "guitars.fill"
         case .bassGuitar:
@@ -538,6 +677,55 @@ struct RunOfShowStagePlotItem: Identifiable, Codable, Equatable {
     }
 }
 
+struct RunOfShowMicboardItem: Identifiable, Codable, Equatable {
+    var id: String = UUID().uuidString
+    var name: String
+    var role: String
+    var microphone: String
+    var inEarMonitor: String
+    var imageURLString: String
+    var position: Int = 0
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case role
+        case microphone
+        case inEarMonitor
+        case imageURLString
+        case position
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        name: String = "",
+        role: String = "",
+        microphone: String = "",
+        inEarMonitor: String = "",
+        imageURLString: String = "",
+        position: Int = 0
+    ) {
+        self.id = id
+        self.name = name
+        self.role = role
+        self.microphone = microphone
+        self.inEarMonitor = inEarMonitor
+        self.imageURLString = imageURLString
+        self.position = position
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? ""
+        role = try container.decodeIfPresent(String.self, forKey: .role) ?? ""
+        microphone = try container.decodeIfPresent(String.self, forKey: .microphone) ?? ""
+        inEarMonitor = try container.decodeIfPresent(String.self, forKey: .inEarMonitor) ?? ""
+        imageURLString = try container.decodeIfPresent(String.self, forKey: .imageURLString) ?? ""
+        position = try container.decodeIfPresent(Int.self, forKey: .position) ?? 0
+    }
+}
+
 struct RunOfShowDocument: Identifiable, Codable, Equatable {
     var id: String = UUID().uuidString
     var title: String
@@ -546,6 +734,7 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
     var items: [RunOfShowItem]
     var stageType: RunOfShowStageType
     var stagePlotItems: [RunOfShowStagePlotItem]
+    var micboardItems: [RunOfShowMicboardItem]
     var position: Int = 0
     var autoStartLive: Bool = false
     var isLiveActive: Bool = false
@@ -553,6 +742,9 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
     var liveShowStartedAt: Date?
     var liveItemStartedAt: Date?
     var liveActualRuntimeSecondsByItemID: [String: Int] = [:]
+    var liveEventTrackingRecords: [RunOfShowEventTrackingRecord] = []
+    var liveTrackingCompletedAt: Date?
+    var liveTrackingSessions: [RunOfShowTrackingSession] = []
     var updatedAt: Date = Date()
 
     enum CodingKeys: String, CodingKey {
@@ -563,6 +755,7 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
         case items
         case stageType
         case stagePlotItems
+        case micboardItems
         case position
         case autoStartLive
         case isLiveActive
@@ -570,6 +763,9 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
         case liveShowStartedAt
         case liveItemStartedAt
         case liveActualRuntimeSecondsByItemID
+        case liveEventTrackingRecords
+        case liveTrackingCompletedAt
+        case liveTrackingSessions
         case updatedAt
     }
 
@@ -581,6 +777,7 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
         items: [RunOfShowItem] = [],
         stageType: RunOfShowStageType = .rectangle,
         stagePlotItems: [RunOfShowStagePlotItem] = [],
+        micboardItems: [RunOfShowMicboardItem] = [],
         position: Int = 0,
         autoStartLive: Bool = false,
         isLiveActive: Bool = false,
@@ -588,6 +785,9 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
         liveShowStartedAt: Date? = nil,
         liveItemStartedAt: Date? = nil,
         liveActualRuntimeSecondsByItemID: [String: Int] = [:],
+        liveEventTrackingRecords: [RunOfShowEventTrackingRecord] = [],
+        liveTrackingCompletedAt: Date? = nil,
+        liveTrackingSessions: [RunOfShowTrackingSession] = [],
         updatedAt: Date = Date()
     ) {
         self.id = id
@@ -597,6 +797,7 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
         self.items = items
         self.stageType = stageType
         self.stagePlotItems = stagePlotItems
+        self.micboardItems = micboardItems
         self.position = position
         self.autoStartLive = autoStartLive
         self.isLiveActive = isLiveActive
@@ -604,6 +805,9 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
         self.liveShowStartedAt = liveShowStartedAt
         self.liveItemStartedAt = liveItemStartedAt
         self.liveActualRuntimeSecondsByItemID = liveActualRuntimeSecondsByItemID
+        self.liveEventTrackingRecords = liveEventTrackingRecords
+        self.liveTrackingCompletedAt = liveTrackingCompletedAt
+        self.liveTrackingSessions = liveTrackingSessions
         self.updatedAt = updatedAt
     }
 
@@ -622,6 +826,10 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
             if $0.position != $1.position { return $0.position < $1.position }
             return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
         }
+        micboardItems = (try container.decodeIfPresent([RunOfShowMicboardItem].self, forKey: .micboardItems) ?? []).sorted {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
         position = try container.decodeIfPresent(Int.self, forKey: .position) ?? 0
         autoStartLive = try container.decodeIfPresent(Bool.self, forKey: .autoStartLive) ?? false
         isLiveActive = try container.decodeIfPresent(Bool.self, forKey: .isLiveActive) ?? false
@@ -629,6 +837,14 @@ struct RunOfShowDocument: Identifiable, Codable, Equatable {
         liveShowStartedAt = try container.decodeIfPresent(Date.self, forKey: .liveShowStartedAt)
         liveItemStartedAt = try container.decodeIfPresent(Date.self, forKey: .liveItemStartedAt)
         liveActualRuntimeSecondsByItemID = try container.decodeIfPresent([String: Int].self, forKey: .liveActualRuntimeSecondsByItemID) ?? [:]
+        liveEventTrackingRecords = (try container.decodeIfPresent([RunOfShowEventTrackingRecord].self, forKey: .liveEventTrackingRecords) ?? []).sorted {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.startedAt < $1.startedAt
+        }
+        liveTrackingCompletedAt = try container.decodeIfPresent(Date.self, forKey: .liveTrackingCompletedAt)
+        liveTrackingSessions = (try container.decodeIfPresent([RunOfShowTrackingSession].self, forKey: .liveTrackingSessions) ?? []).sorted {
+            $0.completedAt > $1.completedAt
+        }
         updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? Date()
     }
 }
@@ -729,6 +945,13 @@ extension RunOfShowDocument {
         }
     }
 
+    var sortedMicboardItems: [RunOfShowMicboardItem] {
+        micboardItems.sorted {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+    }
+
     var totalLengthMinutes: Int {
         totalDurationSeconds / 60
     }
@@ -798,9 +1021,14 @@ extension RunOfShowDocument {
 
     func actualRuntimeSeconds(for itemID: String, at now: Date) -> Int? {
         if isLiveActive, liveCurrentItemID == itemID {
-            return currentElapsedSeconds(at: now)
+            return (liveActualRuntimeSecondsByItemID[itemID] ?? 0) + currentElapsedSeconds(at: now)
         }
         return liveActualRuntimeSecondsByItemID[itemID]
+    }
+
+    func currentLiveTrackingStartedAt() -> Date? {
+        guard let currentItemID = liveCurrentItemID else { return liveItemStartedAt }
+        return liveItemStartedAt ?? liveEventTrackingRecords.first(where: { $0.itemID == currentItemID })?.startedAt
     }
 
     mutating func startLiveSession(at now: Date) {
@@ -810,27 +1038,125 @@ extension RunOfShowDocument {
         liveShowStartedAt = now
         liveItemStartedAt = now
         liveActualRuntimeSecondsByItemID = [:]
+        liveEventTrackingRecords = [makeInitialRecord(for: first, at: now)]
+        liveTrackingCompletedAt = nil
     }
 
-    mutating func moveLiveSession(direction: Int, at now: Date) {
+    mutating func moveLiveSession(direction: Int, at now: Date, splPeakDB: Double? = nil, splAverageDB: Double? = nil) {
         let items = sortedItems
         guard let currentItemID = liveCurrentItemID,
               let currentIndex = itemIndex(for: currentItemID) else { return }
         let newIndex = currentIndex + direction
         guard items.indices.contains(newIndex) else { return }
 
-        recordCurrentLiveItemRuntime(at: now)
+        recordCurrentLiveItemRuntime(at: now, splPeakDB: splPeakDB, splAverageDB: splAverageDB)
         isLiveActive = true
         liveCurrentItemID = items[newIndex].id
         liveItemStartedAt = now
         if liveShowStartedAt == nil {
             liveShowStartedAt = now
         }
+        let newItem = items[newIndex]
+        if !liveEventTrackingRecords.contains(where: { $0.itemID == newItem.id }) {
+            liveEventTrackingRecords.append(makeInitialRecord(for: newItem, at: now))
+            liveEventTrackingRecords.sort {
+                if $0.position != $1.position { return $0.position < $1.position }
+                return $0.startedAt < $1.startedAt
+            }
+        }
     }
 
-    mutating func recordCurrentLiveItemRuntime(at now: Date) {
-        guard let currentItemID = liveCurrentItemID else { return }
-        liveActualRuntimeSecondsByItemID[currentItemID] = max(currentElapsedSeconds(at: now), 0)
+    private func makeInitialRecord(for item: RunOfShowItem, at now: Date) -> RunOfShowEventTrackingRecord {
+        let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let person = item.person.trimmingCharacters(in: .whitespacesAndNewlines)
+        let notes = item.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        let subtitle = [person, notes].filter { !$0.isEmpty }.joined(separator: " - ")
+        return RunOfShowEventTrackingRecord(
+            itemID: item.id,
+            position: item.position,
+            title: title.isEmpty ? "Untitled" : title,
+            subtitle: subtitle,
+            plannedSeconds: item.durationSeconds,
+            actualSeconds: 0,
+            startedAt: now,
+            endedAt: now
+        )
+    }
+
+    mutating func recordCurrentLiveItemRuntime(at now: Date, splPeakDB: Double? = nil, splAverageDB: Double? = nil) {
+        guard let currentItemID = liveCurrentItemID,
+              let currentIndex = itemIndex(for: currentItemID),
+              sortedItems.indices.contains(currentIndex) else { return }
+        let currentItem = sortedItems[currentIndex]
+        let previousRuntime = liveActualRuntimeSecondsByItemID[currentItemID] ?? 0
+        let itemStartedAt = liveItemStartedAt ?? now
+        let elapsed = max(Int(now.timeIntervalSince(itemStartedAt)), 0)
+        let actualSeconds = previousRuntime + elapsed
+        liveActualRuntimeSecondsByItemID[currentItemID] = actualSeconds
+
+        let title = currentItem.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let person = currentItem.person.trimmingCharacters(in: .whitespacesAndNewlines)
+        let notes = currentItem.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        let subtitle = [person, notes].filter { !$0.isEmpty }.joined(separator: " - ")
+        let existingRecord = liveEventTrackingRecords.first(where: { $0.itemID == currentItemID })
+        let resolvedPeakDB: Double?
+        if let splPeakDB, let existingPeak = existingRecord?.splPeakDB {
+            resolvedPeakDB = max(existingPeak, splPeakDB)
+        } else {
+            resolvedPeakDB = splPeakDB ?? existingRecord?.splPeakDB
+        }
+        let resolvedAverageDB = splAverageDB ?? existingRecord?.splAverageDB
+        let record = RunOfShowEventTrackingRecord(
+            id: existingRecord?.id ?? UUID().uuidString,
+            itemID: currentItemID,
+            position: currentItem.position,
+            title: title.isEmpty ? "Untitled" : title,
+            subtitle: subtitle,
+            plannedSeconds: currentItem.durationSeconds,
+            actualSeconds: actualSeconds,
+            startedAt: itemStartedAt,
+            endedAt: now,
+            splPeakDB: resolvedPeakDB,
+            splAverageDB: resolvedAverageDB
+        )
+
+        if let existingIndex = liveEventTrackingRecords.firstIndex(where: { $0.itemID == currentItemID }) {
+            liveEventTrackingRecords[existingIndex] = record
+        } else {
+            liveEventTrackingRecords.append(record)
+        }
+        liveEventTrackingRecords.sort {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.startedAt < $1.startedAt
+        }
+    }
+
+    mutating func completeLiveSession(at now: Date, splPeakDB: Double? = nil, splAverageDB: Double? = nil) {
+        recordCurrentLiveItemRuntime(at: now, splPeakDB: splPeakDB, splAverageDB: splAverageDB)
+        archiveCurrentTrackingSession(completedAt: now)
+        isLiveActive = false
+        liveCurrentItemID = nil
+        liveItemStartedAt = nil
+        liveTrackingCompletedAt = now
+    }
+
+    mutating func archiveCurrentTrackingSession(completedAt now: Date) {
+        let records = liveEventTrackingRecords.sorted {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.startedAt < $1.startedAt
+        }
+        guard !records.isEmpty else { return }
+        let startedAt = liveShowStartedAt ?? records.first?.startedAt ?? now
+        let session = RunOfShowTrackingSession(
+            title: title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Run of Show" : title.trimmingCharacters(in: .whitespacesAndNewlines),
+            startedAt: startedAt,
+            completedAt: now,
+            plannedSeconds: totalDurationSeconds,
+            actualSeconds: records.reduce(0) { $0 + $1.actualSeconds },
+            records: records
+        )
+        liveTrackingSessions.insert(session, at: 0)
+        liveTrackingSessions.sort { $0.completedAt > $1.completedAt }
     }
 
     mutating func resetLiveSession() {
@@ -839,6 +1165,8 @@ extension RunOfShowDocument {
         liveShowStartedAt = nil
         liveItemStartedAt = nil
         liveActualRuntimeSecondsByItemID = [:]
+        liveEventTrackingRecords = []
+        liveTrackingCompletedAt = nil
     }
 }
 

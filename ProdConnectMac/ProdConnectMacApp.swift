@@ -51,6 +51,7 @@ struct ProdConnectMacApp: App {
     @StateObject private var store: ProdConnectStore
     @StateObject private var ndiSettings: MacNDISettingsController
     @StateObject private var runOfShowControls: MacRunOfShowControlController
+    @StateObject private var automaticMessaging: MacAutomaticMessagingController
 
     init() {
         configureMacProcessSignalsIfNeeded()
@@ -60,6 +61,7 @@ struct ProdConnectMacApp: App {
         _store = StateObject(wrappedValue: sharedStore)
         _ndiSettings = StateObject(wrappedValue: ndiController)
         _runOfShowControls = StateObject(wrappedValue: MacRunOfShowControlController(store: sharedStore))
+        _automaticMessaging = StateObject(wrappedValue: MacAutomaticMessagingController(store: sharedStore))
         appDelegate.onWillTerminate = {
             ndiController.disableAllOutputsOnShutdown()
         }
@@ -75,6 +77,7 @@ struct ProdConnectMacApp: App {
                 .environmentObject(store)
                 .environmentObject(ndiSettings)
                 .environmentObject(runOfShowControls)
+                .environmentObject(automaticMessaging)
                 .preferredColorScheme(.dark)
                 .frame(minWidth: 960, minHeight: 680)
         }
@@ -86,6 +89,7 @@ struct ProdConnectMacApp: App {
                 .environmentObject(store)
                 .environmentObject(ndiSettings)
                 .environmentObject(runOfShowControls)
+                .environmentObject(automaticMessaging)
                 .preferredColorScheme(.dark)
         }
     }

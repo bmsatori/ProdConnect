@@ -621,6 +621,7 @@ private enum MacNDIOverviewSourceID {
     static let stagePlot = "stagePlot"
     static let setlist = "setlist"
     static let smaart = "smaart"
+    static let timecode = "timecode"
 }
 
 private func externalTicketFormSlug(from organizationName: String) -> String {
@@ -667,6 +668,7 @@ struct MacRootView: View {
     @EnvironmentObject private var store: ProdConnectStore
     @EnvironmentObject private var ndiSettings: MacNDISettingsController
     @EnvironmentObject private var runOfShowControls: MacRunOfShowControlController
+    @EnvironmentObject private var automaticMessaging: MacAutomaticMessagingController
     @State private var selectedRoute: MacRoute? = .chat
     @State private var draggingSidebarRoute: MacRoute?
     @State private var isShowingNotifications = false
@@ -873,6 +875,7 @@ struct MacRootView: View {
                 .environmentObject(store)
                 .environmentObject(ndiSettings)
                 .environmentObject(runOfShowControls)
+                .environmentObject(automaticMessaging)
         case .users:
             MacUsersView()
         case .account:
@@ -2121,7 +2124,14 @@ private struct MacPatchsheetView: View {
     @State private var field4 = ""
     @State private var selectedPatch: PatchRow?
     @State private var noteDrafts: [String: String] = [:]
-    @FocusState private var focusedNotesPatchID: String?
+    @State private var micboardMicrophoneDrafts: [String: String] = [:]
+    @State private var micboardInEarMonitorDrafts: [String: String] = [:]
+    private enum PatchsheetFocusedField: Hashable {
+        case notes(String)
+        case micboardMicrophone(String)
+        case micboardInEarMonitor(String)
+    }
+    @FocusState private var focusedPatchsheetField: PatchsheetFocusedField?
     @State private var isExporting = false
 
     private let categories = ["Audio", "Video", "Lighting"]
@@ -2138,6 +2148,18 @@ private struct MacPatchsheetView: View {
     private var canManageNDI: Bool {
         guard let user = store.user else { return false }
         return hasNDIFeature && (user.isAdmin || user.isOwner)
+    }
+    private var hasMicboardFeature: Bool {
+        store.user?.normalizedSubscriptionTier != "free"
+    }
+    private var canManageMicboard: Bool {
+        hasMicboardFeature && store.canEditPatchsheet
+    }
+    private var showsMicboardColumn: Bool {
+        selectedCategory == "Audio" && hasMicboardFeature
+    }
+    private var showsMicboardAssignmentColumns: Bool {
+        selectedCategory == "Audio" && hasMicboardFeature
     }
 
     private var nameColumnTitle: String {
@@ -2165,24 +2187,43 @@ private struct MacPatchsheetView: View {
     private var patchsheetOutputColumnWidth: CGFloat { 160 * patchsheetZoom }
     private var patchsheetUniverseColumnWidth: CGFloat { 110 * patchsheetZoom }
     private var patchsheetNotesColumnWidth: CGFloat { 260 * patchsheetZoom }
+    private var patchsheetMicboardAssignmentColumnWidth: CGFloat { 125 * patchsheetZoom }
     private var patchsheetOrderColumnWidth: CGFloat { store.canEditPatchsheet ? 78 : 0 }
     private var patchsheetNDIColumnWidth: CGFloat { 72 }
+    private var patchsheetMicboardColumnWidth: CGFloat { 92 }
+    private var patchsheetCheckboxCellHorizontalPadding: CGFloat { 8 }
+    private var patchsheetPaddedTextColumnCount: Int {
+        3
+            + (showsLightingUniverseColumn ? 1 : 0)
+            + 1
+            + (showsMicboardAssignmentColumns ? 2 : 0)
+    }
     private var patchsheetTableWidth: CGFloat {
         patchsheetNameColumnWidth
             + patchsheetInputColumnWidth
             + patchsheetOutputColumnWidth
             + (showsLightingUniverseColumn ? patchsheetUniverseColumnWidth : 0)
             + patchsheetNotesColumnWidth
+            + (showsMicboardAssignmentColumns ? patchsheetMicboardAssignmentColumnWidth * 2 : 0)
             + patchsheetOrderColumnWidth
+            + (showsMicboardColumn ? patchsheetMicboardColumnWidth : 0)
             + (hasNDIFeature ? patchsheetNDIColumnWidth : 0)
+            + CGFloat(patchsheetPaddedTextColumnCount) * 28
+            + (showsMicboardColumn ? patchsheetCheckboxCellHorizontalPadding * 2 : 0)
+            + (hasNDIFeature ? patchsheetCheckboxCellHorizontalPadding * 2 : 0)
     }
     private var patchsheetHeaderFont: Font { .system(size: 11 * patchsheetZoom, weight: .semibold) }
     private var patchsheetRowFont: Font { .system(size: 13 * patchsheetZoom) }
     private var patchsheetEmphasisFont: Font { .system(size: 13 * patchsheetZoom, weight: .semibold) }
     private var patchsheetCellVerticalPadding: CGFloat { 10 * patchsheetZoom }
     private var allFilteredNDIEnabled: Bool { !filtered.isEmpty && filtered.allSatisfy(\.ndiEnabled) }
+    private var allFilteredMicboardEnabled: Bool { !filtered.isEmpty && filtered.allSatisfy(\.micboardEnabled) }
     private var patchsheetBulkNDISymbolName: String {
         if allFilteredNDIEnabled { return "checkmark.square.fill" }
+        return "square"
+    }
+    private var patchsheetBulkMicboardSymbolName: String {
+        if allFilteredMicboardEnabled { return "checkmark.square.fill" }
         return "square"
     }
 
@@ -2258,9 +2299,9 @@ private struct MacPatchsheetView: View {
             MacEditPatchView(patch: patch)
                 .environmentObject(store)
         }
-        .onChange(of: focusedNotesPatchID) { oldValue, newValue in
+        .onChange(of: focusedPatchsheetField) { oldValue, newValue in
             guard oldValue != newValue, let oldValue else { return }
-            saveNotes(forPatchID: oldValue)
+            saveDraft(for: oldValue)
         }
     }
 
@@ -2298,8 +2339,15 @@ private struct MacPatchsheetView: View {
                 patchsheetHeaderCell("Universe", width: patchsheetUniverseColumnWidth)
             }
             patchsheetHeaderCell("Notes", width: patchsheetNotesColumnWidth)
+            if showsMicboardAssignmentColumns {
+                patchsheetHeaderCell("Microphone", width: patchsheetMicboardAssignmentColumnWidth)
+                patchsheetHeaderCell("Monitor", width: patchsheetMicboardAssignmentColumnWidth)
+            }
             if store.canEditPatchsheet {
-                patchsheetHeaderCell("Order", width: patchsheetOrderColumnWidth, alignment: .center)
+                patchsheetOrderHeaderCell
+            }
+            if showsMicboardColumn {
+                patchsheetMicboardHeaderCell
             }
             if hasNDIFeature {
                 patchsheetNDIHeaderCell
@@ -2315,6 +2363,15 @@ private struct MacPatchsheetView: View {
             .foregroundStyle(.secondary)
             .frame(width: width, alignment: alignment)
             .padding(.horizontal, 14)
+            .padding(.vertical, 11 * patchsheetZoom)
+    }
+
+    private var patchsheetOrderHeaderCell: some View {
+        Text("Order")
+            .font(patchsheetHeaderFont)
+            .textCase(.uppercase)
+            .foregroundStyle(.secondary)
+            .frame(width: patchsheetOrderColumnWidth, alignment: .center)
             .padding(.vertical, 11 * patchsheetZoom)
     }
 
@@ -2335,8 +2392,28 @@ private struct MacPatchsheetView: View {
             .buttonStyle(.plain)
             .disabled(!canManageNDI || filtered.isEmpty)
         }
-        .frame(width: patchsheetNDIColumnWidth, alignment: .center)
-        .padding(.horizontal, 8)
+        .frame(width: patchsheetNDIColumnWidth + (patchsheetCheckboxCellHorizontalPadding * 2), alignment: .center)
+        .padding(.vertical, 11 * patchsheetZoom)
+    }
+
+    private var patchsheetMicboardHeaderCell: some View {
+        HStack(spacing: 6) {
+            Text("Micboard")
+                .font(patchsheetHeaderFont)
+                .textCase(.uppercase)
+                .foregroundStyle(.secondary)
+
+            Button {
+                setAllFilteredMicboardEnabled(!allFilteredMicboardEnabled)
+            } label: {
+                Image(systemName: patchsheetBulkMicboardSymbolName)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(canManageMicboard ? (allFilteredMicboardEnabled ? .green : .secondary) : .secondary)
+            }
+            .buttonStyle(.plain)
+            .disabled(!canManageMicboard || filtered.isEmpty)
+        }
+        .frame(width: patchsheetMicboardColumnWidth + (patchsheetCheckboxCellHorizontalPadding * 2), alignment: .center)
         .padding(.vertical, 11 * patchsheetZoom)
     }
 
@@ -2357,8 +2434,15 @@ private struct MacPatchsheetView: View {
                 }
             }
             patchsheetNotesCell(for: patch)
+            if showsMicboardAssignmentColumns {
+                patchsheetMicboardAssignmentCell(for: patch, field: .micboardMicrophone(patch.id), title: "Microphone")
+                patchsheetMicboardAssignmentCell(for: patch, field: .micboardInEarMonitor(patch.id), title: "Monitor")
+            }
             if store.canEditPatchsheet {
                 patchsheetOrderCell(for: patch)
+            }
+            if showsMicboardColumn {
+                patchsheetMicboardCell(for: patch)
             }
             if hasNDIFeature {
                 patchsheetNDICell(for: patch)
@@ -2399,10 +2483,26 @@ private struct MacPatchsheetView: View {
             .frame(width: patchsheetNotesColumnWidth, alignment: .leading)
             .padding(.horizontal, 14)
             .padding(.vertical, patchsheetCellVerticalPadding)
-            .focused($focusedNotesPatchID, equals: patch.id)
+            .focused($focusedPatchsheetField, equals: .notes(patch.id))
             .disabled(!store.canEditPatchsheet)
             .onSubmit {
-                saveNotes(forPatchID: patch.id)
+                saveDraft(for: .notes(patch.id))
+            }
+    }
+
+    private func patchsheetMicboardAssignmentCell(for patch: PatchRow, field: PatchsheetFocusedField, title: String) -> some View {
+        TextField(title, text: micboardAssignmentBinding(for: patch, field: field))
+            .textFieldStyle(.plain)
+            .font(patchsheetRowFont)
+            .foregroundStyle(.primary)
+            .lineLimit(1)
+            .frame(width: patchsheetMicboardAssignmentColumnWidth, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.vertical, patchsheetCellVerticalPadding)
+            .focused($focusedPatchsheetField, equals: field)
+            .disabled(!store.canEditPatchsheet)
+            .onSubmit {
+                saveDraft(for: field)
             }
     }
 
@@ -2413,11 +2513,25 @@ private struct MacPatchsheetView: View {
             Image(systemName: patch.ndiEnabled ? "checkmark.square.fill" : "square")
                 .foregroundStyle(canManageNDI ? (patch.ndiEnabled ? .green : .secondary) : .secondary)
                 .font(.system(size: 15, weight: .semibold))
-                .frame(width: patchsheetNDIColumnWidth, alignment: .center)
+                .frame(width: patchsheetNDIColumnWidth + (patchsheetCheckboxCellHorizontalPadding * 2), alignment: .center)
                 .padding(.vertical, patchsheetCellVerticalPadding)
         }
         .buttonStyle(.plain)
         .disabled(!canManageNDI)
+    }
+
+    private func patchsheetMicboardCell(for patch: PatchRow) -> some View {
+        Button {
+            toggleMicboard(for: patch)
+        } label: {
+            Image(systemName: patch.micboardEnabled ? "checkmark.square.fill" : "square")
+                .foregroundStyle(canManageMicboard ? (patch.micboardEnabled ? .green : .secondary) : .secondary)
+                .font(.system(size: 15, weight: .semibold))
+                .frame(width: patchsheetMicboardColumnWidth + (patchsheetCheckboxCellHorizontalPadding * 2), alignment: .center)
+                .padding(.vertical, patchsheetCellVerticalPadding)
+        }
+        .buttonStyle(.plain)
+        .disabled(!canManageMicboard)
     }
 
     private var primaryPlaceholder: String {
@@ -2482,6 +2596,8 @@ private struct MacPatchsheetView: View {
             outputColumnTitle,
             "Universe",
             "Notes",
+            "Microphone",
+            "Monitor",
             "Category",
             "Campus",
             "Room",
@@ -2495,6 +2611,8 @@ private struct MacPatchsheetView: View {
                 patch.output,
                 patch.universe ?? "",
                 patch.notes,
+                patch.micboardMicrophone,
+                patch.micboardInEarMonitor,
                 patch.category,
                 patch.campus,
                 patch.room,
@@ -2557,12 +2675,35 @@ private struct MacPatchsheetView: View {
         }
     }
 
+    private func toggleMicboard(for patch: PatchRow) {
+        guard canManageMicboard, patch.category == "Audio" else { return }
+        var updated = patch
+        updated.micboardEnabled.toggle()
+        store.savePatch(updated)
+        if selectedPatch?.id == updated.id {
+            selectedPatch = updated
+        }
+    }
+
     private func setAllFilteredNDIEnabled(_ isEnabled: Bool) {
         guard canManageNDI else { return }
 
         for patch in filtered where patch.ndiEnabled != isEnabled {
             var updated = patch
             updated.ndiEnabled = isEnabled
+            store.savePatch(updated)
+            if selectedPatch?.id == updated.id {
+                selectedPatch = updated
+            }
+        }
+    }
+
+    private func setAllFilteredMicboardEnabled(_ isEnabled: Bool) {
+        guard canManageMicboard, selectedCategory == "Audio" else { return }
+
+        for patch in filtered where patch.micboardEnabled != isEnabled {
+            var updated = patch
+            updated.micboardEnabled = isEnabled
             store.savePatch(updated)
             if selectedPatch?.id == updated.id {
                 selectedPatch = updated
@@ -2581,16 +2722,58 @@ private struct MacPatchsheetView: View {
         )
     }
 
-    private func saveNotes(forPatchID patchID: String) {
+    private func micboardAssignmentBinding(for patch: PatchRow, field: PatchsheetFocusedField) -> Binding<String> {
+        Binding(
+            get: {
+                switch field {
+                case .micboardMicrophone(let patchID):
+                    return micboardMicrophoneDrafts[patchID] ?? patch.micboardMicrophone
+                case .micboardInEarMonitor(let patchID):
+                    return micboardInEarMonitorDrafts[patchID] ?? patch.micboardInEarMonitor
+                case .notes:
+                    return ""
+                }
+            },
+            set: { newValue in
+                switch field {
+                case .micboardMicrophone(let patchID):
+                    micboardMicrophoneDrafts[patchID] = newValue
+                case .micboardInEarMonitor(let patchID):
+                    micboardInEarMonitorDrafts[patchID] = newValue
+                case .notes:
+                    break
+                }
+            }
+        )
+    }
+
+    private func saveDraft(for field: PatchsheetFocusedField) {
         guard store.canEditPatchsheet else { return }
+        let patchID: String
+        switch field {
+        case .notes(let id), .micboardMicrophone(let id), .micboardInEarMonitor(let id):
+            patchID = id
+        }
         guard let patch = store.patchsheet.first(where: { $0.id == patchID }) else { return }
-        let draft = (noteDrafts[patchID] ?? patch.notes).trimmingCharacters(in: .whitespacesAndNewlines)
-        let current = patch.notes.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard draft != current else { return }
 
         var updated = patch
-        updated.notes = draft
-        noteDrafts[patchID] = draft
+        switch field {
+        case .notes:
+            let draft = (noteDrafts[patchID] ?? patch.notes).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard draft != patch.notes.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+            updated.notes = draft
+            noteDrafts[patchID] = draft
+        case .micboardMicrophone:
+            let draft = (micboardMicrophoneDrafts[patchID] ?? patch.micboardMicrophone).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard draft != patch.micboardMicrophone.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+            updated.micboardMicrophone = draft
+            micboardMicrophoneDrafts[patchID] = draft
+        case .micboardInEarMonitor:
+            let draft = (micboardInEarMonitorDrafts[patchID] ?? patch.micboardInEarMonitor).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard draft != patch.micboardInEarMonitor.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+            updated.micboardInEarMonitor = draft
+            micboardInEarMonitorDrafts[patchID] = draft
+        }
         store.savePatch(updated)
         if selectedPatch?.id == updated.id {
             selectedPatch = updated
@@ -2639,6 +2822,94 @@ enum MacNDIOrientation: String, CaseIterable, Codable, Identifiable {
     }
 }
 
+enum MacNDIOutputResolution: String, CaseIterable, Codable, Identifiable {
+    case hd720
+    case hd1080
+    case uhd4K
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .hd720: return "720p"
+        case .hd1080: return "1080p"
+        case .uhd4K: return "4K UHD"
+        }
+    }
+
+    private var landscapeSize: CGSize {
+        switch self {
+        case .hd720: return CGSize(width: 1280, height: 720)
+        case .hd1080: return CGSize(width: 1920, height: 1080)
+        case .uhd4K: return CGSize(width: 3840, height: 2160)
+        }
+    }
+
+    func outputSize(for orientation: MacNDIOrientation) -> CGSize {
+        let size = landscapeSize
+        switch orientation {
+        case .landscape:
+            return size
+        case .portrait:
+            return CGSize(width: size.height, height: size.width)
+        }
+    }
+
+    func windowSize(for orientation: MacNDIOrientation) -> CGSize {
+        let outputSize = outputSize(for: orientation)
+        let maxWidth: CGFloat = orientation == .landscape ? 1200 : 720
+        let maxHeight: CGFloat = orientation == .landscape ? 720 : 1200
+        let scale = min(maxWidth / outputSize.width, maxHeight / outputSize.height)
+        return CGSize(width: outputSize.width * scale, height: outputSize.height * scale)
+    }
+}
+
+enum MacNDIFrameRate: String, CaseIterable, Codable, Identifiable {
+    case fps5
+    case fps10
+    case fps15
+    case fps24
+    case fps30
+    case fps60
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .fps5: return "5 FPS"
+        case .fps10: return "10 FPS"
+        case .fps15: return "15 FPS"
+        case .fps24: return "24 FPS"
+        case .fps30: return "30 FPS"
+        case .fps60: return "60 FPS"
+        }
+    }
+
+    var framesPerSecond: Double {
+        switch self {
+        case .fps5: return 5
+        case .fps10: return 10
+        case .fps15: return 15
+        case .fps24: return 24
+        case .fps30: return 30
+        case .fps60: return 60
+        }
+    }
+
+    var numerator: Int32 {
+        switch self {
+        case .fps5: return 5000
+        case .fps10: return 10000
+        case .fps15: return 15000
+        case .fps24: return 24000
+        case .fps30: return 30000
+        case .fps60: return 60000
+        }
+    }
+
+    var denominator: Int32 { 1000 }
+}
+
 enum MacNDIFeedSourceType: String, CaseIterable, Codable, Identifiable {
     case overview
     case patchsheet
@@ -2646,6 +2917,7 @@ enum MacNDIFeedSourceType: String, CaseIterable, Codable, Identifiable {
     case runOfShow
     case runOfShowLive
     case stagePlot
+    case micboard
 
     var id: String { rawValue }
 
@@ -2657,6 +2929,7 @@ enum MacNDIFeedSourceType: String, CaseIterable, Codable, Identifiable {
         case .runOfShow: return "Run of Show"
         case .runOfShowLive: return "Run of Show Live"
         case .stagePlot: return "Stage Plot"
+        case .micboard: return "Micboard"
         }
     }
 }
@@ -2883,7 +3156,7 @@ struct SmaartSettings: Codable {
     var port: Int = 9090
     var apiPath: String = ""
     var password: String = ""
-    var pollIntervalSeconds: Double = 0.25
+    var pollIntervalSeconds: Double = 0.1
 
     private static let defaultsKey = "prodconnect.smaart.settings.v1"
 
@@ -2920,6 +3193,8 @@ final class SmaartAPIController: ObservableObject {
     private var webSocketTask: URLSessionWebSocketTask?
     private var recentSamplesByChannelID: [String: [(date: Date, value: Double)]] = [:]
     private var peakByChannelID: [String: Double] = [:]
+    private var lastChannelPublishAt = Date.distantPast
+    private let channelPublishInterval: TimeInterval = 1.0 / 6.0
     private let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 3.0
@@ -2932,6 +3207,23 @@ final class SmaartAPIController: ObservableObject {
         restart()
     }
 
+    func trackingSnapshot(since startDate: Date? = nil) -> (peakDB: Double?, averageDB: Double?) {
+        guard let channel = channels.first else { return (nil, nil) }
+        if let startDate {
+            let values = recentSamplesByChannelID[channel.id, default: []]
+                .filter { $0.date >= startDate }
+                .map(\.value)
+            if !values.isEmpty {
+                let peak = values.max()
+                let average = values.reduce(0, +) / Double(values.count)
+                return (peak, average)
+            }
+        }
+        let peak = channel.peakDB > -900 ? channel.peakDB : nil
+        let average = channel.average10MinDB ?? (channel.dB > -900 ? channel.dB : nil)
+        return (peak, average)
+    }
+
     func restart() {
         pollingTask?.cancel()
         pollingTask = nil
@@ -2940,6 +3232,7 @@ final class SmaartAPIController: ObservableObject {
         channels = []
         recentSamplesByChannelID = [:]
         peakByChannelID = [:]
+        lastChannelPublishAt = .distantPast
         lastRawResponse = ""
         connectionStatus = .disconnected
         guard settings.isEnabled, settings.resolvedURL != nil else { return }
@@ -2950,7 +3243,7 @@ final class SmaartAPIController: ObservableObject {
             pollingTask = Task {
             while !Task.isCancelled {
                 await poll()
-                let ms = max(100, Int(settings.pollIntervalSeconds * 1000))
+                let ms = max(50, Int(settings.pollIntervalSeconds * 1000))
                 try? await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
             }
             }
@@ -3052,7 +3345,7 @@ final class SmaartAPIController: ObservableObject {
     private func updateChannels(_ newChannels: [SmaartChannel]) {
         let now = Date()
         let cutoff = now.addingTimeInterval(-600)
-        channels = newChannels.map { channel in
+        let updatedChannels = newChannels.map { channel in
             let sampleValue = channel.dB
             var samples = recentSamplesByChannelID[channel.id, default: []]
             if sampleValue > -900 {
@@ -3074,6 +3367,10 @@ final class SmaartAPIController: ObservableObject {
                 average10MinDB: channel.average10MinDB ?? rollingAverage,
                 levelColor: channel.levelColor
             )
+        }
+        if channels.isEmpty || now.timeIntervalSince(lastChannelPublishAt) >= channelPublishInterval {
+            channels = updatedChannels
+            lastChannelPublishAt = now
         }
     }
 
@@ -3138,6 +3435,14 @@ final class SmaartAPIController: ObservableObject {
                 : streamEndpoints.compactMap { webSocketURL(for: $0.path, rootURL: rootURL) }
             var foundLiveStream = false
             var attemptSummaries: [String] = []
+            func appendAttemptSummary(_ summary: String) {
+                let maxSummaries = 12
+                if attemptSummaries.count < maxSummaries {
+                    attemptSummaries.append(summary)
+                } else if attemptSummaries.count == maxSummaries {
+                    attemptSummaries.append("Additional live Smaart messages suppressed to keep memory bounded.")
+                }
+            }
 
             for wsURL in candidateURLs {
                 guard !Task.isCancelled else { return }
@@ -3151,11 +3456,11 @@ final class SmaartAPIController: ObservableObject {
                 let task = session.webSocketTask(with: request)
                 webSocketTask = task
                 task.resume()
-                _ = await sendWebSocketString(#"{"action":"set","properties":[{"targetFPS":20}]}"#, on: task, timeoutSeconds: 1.0)
+                _ = await sendWebSocketString(#"{"action":"set","properties":[{"targetFPS":12}]}"#, on: task, timeoutSeconds: 1.0)
 
                 let shouldSendGet = wsURL.path == "/api/v3/" || wsURL.path == "/api/v4/"
                 if shouldSendGet, let sendError = await sendWebSocketString(#"{"action":"get"}"#, on: task, timeoutSeconds: 3.0) {
-                    attemptSummaries.append("WebSocket \(wsURL.absoluteString)\nSend failed: \(sendError)")
+                    appendAttemptSummary("WebSocket \(wsURL.absoluteString)\nSend failed: \(sendError)")
                     if !Task.isCancelled {
                         connectionStatus = .error("Smaart WebSocket send failed: \(sendError)")
                         lastRawResponse = attemptSummaries.last ?? ""
@@ -3195,20 +3500,21 @@ final class SmaartAPIController: ObservableObject {
                             lastRawResponse = preview
                             lastDebugUpdateAt = Date()
                         }
-                        attemptSummaries.append("WebSocket \(wsURL.absoluteString)\nMessage \(messageCount):\n\(preview)")
                         let parsed = parseSmaartResponse(data)
                         if !parsed.isEmpty {
                             updateChannels(parsed)
                             connectionStatus = .connected
                             parsedAnyReading = true
                             foundLiveStream = true
+                        } else if !parsedAnyReading || messageCount <= 2 {
+                            appendAttemptSummary("WebSocket \(wsURL.absoluteString)\nMessage \(messageCount):\n\(preview)")
                         }
 
                         if !parsedAnyReading && messageCount >= 2 {
                             break
                         }
                     case .failure(let message):
-                        attemptSummaries.append("WebSocket \(wsURL.absoluteString)\nReceive failed: \(message)")
+                        appendAttemptSummary("WebSocket \(wsURL.absoluteString)\nReceive failed: \(message)")
                         if !parsedAnyReading && message.localizedCaseInsensitiveContains("timed out") {
                             break
                         } else if Date().timeIntervalSince(lastMessageAt) >= 4.5 {
@@ -3418,12 +3724,12 @@ final class SmaartAPIController: ObservableObject {
     }
 
     private func webSocketPaths(in text: String) -> [String] {
-        let pattern = #"["']([^"']*(?:api/v3|stream|spl|meter|endpoint)[^"']*)["']"#
+        let pattern = #"["']([^"']*(?:api/v3|api/v4|stream|spl|meter|endpoint)[^"']*)["']"#
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
         let nsText = text as NSString
         return regex.matches(in: text, range: NSRange(location: 0, length: nsText.length)).compactMap { match in
             guard match.numberOfRanges > 1 else { return nil }
-            var raw = nsText.substring(with: match.range(at: 1))
+            let raw = nsText.substring(with: match.range(at: 1))
             guard !raw.contains("{"), !raw.contains("}"), !raw.contains("\\") else { return nil }
             if raw.hasPrefix("ws://") || raw.hasPrefix("wss://") {
                 return URL(string: raw)?.path
@@ -3974,6 +4280,7 @@ final class SmaartAPIController: ObservableObject {
 
         return []
     }
+
 }
 
 @MainActor
@@ -3984,18 +4291,34 @@ final class MacNDISettingsController: ObservableObject {
             syncOutputs()
         }
     }
+    @Published var outputResolution: MacNDIOutputResolution = .hd1080 {
+        didSet {
+            persistOutputResolution()
+            syncOutputs()
+        }
+    }
+    @Published var outputFrameRate: MacNDIFrameRate = .fps10 {
+        didSet {
+            persistOutputFrameRate()
+            syncOutputs()
+        }
+    }
 
     @Published private(set) var previewVisibleFeedIDs: Set<String> = []
 
     private let store: ProdConnectStore
     private let userDefaults = UserDefaults.standard
     private let feedsDefaultsKey = "prodconnect.mac.ndiFeeds.v1"
+    private let outputResolutionDefaultsKey = "prodconnect.mac.ndiOutputResolution.v1"
+    private let outputFrameRateDefaultsKey = "prodconnect.mac.ndiOutputFrameRate.v1"
     private var controllers: [String: MacPatchsheetNDIOutputWindowController] = [:]
     private var cancellables: Set<AnyCancellable> = []
 
     init(store: ProdConnectStore) {
         self.store = store
         self.feeds = Self.loadPersistedFeeds()
+        self.outputResolution = Self.loadPersistedOutputResolution()
+        self.outputFrameRate = Self.loadPersistedOutputFrameRate()
 
         store.$patchsheet
             .receive(on: RunLoop.main)
@@ -4061,20 +4384,6 @@ final class MacNDISettingsController: ObservableObject {
             .store(in: &cancellables)
 
         store.$user
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
-                self?.syncOutputs()
-            }
-            .store(in: &cancellables)
-
-        SmaartAPIController.shared.$channels
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
-                self?.syncOutputs()
-            }
-            .store(in: &cancellables)
-
-        SmaartAPIController.shared.$connectionStatus
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
                 self?.syncOutputs()
@@ -4226,6 +4535,14 @@ final class MacNDISettingsController: ObservableObject {
             )
         }
 
+        options.append(
+            MacOverviewSourceOption(
+                id: MacNDIOverviewSourceID.timecode,
+                title: "Timecode",
+                systemImage: "timer"
+            )
+        )
+
         return options
     }
 
@@ -4257,6 +4574,10 @@ final class MacNDISettingsController: ObservableObject {
         store.patchsheet
             .filter { $0.category == category && $0.ndiEnabled }
             .sorted(by: PatchRow.autoSort)
+    }
+
+    func micboardItems(for show: RunOfShowDocument?) -> [RunOfShowMicboardItem] {
+        makeMicboardItems(fromAudioPatchRows: store.patchsheet, storedItems: show?.micboardItems ?? [])
     }
 
     func runOfShows() -> [RunOfShowDocument] {
@@ -4298,6 +4619,11 @@ final class MacNDISettingsController: ObservableObject {
             let show = runOfShow(for: feed)
             let title = show?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return "\(show?.sortedStagePlotItems.count ?? 0) stage plot items in \(title.isEmpty ? "selected show" : title)"
+        case .micboard:
+            let show = runOfShow(for: feed)
+            let title = show?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let manualCount = show?.sortedMicboardItems.filter { !$0.id.hasPrefix("patchsheet-") }.count ?? 0
+            return "\(micboardItems(for: show).count + manualCount) micboard assignments in \(title.isEmpty ? "selected show" : title)"
         }
     }
 
@@ -4327,9 +4653,10 @@ final class MacNDISettingsController: ObservableObject {
             }
 
             let feedController = controller(for: feed.id)
+            let selectedRunOfShow = runOfShow(for: feed)
             if feed.sourceType == .overview {
                 feedController.liveOverviewTilesProvider = { [weak self] in
-                    self?.overviewTiles(for: feed, rowLimit: 20, now: Date()) ?? []
+                    self?.overviewTiles(for: feed, rowLimit: nil, now: Date()) ?? []
                 }
             }
             feedController.update(
@@ -4337,9 +4664,10 @@ final class MacNDISettingsController: ObservableObject {
                     isActive: feed.isLive,
                     title: feed.title,
                     sourceType: feed.sourceType,
-                    overviewTiles: feed.sourceType == .overview ? overviewTiles(for: feed, rowLimit: 20, now: Date()) : [],
+                    overviewTiles: feed.sourceType == .overview ? overviewTiles(for: feed, rowLimit: nil, now: Date()) : [],
                     category: feed.category,
-                    runOfShow: runOfShow(for: feed),
+                    runOfShow: selectedRunOfShow,
+                    micboardItems: micboardItems(for: selectedRunOfShow),
                     tickets: tickets(for: feed),
                     patches: patches(for: feed.category),
                     nameColumnTitle: Self.nameColumnTitle(for: feed.category),
@@ -4348,7 +4676,9 @@ final class MacNDISettingsController: ObservableObject {
                     showsUniverseColumn: feed.category == "Lighting",
                     showsHeaders: feed.showsHeaders,
                     scale: feed.scale,
-                    orientation: feed.orientation
+                    orientation: feed.orientation,
+                    resolution: outputResolution,
+                    frameRate: outputFrameRate
                 )
             )
         }
@@ -4393,11 +4723,11 @@ final class MacNDISettingsController: ObservableObject {
     }
 
     fileprivate func overviewTiles(for feed: MacNDIFeedConfiguration) -> [MacOverviewTileData] {
-        overviewTiles(for: feed, rowLimit: 30, now: Date())
+        overviewTiles(for: feed, rowLimit: nil, now: Date())
     }
 
     fileprivate func overviewTiles(for feed: MacNDIFeedConfiguration, now: Date) -> [MacOverviewTileData] {
-        overviewTiles(for: feed, rowLimit: 30, now: now)
+        overviewTiles(for: feed, rowLimit: nil, now: now)
     }
 
     private func overviewTiles(for feed: MacNDIFeedConfiguration, rowLimit: Int?, now: Date) -> [MacOverviewTileData] {
@@ -4438,7 +4768,9 @@ final class MacNDISettingsController: ObservableObject {
                     "Show ends: \(projectedEnd.formatted(date: .omitted, time: .shortened))",
                     "\(items.count) show items",
                     show?.isLiveActive == true ? "Live timer running" : "Live timer stopped"
-                ], rowLimit: rowLimit)
+                ], rowLimit: rowLimit),
+                runOfShowLiveShow: show,
+                runOfShowLiveNow: now
             )
         }
 
@@ -4501,10 +4833,26 @@ final class MacNDISettingsController: ObservableObject {
                     ? []
                     : Array(smaartChannels.filter { $0.id != selectedChannel?.id }.prefix(rowLimit ?? smaartChannels.count).map { ch in
                         [ch.name, ch.formattedDB, ch.formattedPeak]
-                    }),
+                }),
                 smaartChannel: selectedChannel,
                 smaartChannels: smaartChannels,
                 smaartConnectionStatus: status
+            )
+        }
+
+        if source.id == MacNDIOverviewSourceID.timecode {
+            let controller = MacExternalTimecodeController.shared
+            return MacOverviewTileData(
+                id: source.id,
+                title: source.title,
+                subtitle: controller.statusText,
+                systemImage: source.systemImage,
+                accent: controller.isReceiving ? .green : .orange,
+                rows: [],
+                timecodeDisplay: controller.timecodeDisplay,
+                timecodeFrameRate: controller.frameRateLabel,
+                timecodeStatus: controller.statusText,
+                timecodeIsReceiving: controller.isReceiving
             )
         }
 
@@ -4660,6 +5008,24 @@ final class MacNDISettingsController: ObservableObject {
         userDefaults.set(data, forKey: feedsDefaultsKey)
     }
 
+    private func persistOutputResolution() {
+        userDefaults.set(outputResolution.rawValue, forKey: outputResolutionDefaultsKey)
+    }
+
+    private func persistOutputFrameRate() {
+        userDefaults.set(outputFrameRate.rawValue, forKey: outputFrameRateDefaultsKey)
+    }
+
+    private static func loadPersistedOutputResolution() -> MacNDIOutputResolution {
+        let rawValue = UserDefaults.standard.string(forKey: "prodconnect.mac.ndiOutputResolution.v1") ?? ""
+        return MacNDIOutputResolution(rawValue: rawValue) ?? .hd1080
+    }
+
+    private static func loadPersistedOutputFrameRate() -> MacNDIFrameRate {
+        let rawValue = UserDefaults.standard.string(forKey: "prodconnect.mac.ndiOutputFrameRate.v1") ?? ""
+        return MacNDIFrameRate(rawValue: rawValue) ?? .fps10
+    }
+
     private static func loadPersistedFeeds() -> [MacNDIFeedConfiguration] {
         let defaults = UserDefaults.standard
         if let data = defaults.data(forKey: "prodconnect.mac.ndiFeeds.v1"),
@@ -4721,6 +5087,13 @@ enum MacRunOfShowMIDIAction: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum MacAutomaticMessageTriggerType: String, CaseIterable, Identifiable, Codable {
+    case midiNote = "MIDI Note"
+    case timeOfDay = "Time of Day"
+
+    var id: String { rawValue }
+}
+
 struct MacRunOfShowMIDIMapping: Codable, Equatable {
     var messageType: MacRunOfShowMIDIMessageType = .noteOn
     var channel: Int = 1
@@ -4755,10 +5128,614 @@ struct MacRunOfShowMIDIMapping: Codable, Equatable {
     }
 }
 
+struct MacAutomaticMessageRule: Identifiable, Codable, Equatable {
+    var id: String = UUID().uuidString
+    var isEnabled: Bool = true
+    var name: String = ""
+    var channelID: String = ""
+    var messageText: String = ""
+    var triggerType: MacAutomaticMessageTriggerType = .midiNote
+    var midiChannel: Int = 1
+    var noteNumber: Int = 60
+    var minimumVelocity: Int = 1
+    var timeOfDayMinutes: Int = 9 * 60
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case isEnabled
+        case name
+        case channelID
+        case messageText
+        case triggerType
+        case midiChannel
+        case noteNumber
+        case minimumVelocity
+        case timeOfDayMinutes
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        isEnabled: Bool = true,
+        name: String = "",
+        channelID: String = "",
+        messageText: String = "",
+        triggerType: MacAutomaticMessageTriggerType = .midiNote,
+        midiChannel: Int = 1,
+        noteNumber: Int = 60,
+        minimumVelocity: Int = 1,
+        timeOfDayMinutes: Int = 9 * 60
+    ) {
+        self.id = id
+        self.isEnabled = isEnabled
+        self.name = name
+        self.channelID = channelID
+        self.messageText = messageText
+        self.triggerType = triggerType
+        self.midiChannel = midiChannel
+        self.noteNumber = noteNumber
+        self.minimumVelocity = minimumVelocity
+        self.timeOfDayMinutes = timeOfDayMinutes
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? ""
+        channelID = try container.decodeIfPresent(String.self, forKey: .channelID) ?? ""
+        messageText = try container.decodeIfPresent(String.self, forKey: .messageText) ?? ""
+        triggerType = try container.decodeIfPresent(MacAutomaticMessageTriggerType.self, forKey: .triggerType) ?? .midiNote
+        midiChannel = try container.decodeIfPresent(Int.self, forKey: .midiChannel) ?? 1
+        noteNumber = try container.decodeIfPresent(Int.self, forKey: .noteNumber) ?? 60
+        minimumVelocity = try container.decodeIfPresent(Int.self, forKey: .minimumVelocity) ?? 1
+        timeOfDayMinutes = try container.decodeIfPresent(Int.self, forKey: .timeOfDayMinutes) ?? (9 * 60)
+    }
+}
+
 struct MacMIDISourceDescriptor: Identifiable, Equatable {
     let id: String
     let uniqueID: MIDIUniqueID
     let name: String
+}
+
+struct MacLTCAudioSourceDescriptor: Identifiable, Equatable {
+    let id: String
+    let name: String
+}
+
+enum MacExternalTimecodeInputMode: String, CaseIterable, Identifiable {
+    case mtc
+    case ltc
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .mtc: "MTC MIDI"
+        case .ltc: "LTC Audio"
+        }
+    }
+}
+
+@MainActor
+final class MacExternalTimecodeController: ObservableObject {
+    static let shared = MacExternalTimecodeController()
+
+    @Published var inputMode: MacExternalTimecodeInputMode {
+        didSet {
+            userDefaults.set(inputMode.rawValue, forKey: inputModeDefaultsKey)
+            applyInputMode()
+        }
+    }
+
+    @Published var selectedMIDISourceID: String? {
+        didSet {
+            userDefaults.set(selectedMIDISourceID, forKey: selectedMIDISourceDefaultsKey)
+#if canImport(CoreMIDI)
+            if inputMode == .mtc {
+                refreshMIDISourceConnection()
+            }
+#endif
+        }
+    }
+
+    @Published var selectedLTCAudioSourceID: String? {
+        didSet {
+            userDefaults.set(selectedLTCAudioSourceID, forKey: selectedLTCAudioSourceDefaultsKey)
+            if inputMode == .ltc {
+                refreshLTCAudioConnection()
+            }
+        }
+    }
+
+    @Published private(set) var timecodeDisplay = "--:--:--:--"
+    @Published private(set) var frameRateLabel = "SMPTE"
+    @Published private(set) var lastReceivedAt: Date?
+    @Published private(set) var lastLTCAudioLevel: Double = 0
+
+    private let userDefaults = UserDefaults.standard
+    private let inputModeDefaultsKey = "prodconnect.mac.externalTimecode.inputMode"
+    private let selectedMIDISourceDefaultsKey = "prodconnect.mac.externalTimecode.selectedMIDISourceID"
+    private let selectedLTCAudioSourceDefaultsKey = "prodconnect.mac.externalTimecode.selectedLTCAudioSourceID"
+    private var quarterFrameValues = [Int](repeating: 0, count: 8)
+    private var ltcCaptureSession: AVCaptureSession?
+    private var ltcCaptureProcessor: MacLTCAudioCaptureProcessor?
+
+#if canImport(CoreMIDI)
+    private var midiClient = MIDIClientRef()
+    private var inputPort = MIDIPortRef()
+    private var connectedSourceID: MIDIUniqueID?
+#endif
+
+    private init() {
+        let savedMode = userDefaults.string(forKey: inputModeDefaultsKey).flatMap(MacExternalTimecodeInputMode.init(rawValue:))
+        inputMode = savedMode ?? .mtc
+        selectedMIDISourceID = userDefaults.string(forKey: selectedMIDISourceDefaultsKey)
+        selectedLTCAudioSourceID = userDefaults.string(forKey: selectedLTCAudioSourceDefaultsKey)
+#if canImport(CoreMIDI)
+        configureMIDI()
+#endif
+        applyInputMode()
+    }
+
+    deinit {
+        ltcCaptureSession?.stopRunning()
+#if canImport(CoreMIDI)
+        if inputPort != 0 { MIDIPortDispose(inputPort) }
+        if midiClient != 0 { MIDIClientDispose(midiClient) }
+#endif
+    }
+
+    var midiSources: [MacMIDISourceDescriptor] {
+#if canImport(CoreMIDI)
+        var result: [MacMIDISourceDescriptor] = []
+        let sourceCount = MIDIGetNumberOfSources()
+        for index in 0..<sourceCount {
+            let source = MIDIGetSource(index)
+            var sourceID = MIDIUniqueID()
+            guard MIDIObjectGetIntegerProperty(source, kMIDIPropertyUniqueID, &sourceID) == noErr else { continue }
+            let name = midiSourceName(for: source) ?? "MIDI Source \(index + 1)"
+            result.append(MacMIDISourceDescriptor(id: String(sourceID), uniqueID: sourceID, name: name))
+        }
+        return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+#else
+        return []
+#endif
+    }
+
+    var ltcAudioSources: [MacLTCAudioSourceDescriptor] {
+        AVCaptureDevice.devices(for: .audio)
+            .map { MacLTCAudioSourceDescriptor(id: $0.uniqueID, name: $0.localizedName) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    var midiSourceCount: Int {
+        midiSources.count
+    }
+
+    var statusText: String {
+        guard let lastReceivedAt else {
+            return inputMode == .ltc ? "Waiting for SMPTE LTC audio" : "Waiting for SMPTE MTC"
+        }
+        let age = Date().timeIntervalSince(lastReceivedAt)
+        return age <= 2.0 ? "Receiving \(frameRateLabel)" : "No timecode received recently"
+    }
+
+    var isReceiving: Bool {
+        guard let lastReceivedAt else { return false }
+        return Date().timeIntervalSince(lastReceivedAt) <= 2.0
+    }
+
+    func updateSelectedMIDISourceID(_ id: String) {
+        selectedMIDISourceID = id.isEmpty ? nil : id
+    }
+
+    func updateSelectedLTCAudioSourceID(_ id: String) {
+        selectedLTCAudioSourceID = id.isEmpty ? nil : id
+    }
+
+    private func applyInputMode() {
+#if canImport(CoreMIDI)
+        if inputMode == .mtc {
+            refreshMIDISourceConnection()
+        } else {
+            disconnectMIDISource()
+        }
+#endif
+        if inputMode == .ltc {
+            refreshLTCAudioConnection()
+        } else {
+            stopLTCAudioConnection()
+        }
+        frameRateLabel = inputMode == .ltc ? "SMPTE LTC" : "SMPTE MTC"
+    }
+
+    private func refreshLTCAudioConnection() {
+        stopLTCAudioConnection()
+        if selectedLTCAudioSourceID == nil {
+            selectedLTCAudioSourceID = ltcAudioSources.first?.id
+        }
+
+        guard let selectedLTCAudioSourceID,
+              let device = AVCaptureDevice.devices(for: .audio).first(where: { $0.uniqueID == selectedLTCAudioSourceID }) else {
+            return
+        }
+
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            startLTCAudioConnection(device: device)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                guard granted else { return }
+                Task { @MainActor in
+                    self?.refreshLTCAudioConnection()
+                }
+            }
+        default:
+            break
+        }
+    }
+
+    private func startLTCAudioConnection(device: AVCaptureDevice) {
+        do {
+            let session = AVCaptureSession()
+            session.beginConfiguration()
+            let input = try AVCaptureDeviceInput(device: device)
+            guard session.canAddInput(input) else { return }
+            session.addInput(input)
+
+            let output = AVCaptureAudioDataOutput()
+            let processor = MacLTCAudioCaptureProcessor { [weak self] decoded, level in
+                Task { @MainActor in
+                    self?.handleLTCUpdate(decoded: decoded, level: level)
+                }
+            }
+            output.setSampleBufferDelegate(processor, queue: DispatchQueue(label: "prodconnect.ltc.audio"))
+            guard session.canAddOutput(output) else { return }
+            session.addOutput(output)
+            session.commitConfiguration()
+            session.startRunning()
+
+            ltcCaptureProcessor = processor
+            ltcCaptureSession = session
+        } catch {
+            stopLTCAudioConnection()
+        }
+    }
+
+    private func stopLTCAudioConnection() {
+        ltcCaptureSession?.stopRunning()
+        ltcCaptureSession = nil
+        ltcCaptureProcessor = nil
+        lastLTCAudioLevel = 0
+    }
+
+    private func handleLTCUpdate(decoded: MacLTCDecodedTimecode?, level: Double) {
+        lastLTCAudioLevel = level
+        guard let decoded else { return }
+        timecodeDisplay = decoded.display
+        frameRateLabel = decoded.rateLabel
+        lastReceivedAt = Date()
+    }
+
+#if canImport(CoreMIDI)
+    private func configureMIDI() {
+        MIDIClientCreateWithBlock("ProdConnect External Timecode MIDI" as CFString, &midiClient) { _ in }
+        MIDIInputPortCreateWithBlock(midiClient, "ProdConnect Timecode Input" as CFString, &inputPort) { [weak self] packetList, _ in
+            guard let self else { return }
+            self.handle(packetList: packetList)
+        }
+        if selectedMIDISourceID == nil {
+            selectedMIDISourceID = midiSources.first?.id
+        }
+        if inputMode == .mtc {
+            refreshMIDISourceConnection()
+        }
+    }
+
+    private func refreshMIDISourceConnection() {
+        disconnectMIDISource()
+
+        guard let selectedMIDISourceID,
+              let parsedUniqueID = Int32(selectedMIDISourceID),
+              let selectedUniqueID = MIDIUniqueID(exactly: parsedUniqueID),
+              let source = midiSourceRef(for: selectedUniqueID) else { return }
+
+        MIDIPortConnectSource(inputPort, source, nil)
+        connectedSourceID = selectedUniqueID
+    }
+
+    private func disconnectMIDISource() {
+        if let connectedSourceID,
+           let source = midiSourceRef(for: connectedSourceID) {
+            MIDIPortDisconnectSource(inputPort, source)
+            self.connectedSourceID = nil
+        }
+    }
+
+    private func handle(packetList: UnsafePointer<MIDIPacketList>) {
+        var packet = packetList.pointee.packet
+        for _ in 0..<packetList.pointee.numPackets {
+            let length = Int(packet.length)
+            let bytes = withUnsafeBytes(of: packet.data) { rawBuffer in
+                Array(rawBuffer.prefix(length))
+            }
+            handle(bytes: bytes)
+            packet = MIDIPacketNext(&packet).pointee
+        }
+    }
+
+    private func handle(bytes: [UInt8]) {
+        var index = 0
+        while index < bytes.count {
+            let status = bytes[index]
+            if status == 0xF1, index + 1 < bytes.count {
+                handleQuarterFrame(dataByte: bytes[index + 1])
+                index += 2
+            } else {
+                index += 1
+            }
+        }
+    }
+
+    private func handleQuarterFrame(dataByte: UInt8) {
+        let piece = Int((dataByte >> 4) & 0x07)
+        let value = Int(dataByte & 0x0F)
+        quarterFrameValues[piece] = value
+
+        let frame = (quarterFrameValues[1] << 4) | quarterFrameValues[0]
+        let seconds = (quarterFrameValues[3] << 4) | quarterFrameValues[2]
+        let minutes = (quarterFrameValues[5] << 4) | quarterFrameValues[4]
+        let hours = ((quarterFrameValues[7] & 0x01) << 4) | quarterFrameValues[6]
+        let rateCode = (quarterFrameValues[7] >> 1) & 0x03
+
+        guard hours < 24, minutes < 60, seconds < 60 else { return }
+        let maxFrame: Int
+        switch rateCode {
+        case 0:
+            frameRateLabel = "SMPTE MTC 24 fps"
+            maxFrame = 24
+        case 1:
+            frameRateLabel = "SMPTE MTC 25 fps"
+            maxFrame = 25
+        case 2:
+            frameRateLabel = "SMPTE MTC 29.97 df"
+            maxFrame = 30
+        default:
+            frameRateLabel = "SMPTE MTC 30 fps"
+            maxFrame = 30
+        }
+        guard frame < maxFrame else { return }
+
+        timecodeDisplay = String(format: "%02d:%02d:%02d:%02d", hours, minutes, seconds, frame)
+        lastReceivedAt = Date()
+    }
+
+    private func midiSourceRef(for uniqueID: MIDIUniqueID) -> MIDIEndpointRef? {
+        let sourceCount = MIDIGetNumberOfSources()
+        for index in 0..<sourceCount {
+            let source = MIDIGetSource(index)
+            var sourceID = MIDIUniqueID()
+            guard MIDIObjectGetIntegerProperty(source, kMIDIPropertyUniqueID, &sourceID) == noErr else { continue }
+            if sourceID == uniqueID {
+                return source
+            }
+        }
+        return nil
+    }
+
+    private func midiSourceName(for source: MIDIEndpointRef) -> String? {
+        var unmanagedName: Unmanaged<CFString>?
+        guard MIDIObjectGetStringProperty(source, kMIDIPropertyDisplayName, &unmanagedName) == noErr
+                || MIDIObjectGetStringProperty(source, kMIDIPropertyName, &unmanagedName) == noErr else {
+            return nil
+        }
+        return unmanagedName?.takeRetainedValue() as String?
+    }
+#endif
+}
+
+private struct MacLTCDecodedTimecode {
+    let display: String
+    let rateLabel: String
+}
+
+private final class MacLTCAudioCaptureProcessor: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
+    private var decoder = MacLTCDecoder()
+    private let onUpdate: @Sendable (MacLTCDecodedTimecode?, Double) -> Void
+
+    init(onUpdate: @escaping @Sendable (MacLTCDecodedTimecode?, Double) -> Void) {
+        self.onUpdate = onUpdate
+        super.init()
+    }
+
+    nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let streamDescription = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)?.pointee else {
+            return
+        }
+        let samples = Self.samples(from: sampleBuffer, streamDescription: streamDescription)
+        guard !samples.isEmpty else { return }
+
+        let squaredSum = samples.reduce(0.0) { $0 + ($1 * $1) }
+        let rms = sqrt(squaredSum / Double(samples.count))
+        let level = min(1.0, max(0.0, rms * 4.0))
+        let decoded = decoder.process(samples: samples, sampleRate: streamDescription.mSampleRate)
+        onUpdate(decoded, level)
+    }
+
+    private nonisolated static func samples(from sampleBuffer: CMSampleBuffer, streamDescription: AudioStreamBasicDescription) -> [Double] {
+        var neededSize = 0
+        var blockBuffer: CMBlockBuffer?
+        var status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: &neededSize,
+            bufferListOut: nil,
+            bufferListSize: 0,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: 0,
+            blockBufferOut: &blockBuffer
+        )
+        guard status == noErr, neededSize > 0 else { return [] }
+
+        let rawBufferList = UnsafeMutableRawPointer.allocate(
+            byteCount: neededSize,
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { rawBufferList.deallocate() }
+        let audioBufferList = rawBufferList.bindMemory(to: AudioBufferList.self, capacity: 1)
+
+        status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: nil,
+            bufferListOut: audioBufferList,
+            bufferListSize: neededSize,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: 0,
+            blockBufferOut: &blockBuffer
+        )
+        guard status == noErr else { return [] }
+
+        let isFloat = (streamDescription.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+        let bitsPerChannel = Int(streamDescription.mBitsPerChannel)
+        let channelsPerFrame = max(1, Int(streamDescription.mChannelsPerFrame))
+        var result: [Double] = []
+
+        for buffer in UnsafeMutableAudioBufferListPointer(audioBufferList) {
+            guard let data = buffer.mData else { continue }
+            if isFloat, bitsPerChannel == 32 {
+                let sampleCount = Int(buffer.mDataByteSize) / MemoryLayout<Float>.stride
+                let pointer = data.assumingMemoryBound(to: Float.self)
+                result.reserveCapacity(result.count + sampleCount / channelsPerFrame)
+                for index in stride(from: 0, to: sampleCount, by: channelsPerFrame) {
+                    result.append(Double(pointer[index]))
+                }
+            } else if !isFloat, bitsPerChannel == 16 {
+                let sampleCount = Int(buffer.mDataByteSize) / MemoryLayout<Int16>.stride
+                let pointer = data.assumingMemoryBound(to: Int16.self)
+                result.reserveCapacity(result.count + sampleCount / channelsPerFrame)
+                for index in stride(from: 0, to: sampleCount, by: channelsPerFrame) {
+                    result.append(Double(pointer[index]) / Double(Int16.max))
+                }
+            }
+        }
+
+        return result
+    }
+}
+
+private final class MacLTCDecoder: @unchecked Sendable {
+    private var sampleIndex = 0
+    private var previousPolarity: Bool?
+    private var lastTransitionSample: Int?
+    private var halfCellSamples: Double?
+    private var waitingForSecondHalf = false
+    private var bits: [Int] = []
+
+    func process(samples: [Double], sampleRate: Double) -> MacLTCDecodedTimecode? {
+        var latestDecoded: MacLTCDecodedTimecode?
+        let noiseFloor = 0.02
+
+        for sample in samples {
+            defer { sampleIndex += 1 }
+            guard abs(sample) >= noiseFloor else { continue }
+            let polarity = sample >= 0
+            guard let previousPolarity else {
+                self.previousPolarity = polarity
+                continue
+            }
+            guard polarity != previousPolarity else { continue }
+            self.previousPolarity = polarity
+
+            guard let lastTransitionSample else {
+                self.lastTransitionSample = sampleIndex
+                continue
+            }
+
+            let interval = sampleIndex - lastTransitionSample
+            self.lastTransitionSample = sampleIndex
+            guard interval >= 3 else { continue }
+
+            let estimatedHalfCell = halfCellSamples ?? max(4.0, sampleRate / (30.0 * 160.0))
+            let isHalfCell = Double(interval) < estimatedHalfCell * 1.55
+            let observedHalfCell = isHalfCell ? Double(interval) : Double(interval) / 2.0
+            halfCellSamples = (estimatedHalfCell * 0.92) + (observedHalfCell * 0.08)
+
+            if isHalfCell {
+                if waitingForSecondHalf {
+                    latestDecoded = append(bit: 1, sampleRate: sampleRate)
+                    waitingForSecondHalf = false
+                } else {
+                    waitingForSecondHalf = true
+                }
+            } else {
+                waitingForSecondHalf = false
+                latestDecoded = append(bit: 0, sampleRate: sampleRate)
+            }
+        }
+
+        return latestDecoded
+    }
+
+    private func append(bit: Int, sampleRate: Double) -> MacLTCDecodedTimecode? {
+        bits.append(bit)
+        if bits.count > 160 {
+            bits.removeFirst(bits.count - 160)
+        }
+
+        guard bits.count >= 80 else { return nil }
+        let frame = Array(bits.suffix(80))
+        guard syncMatches(frame) else { return nil }
+        return decode(frame: frame, sampleRate: sampleRate)
+    }
+
+    private func syncMatches(_ frame: [Int]) -> Bool {
+        let syncBits = Array(frame.suffix(16))
+        let value = syncBits.enumerated().reduce(0) { partial, element in
+            partial | ((element.element & 1) << element.offset)
+        }
+        return value == 0x3FFD || value == 0xBFFC
+    }
+
+    private func decode(frame bits: [Int], sampleRate: Double) -> MacLTCDecodedTimecode? {
+        let frames = bcd(units: 0...3, tens: 8...9, in: bits)
+        let seconds = bcd(units: 16...19, tens: 24...26, in: bits)
+        let minutes = bcd(units: 32...35, tens: 40...42, in: bits)
+        let hours = bcd(units: 48...51, tens: 56...57, in: bits)
+        guard hours < 24, minutes < 60, seconds < 60, frames < 60 else { return nil }
+
+        let display = String(format: "%02d:%02d:%02d:%02d", hours, minutes, seconds, frames)
+        return MacLTCDecodedTimecode(display: display, rateLabel: inferredRateLabel(sampleRate: sampleRate))
+    }
+
+    private func bcd(units: ClosedRange<Int>, tens: ClosedRange<Int>, in bits: [Int]) -> Int {
+        let unitValue = units.enumerated().reduce(0) { partial, element in
+            partial | ((bits[element.element] & 1) << element.offset)
+        }
+        let tenValue = tens.enumerated().reduce(0) { partial, element in
+            partial | ((bits[element.element] & 1) << element.offset)
+        }
+        return (tenValue * 10) + unitValue
+    }
+
+    private func inferredRateLabel(sampleRate: Double) -> String {
+        guard let halfCellSamples, halfCellSamples > 0 else { return "SMPTE LTC" }
+        let bitRate = sampleRate / (halfCellSamples * 2.0)
+        let frameRate = bitRate / 80.0
+        let knownRates: [(Double, String)] = [
+            (24.0, "SMPTE LTC 24 fps"),
+            (25.0, "SMPTE LTC 25 fps"),
+            (29.97, "SMPTE LTC 29.97 fps"),
+            (30.0, "SMPTE LTC 30 fps")
+        ]
+        if let match = knownRates.min(by: { abs($0.0 - frameRate) < abs($1.0 - frameRate) }),
+           abs(match.0 - frameRate) < 1.5 {
+            return match.1
+        }
+        return "SMPTE LTC"
+    }
 }
 
 @MainActor
@@ -4994,8 +5971,9 @@ final class MacRunOfShowControlController: ObservableObject {
     }
 
     private func move(_ show: RunOfShowDocument, direction: Int) {
+        let spl = SmaartAPIController.shared.trackingSnapshot(since: show.currentLiveTrackingStartedAt())
         var updated = show
-        updated.moveLiveSession(direction: direction, at: Date())
+        updated.moveLiveSession(direction: direction, at: Date(), splPeakDB: spl.peakDB, splAverageDB: spl.averageDB)
         store.saveRunOfShow(updated)
     }
 
@@ -5141,6 +6119,324 @@ final class MacRunOfShowControlController: ObservableObject {
     }
 }
 
+@MainActor
+final class MacAutomaticMessagingController: ObservableObject {
+    @Published var isEnabled: Bool {
+        didSet { userDefaults.set(isEnabled, forKey: enabledDefaultsKey) }
+    }
+    @Published var selectedMIDISourceID: String? {
+        didSet {
+            userDefaults.set(selectedMIDISourceID, forKey: selectedMIDISourceDefaultsKey)
+#if canImport(CoreMIDI)
+            refreshMIDISourceConnection()
+#endif
+        }
+    }
+    @Published var rules: [MacAutomaticMessageRule] {
+        didSet { persistRules() }
+    }
+    @Published var listeningRuleID: String?
+    @Published private(set) var lastStatusText = "No automatic messages sent yet."
+
+    private let store: ProdConnectStore
+    private let userDefaults = UserDefaults.standard
+    private let enabledDefaultsKey = "prodconnect.mac.automaticMessaging.enabled"
+    private let selectedMIDISourceDefaultsKey = "prodconnect.mac.automaticMessaging.selectedMIDISourceID"
+    private let rulesDefaultsKey = "prodconnect.mac.automaticMessaging.rules.v1"
+    private var lastTriggeredAtByRuleID: [String: Date] = [:]
+    private var sentTimeRuleDayByRuleID: [String: String] = [:]
+    private var timeRuleTimer: Timer?
+    private let triggerCooldown: TimeInterval = 1.0
+
+#if canImport(CoreMIDI)
+    private var midiClient = MIDIClientRef()
+    private var inputPort = MIDIPortRef()
+    private var connectedSourceID: MIDIUniqueID?
+#endif
+
+    init(store: ProdConnectStore) {
+        self.store = store
+        self.isEnabled = userDefaults.bool(forKey: enabledDefaultsKey)
+        self.selectedMIDISourceID = userDefaults.string(forKey: selectedMIDISourceDefaultsKey)
+        self.rules = Self.loadPersistedRules(userDefaults: userDefaults)
+        startTimeRuleTimer()
+#if canImport(CoreMIDI)
+        configureMIDI()
+#endif
+    }
+
+    deinit {
+        timeRuleTimer?.invalidate()
+#if canImport(CoreMIDI)
+        if inputPort != 0 { MIDIPortDispose(inputPort) }
+        if midiClient != 0 { MIDIClientDispose(midiClient) }
+#endif
+    }
+
+    var canManageMessaging: Bool {
+        guard let user = store.user else { return false }
+        return user.hasPaidSubscription && (user.isAdmin || user.isOwner)
+    }
+
+    var groupChannels: [ChatChannel] {
+        store.channels
+            .filter { $0.kind == .group }
+            .sorted { $0.position < $1.position }
+    }
+
+    var midiSources: [MacMIDISourceDescriptor] {
+#if canImport(CoreMIDI)
+        var result: [MacMIDISourceDescriptor] = []
+        let sourceCount = MIDIGetNumberOfSources()
+        for index in 0..<sourceCount {
+            let source = MIDIGetSource(index)
+            var sourceID = MIDIUniqueID()
+            guard MIDIObjectGetIntegerProperty(source, kMIDIPropertyUniqueID, &sourceID) == noErr else { continue }
+            let name = midiSourceName(for: source) ?? "MIDI Source \(index + 1)"
+            result.append(MacMIDISourceDescriptor(id: String(sourceID), uniqueID: sourceID, name: name))
+        }
+        return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+#else
+        return []
+#endif
+    }
+
+    var midiSourceCount: Int {
+        midiSources.count
+    }
+
+    func updateSelectedMIDISourceID(_ id: String) {
+        selectedMIDISourceID = id.isEmpty ? nil : id
+    }
+
+    func addRule() {
+        guard canManageMessaging else { return }
+        rules.append(
+            MacAutomaticMessageRule(
+                name: "New Message Trigger",
+                channelID: groupChannels.first?.id ?? "",
+                messageText: "",
+                midiChannel: 1,
+                noteNumber: 60,
+                minimumVelocity: 1
+            )
+        )
+    }
+
+    func removeRule(id: String) {
+        guard canManageMessaging else { return }
+        rules.removeAll { $0.id == id }
+        if listeningRuleID == id {
+            listeningRuleID = nil
+        }
+        lastTriggeredAtByRuleID[id] = nil
+    }
+
+    func updateRuleValue<Value>(_ value: Value, ruleID: String, keyPath: WritableKeyPath<MacAutomaticMessageRule, Value>) {
+        guard canManageMessaging,
+              let index = rules.firstIndex(where: { $0.id == ruleID }) else { return }
+        var updated = rules[index]
+        updated[keyPath: keyPath] = value
+        updated.midiChannel = min(max(updated.midiChannel, 1), 16)
+        updated.noteNumber = min(max(updated.noteNumber, 0), 127)
+        updated.minimumVelocity = min(max(updated.minimumVelocity, 1), 127)
+        updated.timeOfDayMinutes = min(max(updated.timeOfDayMinutes, 0), 1439)
+        rules[index] = updated
+    }
+
+    func toggleListening(ruleID: String) {
+        guard canManageMessaging else { return }
+        listeningRuleID = listeningRuleID == ruleID ? nil : ruleID
+    }
+
+    func isListening(ruleID: String) -> Bool {
+        listeningRuleID == ruleID
+    }
+
+    func channelName(for channelID: String) -> String {
+        groupChannels.first(where: { $0.id == channelID })?.name ?? "Select Channel"
+    }
+
+    private func persistRules() {
+        guard let data = try? JSONEncoder().encode(rules) else { return }
+        userDefaults.set(data, forKey: rulesDefaultsKey)
+    }
+
+    private static func loadPersistedRules(userDefaults: UserDefaults) -> [MacAutomaticMessageRule] {
+        guard let data = userDefaults.data(forKey: "prodconnect.mac.automaticMessaging.rules.v1"),
+              let decoded = try? JSONDecoder().decode([MacAutomaticMessageRule].self, from: data) else {
+            return []
+        }
+        return decoded
+    }
+
+    private func learn(ruleID: String, midiChannel: Int, noteNumber: Int, velocity: Int) {
+        guard let index = rules.firstIndex(where: { $0.id == ruleID }) else { return }
+        rules[index].midiChannel = min(max(midiChannel, 1), 16)
+        rules[index].noteNumber = min(max(noteNumber, 0), 127)
+        rules[index].minimumVelocity = min(max(velocity, 1), 127)
+        listeningRuleID = nil
+        lastStatusText = "Learned note \(noteNumber) on channel \(midiChannel)."
+    }
+
+    private func triggerRules(midiChannel: Int, noteNumber: Int, velocity: Int) {
+        guard isEnabled, canManageMessaging else { return }
+        if let listeningRuleID {
+            learn(ruleID: listeningRuleID, midiChannel: midiChannel, noteNumber: noteNumber, velocity: velocity)
+            return
+        }
+
+        let now = Date()
+        for rule in rules where rule.isEnabled
+            && rule.triggerType == .midiNote
+            && rule.midiChannel == midiChannel
+            && rule.noteNumber == noteNumber
+            && velocity >= rule.minimumVelocity {
+            if let lastTriggeredAt = lastTriggeredAtByRuleID[rule.id],
+               now.timeIntervalSince(lastTriggeredAt) < triggerCooldown {
+                continue
+            }
+            sendMessage(for: rule, triggeredAt: now)
+        }
+    }
+
+    private func startTimeRuleTimer() {
+        timeRuleTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                self.performTimeRulesIfNeeded(now: Date())
+            }
+        }
+        if let timeRuleTimer {
+            RunLoop.main.add(timeRuleTimer, forMode: .common)
+        }
+    }
+
+    private func performTimeRulesIfNeeded(now: Date) {
+        guard isEnabled, canManageMessaging else { return }
+        let calendar = Calendar.current
+        let currentMinutes = (calendar.component(.hour, from: now) * 60) + calendar.component(.minute, from: now)
+        let dayKey = Self.dayKey(for: now, calendar: calendar)
+
+        for rule in rules where rule.isEnabled && rule.triggerType == .timeOfDay && rule.timeOfDayMinutes == currentMinutes {
+            guard sentTimeRuleDayByRuleID[rule.id] != dayKey else { continue }
+            sendMessage(for: rule, triggeredAt: now)
+            sentTimeRuleDayByRuleID[rule.id] = dayKey
+        }
+    }
+
+    private static func dayKey(for date: Date, calendar: Calendar) -> String {
+        let components = calendar.dateComponents([.year, .month, .day], from: date)
+        return "\(components.year ?? 0)-\(components.month ?? 0)-\(components.day ?? 0)"
+    }
+
+    private func sendMessage(for rule: MacAutomaticMessageRule, triggeredAt: Date) {
+        let trimmedText = rule.messageText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedText.isEmpty else {
+            lastStatusText = "Matched \(rule.name.isEmpty ? "a rule" : rule.name), but no message text is set."
+            return
+        }
+        guard let channelIndex = store.channels.firstIndex(where: { $0.id == rule.channelID && $0.kind == .group }) else {
+            lastStatusText = "Matched \(rule.name.isEmpty ? "a rule" : rule.name), but the channel was not found."
+            return
+        }
+
+        var updated = store.channels[channelIndex]
+        updated.messages.append(
+            ChatMessage(
+                author: store.user?.email ?? "automation@prodconnect",
+                text: trimmedText,
+                timestamp: triggeredAt
+            )
+        )
+        updated.lastMessageAt = updated.messages.last?.timestamp
+        store.saveChannel(updated)
+        lastTriggeredAtByRuleID[rule.id] = triggeredAt
+        lastStatusText = "Sent to \(updated.name) at \(triggeredAt.formatted(date: .omitted, time: .standard))."
+    }
+
+#if canImport(CoreMIDI)
+    private func configureMIDI() {
+        MIDIClientCreateWithBlock("ProdConnect Automatic Messaging MIDI" as CFString, &midiClient) { _ in }
+        MIDIInputPortCreateWithBlock(midiClient, "ProdConnect Messaging Input" as CFString, &inputPort) { [weak self] packetList, _ in
+            guard let self else { return }
+            self.handle(packetList: packetList)
+        }
+        if selectedMIDISourceID == nil {
+            selectedMIDISourceID = midiSources.first?.id
+        }
+        refreshMIDISourceConnection()
+    }
+
+    private func refreshMIDISourceConnection() {
+        if let connectedSourceID,
+           let source = midiSourceRef(for: connectedSourceID) {
+            MIDIPortDisconnectSource(inputPort, source)
+            self.connectedSourceID = nil
+        }
+
+        guard let selectedMIDISourceID,
+              let parsedUniqueID = Int32(selectedMIDISourceID),
+              let selectedUniqueID = MIDIUniqueID(exactly: parsedUniqueID),
+              let source = midiSourceRef(for: selectedUniqueID) else { return }
+
+        MIDIPortConnectSource(inputPort, source, nil)
+        connectedSourceID = selectedUniqueID
+    }
+
+    private func handle(packetList: UnsafePointer<MIDIPacketList>) {
+        var packet = packetList.pointee.packet
+        for _ in 0..<packetList.pointee.numPackets {
+            let length = Int(packet.length)
+            let bytes = withUnsafeBytes(of: packet.data) { rawBuffer in
+                Array(rawBuffer.prefix(length))
+            }
+            handle(bytes: bytes)
+            packet = MIDIPacketNext(&packet).pointee
+        }
+    }
+
+    private func handle(bytes: [UInt8]) {
+        var index = 0
+        while index + 2 < bytes.count {
+            let status = bytes[index]
+            let type = status & 0xF0
+            let channel = Int((status & 0x0F) + 1)
+            let note = Int(bytes[index + 1])
+            let velocity = Int(bytes[index + 2])
+            if type == 0x90, velocity > 0 {
+                Task { @MainActor in
+                    self.triggerRules(midiChannel: channel, noteNumber: note, velocity: velocity)
+                }
+            }
+            index += 3
+        }
+    }
+
+    private func midiSourceRef(for uniqueID: MIDIUniqueID) -> MIDIEndpointRef? {
+        let sourceCount = MIDIGetNumberOfSources()
+        for index in 0..<sourceCount {
+            let source = MIDIGetSource(index)
+            var sourceID = MIDIUniqueID()
+            guard MIDIObjectGetIntegerProperty(source, kMIDIPropertyUniqueID, &sourceID) == noErr else { continue }
+            if sourceID == uniqueID {
+                return source
+            }
+        }
+        return nil
+    }
+
+    private func midiSourceName(for source: MIDIEndpointRef) -> String? {
+        var unmanagedName: Unmanaged<CFString>?
+        guard MIDIObjectGetStringProperty(source, kMIDIPropertyDisplayName, &unmanagedName) == noErr
+                || MIDIObjectGetStringProperty(source, kMIDIPropertyName, &unmanagedName) == noErr else {
+            return nil
+        }
+        return unmanagedName?.takeRetainedValue() as String?
+    }
+#endif
+}
+
 private struct MacOverviewMultiview: View {
     @EnvironmentObject private var store: ProdConnectStore
     @EnvironmentObject private var ndiSettings: MacNDISettingsController
@@ -5191,7 +6487,7 @@ private struct MacOverviewMultiview: View {
             }
 
             ScrollView {
-                TimelineView(.periodic(from: .now, by: 1)) { context in
+                TimelineView(.periodic(from: .now, by: 0.1)) { context in
                     overviewTilesGrid(tiles: ndiSettings.overviewTiles(for: displayFeed, now: context.date))
                 }
                 .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -5277,7 +6573,7 @@ private struct MacOverviewTileCard: View {
     var onDrop: ((String) -> Void)? = nil
 
     private static let minHeight: Double = 160
-    private static let maxHeight: Double = 700
+    private static let maxHeight: Double = 1800
     private static let defaultHeight: Double = 280
 
     @State private var storedHeight: Double
@@ -5340,42 +6636,53 @@ private struct MacOverviewTileCard: View {
 
             Divider().opacity(0.5)
 
-            if let show = tile.stagePlotShow {
-                MacStagePlotCanvas(show: show)
-                    .padding(10)
-            } else if let channel = selectedSmaartChannel {
-                smaartMeter(channel)
-            } else if !tile.columnRows.isEmpty {
-                columnTable
-            } else if tile.rows.isEmpty {
-                Text("No items to show")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 14)
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(tile.rows.enumerated()), id: \.offset) { _, row in
-                            Text(row.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : row)
-                                .font(.system(size: 13))
-                                .foregroundStyle(Color.primary)
-                                .lineLimit(1)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 10)
-                                .overlay(alignment: .bottom) {
-                                    Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 1)
-                                }
+            Group {
+                if let show = tile.runOfShowLiveShow {
+                    MacRunOfShowLiveOverviewTile(show: show, now: tile.runOfShowLiveNow)
+                        .padding(10)
+                } else if let show = tile.stagePlotShow {
+                    MacStagePlotCanvas(show: show)
+                        .padding(10)
+                } else if tile.timecodeDisplay != nil {
+                    timecodeDisplay
+                } else if let channel = selectedSmaartChannel {
+                    smaartMeter(channel)
+                } else if !tile.columnRows.isEmpty {
+                    columnTable
+                } else if tile.rows.isEmpty {
+                    Text("No items to show")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 14)
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 0) {
+                            ForEach(Array(tile.rows.enumerated()), id: \.offset) { _, row in
+                                Text(row.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : row)
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(Color.primary)
+                                    .lineLimit(1)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 10)
+                                    .overlay(alignment: .bottom) {
+                                        Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 1)
+                                    }
+                            }
                         }
                     }
+                    .scrollIndicators(.never)
                 }
-                .scrollIndicators(.never)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .padding(.bottom, 18)
+            .clipped()
         }
         .frame(maxWidth: .infinity, minHeight: displayHeight, maxHeight: displayHeight, alignment: .topLeading)
         .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(isDropTargeted ? tile.accent.opacity(0.8) : tile.accent.opacity(0.24), lineWidth: isDropTargeted ? 2 : 1)
@@ -5404,6 +6711,31 @@ private struct MacOverviewTileCard: View {
     private func selectSmaartChannel(_ channel: SmaartChannel) {
         selectedSmaartChannelID = channel.id
         UserDefaults.standard.set(channel.id, forKey: MacOverviewTileData.smaartSelectedChannelDefaultsKey)
+    }
+
+    private var timecodeDisplay: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(tile.timecodeDisplay ?? "--:--:--:--")
+                .font(.system(size: 52, weight: .bold, design: .monospaced))
+                .monospacedDigit()
+                .foregroundStyle(tile.timecodeIsReceiving ? Color.green : Color.orange)
+                .lineLimit(1)
+                .minimumScaleFactor(0.35)
+            HStack(spacing: 10) {
+                Text(tile.timecodeFrameRate.isEmpty ? "SMPTE" : tile.timecodeFrameRate)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Circle()
+                    .fill(tile.timecodeIsReceiving ? Color.green : Color.orange)
+                    .frame(width: 8, height: 8)
+                Text(tile.timecodeStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
 
     private func smaartMeter(_ channel: SmaartChannel) -> some View {
@@ -5532,12 +6864,18 @@ private struct MacOverviewTileCard: View {
 
     private var resizeHandle: some View {
         Rectangle()
-            .fill(Color.clear)
-            .frame(height: 16)
+            .fill(Color.white.opacity(0.035))
+            .frame(maxWidth: .infinity)
+            .frame(height: 18)
             .contentShape(Rectangle())
+            .overlay(alignment: .top) {
+                Rectangle()
+                    .fill(Color.primary.opacity(0.08))
+                    .frame(height: 1)
+            }
             .overlay(alignment: .center) {
                 Capsule()
-                    .fill(Color.white.opacity(0.18))
+                    .fill(Color.primary.opacity(0.28))
                     .frame(width: 36, height: 3)
             }
             .gesture(resizeGesture)
@@ -5555,6 +6893,8 @@ struct MacSettingsView: View {
     @EnvironmentObject private var store: ProdConnectStore
     @EnvironmentObject private var ndiSettings: MacNDISettingsController
     @EnvironmentObject private var runOfShowControls: MacRunOfShowControlController
+    @EnvironmentObject private var automaticMessaging: MacAutomaticMessagingController
+    @ObservedObject private var timecodeController = MacExternalTimecodeController.shared
     @State private var selectedSection: MacSettingsSection = .integrations
 
     private let categories = ["Audio", "Video", "Lighting"]
@@ -5724,6 +7064,130 @@ struct MacSettingsView: View {
                         .font(.headline)
                 }
             }
+
+            automaticMessagingSection
+
+            GroupBox {
+                VStack(alignment: .leading, spacing: 14) {
+                    Picker("Format", selection: $timecodeController.inputMode) {
+                        ForEach(MacExternalTimecodeInputMode.allCases) { mode in
+                            Text(mode.label).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    if timecodeController.inputMode == .mtc {
+                        Picker(
+                            "MTC MIDI Input",
+                            selection: Binding(
+                                get: { timecodeController.selectedMIDISourceID ?? timecodeController.midiSources.first?.id ?? "" },
+                                set: { timecodeController.updateSelectedMIDISourceID($0) }
+                            )
+                        ) {
+                            if timecodeController.midiSources.isEmpty {
+                                Text("No MIDI Devices").tag("")
+                            }
+                            ForEach(timecodeController.midiSources) { source in
+                                Text(source.name).tag(source.id)
+                            }
+                        }
+                        .disabled(timecodeController.midiSources.isEmpty)
+                    } else {
+                        Picker(
+                            "LTC Audio Input",
+                            selection: Binding(
+                                get: { timecodeController.selectedLTCAudioSourceID ?? timecodeController.ltcAudioSources.first?.id ?? "" },
+                                set: { timecodeController.updateSelectedLTCAudioSourceID($0) }
+                            )
+                        ) {
+                            if timecodeController.ltcAudioSources.isEmpty {
+                                Text("No Audio Inputs").tag("")
+                            }
+                            ForEach(timecodeController.ltcAudioSources) { source in
+                                Text(source.name).tag(source.id)
+                            }
+                        }
+                        .disabled(timecodeController.ltcAudioSources.isEmpty)
+
+                        ProgressView(value: timecodeController.lastLTCAudioLevel)
+                            .progressViewStyle(.linear)
+                    }
+
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(timecodeController.isReceiving ? Color.green : Color.orange)
+                            .frame(width: 8, height: 8)
+                        Text(timecodeController.statusText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Text("Select an SMPTE MTC MIDI source or an SMPTE LTC audio input. Add Timecode in Settings > Overview to display it on the Overview tab and Overview NDI feed.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } label: {
+                Text("SMPTE Timecode")
+                    .font(.headline)
+            }
+        }
+    }
+
+    private var automaticMessagingSection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 14) {
+                Toggle("Enable automatic messaging", isOn: $automaticMessaging.isEnabled)
+                    .disabled(!automaticMessaging.canManageMessaging)
+
+                Picker(
+                    "MIDI Input",
+                    selection: Binding(
+                        get: { automaticMessaging.selectedMIDISourceID ?? automaticMessaging.midiSources.first?.id ?? "" },
+                        set: { automaticMessaging.updateSelectedMIDISourceID($0) }
+                    )
+                ) {
+                    if automaticMessaging.midiSources.isEmpty {
+                        Text("No MIDI Devices").tag("")
+                    }
+                    ForEach(automaticMessaging.midiSources) { source in
+                        Text(source.name).tag(source.id)
+                    }
+                }
+                .disabled(!automaticMessaging.canManageMessaging || automaticMessaging.midiSources.isEmpty)
+
+                Text("Listening to \(automaticMessaging.midiSourceCount) available MIDI source\(automaticMessaging.midiSourceCount == 1 ? "" : "s"). Incoming MIDI Note On messages can send saved text to group channels.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if !automaticMessaging.canManageMessaging {
+                    Text("Automatic messaging is available to admins and owners on paid subscriptions.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if automaticMessaging.groupChannels.isEmpty {
+                    Text("Create a group chat channel before adding automatic message rules.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if !automaticMessaging.lastStatusText.isEmpty {
+                    Text(automaticMessaging.lastStatusText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                ForEach(automaticMessaging.rules) { rule in
+                    automaticMessageRuleEditor(rule: rule)
+                }
+
+                Button("Add Message Trigger") {
+                    automaticMessaging.addRule()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!automaticMessaging.canManageMessaging || automaticMessaging.groupChannels.isEmpty)
+            }
+        } label: {
+            Text("Automatic Messaging")
+                .font(.headline)
         }
     }
 
@@ -5733,7 +7197,7 @@ struct MacSettingsView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("NDI Outputs")
                         .font(.title2.weight(.semibold))
-                    Text("Each feed can target Patchsheet, Tickets, Run of Show, or Run of Show Live.")
+                    Text("Each feed can target Patchsheet, Tickets, Run of Show, Run of Show Live, Stage Plot, or Micboard.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
@@ -5754,6 +7218,40 @@ struct MacSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            HStack(spacing: 18) {
+                HStack(spacing: 8) {
+                    Text("Output Resolution")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Picker("Output Resolution", selection: $ndiSettings.outputResolution) {
+                        ForEach(MacNDIOutputResolution.allCases) { resolution in
+                            Text(resolution.title).tag(resolution)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 140)
+                }
+
+                HStack(spacing: 8) {
+                    Text("FPS")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Picker("FPS", selection: $ndiSettings.outputFrameRate) {
+                        ForEach(MacNDIFrameRate.allCases) { frameRate in
+                            Text(frameRate.title).tag(frameRate)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 110)
+                }
+
+                Text("Applies to all NDI feeds. Higher values increase CPU use.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .disabled(!canManageNDI)
 
             ForEach(Array(ndiSettings.feeds.enumerated()), id: \.element.id) { index, feed in
                 GroupBox {
@@ -5781,7 +7279,7 @@ struct MacSettingsView: View {
                                     }
                                 }
                                 .frame(width: 150)
-                            } else if feed.sourceType == .runOfShow || feed.sourceType == .runOfShowLive || feed.sourceType == .stagePlot {
+                            } else if feed.sourceType == .runOfShow || feed.sourceType == .runOfShowLive || feed.sourceType == .stagePlot || feed.sourceType == .micboard {
                                 Picker(
                                     "Show",
                                     selection: runOfShowBinding(for: index, feed: feed)
@@ -5955,6 +7453,139 @@ struct MacSettingsView: View {
         }
     }
 
+    private func automaticMessageRuleEditor(rule: MacAutomaticMessageRule) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Toggle(
+                    "Enabled",
+                    isOn: automaticMessageRuleBinding(rule, \.isEnabled)
+                )
+                .frame(width: 92, alignment: .leading)
+
+                TextField("Rule Name", text: automaticMessageRuleBinding(rule, \.name))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 160)
+
+                Picker("Group", selection: automaticMessageRuleBinding(rule, \.channelID)) {
+                    if automaticMessaging.groupChannels.isEmpty {
+                        Text("No Group Channels").tag("")
+                    }
+                    ForEach(automaticMessaging.groupChannels) { channel in
+                        Text(channel.name.isEmpty ? "Channel" : channel.name).tag(channel.id)
+                    }
+                }
+                .frame(width: 220)
+
+                Button("Remove") {
+                    automaticMessaging.removeRule(id: rule.id)
+                }
+                .buttonStyle(.bordered)
+
+                Spacer()
+            }
+
+            HStack(spacing: 12) {
+                Picker("Trigger", selection: automaticMessageRuleBinding(rule, \.triggerType)) {
+                    ForEach(MacAutomaticMessageTriggerType.allCases) { triggerType in
+                        Text(triggerType.rawValue).tag(triggerType)
+                    }
+                }
+                .frame(width: 180)
+
+                if rule.triggerType == .timeOfDay {
+                    DatePicker(
+                        "Send At",
+                        selection: automaticMessageTimeBinding(rule),
+                        displayedComponents: [.hourAndMinute]
+                    )
+                    .frame(width: 220)
+                }
+
+                Spacer()
+            }
+
+            TextField("Message to send", text: automaticMessageRuleBinding(rule, \.messageText), axis: .vertical)
+                .textFieldStyle(.roundedBorder)
+                .lineLimit(2...4)
+
+            if rule.triggerType == .midiNote {
+                HStack(spacing: 12) {
+                    Stepper(
+                        "Ch \(rule.midiChannel)",
+                        value: automaticMessageRuleBinding(rule, \.midiChannel),
+                        in: 1...16
+                    )
+                    .frame(width: 110)
+
+                    Stepper(
+                        "Note #\(rule.noteNumber)",
+                        value: automaticMessageRuleBinding(rule, \.noteNumber),
+                        in: 0...127
+                    )
+                    .frame(width: 130)
+
+                    Stepper(
+                        "Min Velocity \(rule.minimumVelocity)",
+                        value: automaticMessageRuleBinding(rule, \.minimumVelocity),
+                        in: 1...127
+                    )
+                    .frame(width: 165)
+
+                    Button(automaticMessaging.isListening(ruleID: rule.id) ? "Listening..." : "Listen") {
+                        automaticMessaging.toggleListening(ruleID: rule.id)
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Text("Sends to \(automaticMessaging.channelName(for: rule.channelID))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Spacer()
+                }
+            } else {
+                Text("Sends to \(automaticMessaging.channelName(for: rule.channelID)) once per day at the selected time.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.white.opacity(0.07), lineWidth: 1)
+        )
+        .disabled(!automaticMessaging.canManageMessaging)
+    }
+
+    private func automaticMessageRuleBinding<Value>(_ rule: MacAutomaticMessageRule, _ keyPath: WritableKeyPath<MacAutomaticMessageRule, Value>) -> Binding<Value> {
+        Binding(
+            get: {
+                automaticMessaging.rules.first(where: { $0.id == rule.id })?[keyPath: keyPath] ?? rule[keyPath: keyPath]
+            },
+            set: {
+                automaticMessaging.updateRuleValue($0, ruleID: rule.id, keyPath: keyPath)
+            }
+        )
+    }
+
+    private func automaticMessageTimeBinding(_ rule: MacAutomaticMessageRule) -> Binding<Date> {
+        Binding(
+            get: {
+                let minutes = automaticMessaging.rules.first(where: { $0.id == rule.id })?.timeOfDayMinutes ?? rule.timeOfDayMinutes
+                var components = Calendar.current.dateComponents([.year, .month, .day], from: Date())
+                components.hour = minutes / 60
+                components.minute = minutes % 60
+                components.second = 0
+                return Calendar.current.date(from: components) ?? Date()
+            },
+            set: { newValue in
+                let components = Calendar.current.dateComponents([.hour, .minute], from: newValue)
+                let minutes = ((components.hour ?? 0) * 60) + (components.minute ?? 0)
+                automaticMessaging.updateRuleValue(minutes, ruleID: rule.id, keyPath: \.timeOfDayMinutes)
+            }
+        )
+    }
+
     private func midiMappingEditor(title: String, action: MacRunOfShowMIDIAction) -> some View {
         let binding = runOfShowControls.binding(for: action)
         let messageNumberLabel = binding.wrappedValue.messageType == .noteOn ? "Note #\(binding.wrappedValue.value)" : "CC #\(binding.wrappedValue.value)"
@@ -6095,6 +7726,15 @@ struct MacSettingsView: View {
                 isActive: feed.isLive,
                 scale: min(feed.scale, 1.0)
             )
+        case .micboard:
+            let selectedRunOfShow = ndiSettings.runOfShow(for: feed)
+            MacMicboardNDIPreview(
+                show: selectedRunOfShow,
+                patchsheetItems: ndiSettings.micboardItems(for: selectedRunOfShow),
+                outputName: feed.title,
+                isActive: feed.isLive,
+                scale: min(feed.scale, 1.0)
+            )
         }
     }
 }
@@ -6106,6 +7746,7 @@ private struct MacPatchsheetNDIOutputConfiguration {
     let overviewTiles: [MacOverviewTileData]
     let category: String
     let runOfShow: RunOfShowDocument?
+    let micboardItems: [RunOfShowMicboardItem]
     let tickets: [SupportTicket]
     let patches: [PatchRow]
     let nameColumnTitle: String
@@ -6115,6 +7756,16 @@ private struct MacPatchsheetNDIOutputConfiguration {
     let showsHeaders: Bool
     let scale: Double
     let orientation: MacNDIOrientation
+    let resolution: MacNDIOutputResolution
+    let frameRate: MacNDIFrameRate
+
+    var outputSize: CGSize {
+        resolution.outputSize(for: orientation)
+    }
+
+    var windowSize: CGSize {
+        resolution.windowSize(for: orientation)
+    }
 }
 
 private struct MacOverviewTileData: Identifiable {
@@ -6129,9 +7780,15 @@ private struct MacOverviewTileData: Identifiable {
     var columnHeaders: [String] = []
     var columnRows: [[String]] = []
     var stagePlotShow: RunOfShowDocument? = nil
+    var runOfShowLiveShow: RunOfShowDocument? = nil
+    var runOfShowLiveNow: Date = Date()
     var smaartChannel: SmaartChannel? = nil
     var smaartChannels: [SmaartChannel] = []
     var smaartConnectionStatus: SmaartConnectionStatus = .disconnected
+    var timecodeDisplay: String? = nil
+    var timecodeFrameRate: String = ""
+    var timecodeStatus: String = ""
+    var timecodeIsReceiving: Bool = false
 }
 
 @MainActor
@@ -6139,11 +7796,20 @@ private final class MacPatchsheetNDIOutputWindowController {
     private var window: NSWindow?
     private var currentConfiguration: MacPatchsheetNDIOutputConfiguration?
     private var frameTimer: Timer?
+    private var timerFrameRate: MacNDIFrameRate?
     private let sender = MacNDISender()
     var isWindowVisible: Bool { window != nil }
     var liveOverviewTilesProvider: (() -> [MacOverviewTileData])? = nil
 
+    // Frame cache — prevents re-rendering the heavy overview view every NDI tick.
+    // Overview data changes at most ~1/s; other source types re-render every frame as before.
+    private var cachedOverviewFrame: CGImage? = nil
+    private var lastOverviewRenderTime: Date = .distantPast
+    private var isRenderingFrame = false
+    private static let overviewRenderInterval: TimeInterval = 1.0
+
     func update(configuration: MacPatchsheetNDIOutputConfiguration) {
+        let wasActive = currentConfiguration?.isActive == true
         currentConfiguration = configuration
 
         let resolvedTitle = configuration.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -6152,11 +7818,16 @@ private final class MacPatchsheetNDIOutputWindowController {
 
         if configuration.isActive {
             sender.updateOutputName(resolvedTitle)
-            startFrameTimerIfNeeded()
-            sendCurrentFrameIfPossible()
+            startFrameTimerIfNeeded(frameRate: configuration.frameRate)
+            if !wasActive {
+                sendCurrentFrameIfPossible()
+            }
         } else {
             frameTimer?.invalidate()
             frameTimer = nil
+            timerFrameRate = nil
+            cachedOverviewFrame = nil
+            lastOverviewRenderTime = .distantPast
             sender.stop()
         }
 
@@ -6175,6 +7846,7 @@ private final class MacPatchsheetNDIOutputWindowController {
     func close() {
         frameTimer?.invalidate()
         frameTimer = nil
+        timerFrameRate = nil
         currentConfiguration = nil
         sender.stop()
         hideWindow()
@@ -6187,7 +7859,7 @@ private final class MacPatchsheetNDIOutputWindowController {
         let resolvedTitle = currentConfiguration.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "ProdConnect Patchsheet"
             : currentConfiguration.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let windowSize = currentConfiguration.orientation.windowSize
+        let windowSize = currentConfiguration.windowSize
 
         let rootView = outputPreviewView(for: currentConfiguration, title: resolvedTitle)
             .frame(minWidth: windowSize.width, minHeight: windowSize.height)
@@ -6224,7 +7896,8 @@ private final class MacPatchsheetNDIOutputWindowController {
                     tiles: configuration.overviewTiles,
                     outputName: title,
                     isActive: sender.isReadyToSend,
-                    scale: configuration.scale
+                    scale: configuration.scale,
+                    outputSize: configuration.outputSize
                 )
             case .patchsheet:
                 MacPatchsheetNDIPreview(
@@ -6268,52 +7941,104 @@ private final class MacPatchsheetNDIOutputWindowController {
                     isActive: sender.isReadyToSend,
                     scale: configuration.scale
                 )
+            case .micboard:
+                MacMicboardNDIPreview(
+                    show: configuration.runOfShow,
+                    patchsheetItems: configuration.micboardItems,
+                    outputName: title,
+                    isActive: sender.isReadyToSend,
+                    scale: configuration.scale
+                )
             }
         }
     }
 
-    private func startFrameTimerIfNeeded() {
+    private func startFrameTimerIfNeeded(frameRate: MacNDIFrameRate) {
+        if timerFrameRate != frameRate {
+            frameTimer?.invalidate()
+            frameTimer = nil
+            timerFrameRate = nil
+        }
         guard frameTimer == nil else { return }
-        frameTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 12.0, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1.0 / frameRate.framesPerSecond, repeats: true) { [weak self] _ in
             guard let controller = self else { return }
             Task { @MainActor [controller] in
                 controller.sendCurrentFrameIfPossible()
             }
         }
-        if let frameTimer {
-            RunLoop.main.add(frameTimer, forMode: .common)
-        }
+        frameTimer = timer
+        timerFrameRate = frameRate
+        RunLoop.main.add(timer, forMode: .default)
     }
 
     private func sendCurrentFrameIfPossible() {
+        // Prevent queued tasks from piling up if a previous render is still running
+        guard !isRenderingFrame else { return }
         guard sender.isReadyToSend, var currentConfiguration else { return }
-        if currentConfiguration.sourceType == .overview, let provider = liveOverviewTilesProvider {
-            currentConfiguration = MacPatchsheetNDIOutputConfiguration(
-                isActive: currentConfiguration.isActive,
-                title: currentConfiguration.title,
-                sourceType: currentConfiguration.sourceType,
-                overviewTiles: provider(),
-                category: currentConfiguration.category,
-                runOfShow: currentConfiguration.runOfShow,
-                tickets: currentConfiguration.tickets,
-                patches: currentConfiguration.patches,
-                nameColumnTitle: currentConfiguration.nameColumnTitle,
-                inputColumnTitle: currentConfiguration.inputColumnTitle,
-                outputColumnTitle: currentConfiguration.outputColumnTitle,
-                showsUniverseColumn: currentConfiguration.showsUniverseColumn,
-                showsHeaders: currentConfiguration.showsHeaders,
-                scale: currentConfiguration.scale,
-                orientation: currentConfiguration.orientation
-            )
-        }
+
         let resolvedTitle = currentConfiguration.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "ProdConnect Patchsheet"
             : currentConfiguration.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let outputSize = currentConfiguration.orientation.outputSize
+        let outputSize = currentConfiguration.outputSize
+
+        if currentConfiguration.sourceType == .micboard {
+            MacMicboardImageCache.shared.preload(
+                urlStrings: currentConfiguration.micboardItems.map(\.imageURLString) + (currentConfiguration.runOfShow?.sortedMicboardItems.map(\.imageURLString) ?? [])
+            )
+        }
+
+        if currentConfiguration.sourceType == .overview, let provider = liveOverviewTilesProvider {
+            let now = Date()
+            let needsRender = cachedOverviewFrame == nil ||
+                now.timeIntervalSince(lastOverviewRenderTime) >= Self.overviewRenderInterval
+
+            if needsRender {
+                isRenderingFrame = true
+                let tiles = provider()
+                currentConfiguration = MacPatchsheetNDIOutputConfiguration(
+                    isActive: currentConfiguration.isActive,
+                    title: currentConfiguration.title,
+                    sourceType: currentConfiguration.sourceType,
+                    overviewTiles: tiles,
+                    category: currentConfiguration.category,
+                    runOfShow: currentConfiguration.runOfShow,
+                    micboardItems: currentConfiguration.micboardItems,
+                    tickets: currentConfiguration.tickets,
+                    patches: currentConfiguration.patches,
+                    nameColumnTitle: currentConfiguration.nameColumnTitle,
+                    inputColumnTitle: currentConfiguration.inputColumnTitle,
+                    outputColumnTitle: currentConfiguration.outputColumnTitle,
+                    showsUniverseColumn: currentConfiguration.showsUniverseColumn,
+                    showsHeaders: currentConfiguration.showsHeaders,
+                    scale: currentConfiguration.scale,
+                    orientation: currentConfiguration.orientation,
+                    resolution: currentConfiguration.resolution,
+                    frameRate: currentConfiguration.frameRate
+                )
+                let preview = outputPreviewView(for: currentConfiguration, title: resolvedTitle)
+                    .frame(width: outputSize.width, height: outputSize.height)
+                if let image = MacNDIRenderer.snapshot(of: preview, size: outputSize) {
+                    cachedOverviewFrame = image
+                    lastOverviewRenderTime = now
+                }
+                isRenderingFrame = false
+            }
+
+            // Always send the cached frame so the NDI stream stays at the configured frame rate
+            if let cached = cachedOverviewFrame {
+                sender.send(image: cached, frameRate: currentConfiguration.frameRate)
+            }
+            return
+        }
+
+        // All other source types: render every frame as before
+        isRenderingFrame = true
         let preview = outputPreviewView(for: currentConfiguration, title: resolvedTitle)
             .frame(width: outputSize.width, height: outputSize.height)
-        guard let image = MacNDIRenderer.snapshot(of: preview, size: outputSize) else { return }
-        sender.send(image: image)
+        if let image = MacNDIRenderer.snapshot(of: preview, size: outputSize) {
+            sender.send(image: image, frameRate: currentConfiguration.frameRate)
+        }
+        isRenderingFrame = false
     }
 }
 
@@ -6328,6 +8053,45 @@ private enum MacNDIRenderer {
         // NDI should receive exact output pixels, not Retina-scaled backing pixels.
         renderer.scale = 1.0
         return renderer.cgImage
+    }
+}
+
+@MainActor
+private final class MacMicboardImageCache {
+    static let shared = MacMicboardImageCache()
+
+    private var imagesByURL: [URL: NSImage] = [:]
+    private var loadingURLs: Set<URL> = []
+
+    private init() {}
+
+    func image(for url: URL) -> NSImage? {
+        imagesByURL[url]
+    }
+
+    func preload(urlStrings: [String]) {
+        for rawValue in urlStrings {
+            let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, let url = URL(string: trimmed) else { continue }
+            loadIfNeeded(url)
+        }
+    }
+
+    private func loadIfNeeded(_ url: URL) {
+        guard imagesByURL[url] == nil, !loadingURLs.contains(url) else { return }
+        loadingURLs.insert(url)
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            guard let data, let image = NSImage(data: data) else {
+                DispatchQueue.main.async {
+                    self?.loadingURLs.remove(url)
+                }
+                return
+            }
+            DispatchQueue.main.async {
+                self?.imagesByURL[url] = image
+                self?.loadingURLs.remove(url)
+            }
+        }.resume()
     }
 }
 
@@ -6510,9 +8274,9 @@ private final class MacNDISender {
         currentOutputName = resolved
     }
 
-    func send(image: CGImage) {
+    func send(image: CGImage, frameRate: MacNDIFrameRate) {
         guard let senderInstance else { return }
-        guard let payload = makeVideoFramePayload(from: image) else { return }
+        guard let payload = makeVideoFramePayload(from: image, frameRate: frameRate) else { return }
         runtime.sendVideo(payload.frame, on: senderInstance)
         _ = payload
     }
@@ -6525,7 +8289,7 @@ private final class MacNDISender {
         currentOutputName = ""
     }
 
-    private func makeVideoFramePayload(from image: CGImage) -> (frame: NDIVideoFrameV2, storage: [UInt8])? {
+    private func makeVideoFramePayload(from image: CGImage, frameRate: MacNDIFrameRate) -> (frame: NDIVideoFrameV2, storage: [UInt8])? {
         let width = image.width
         let height = image.height
         guard width > 0, height > 0 else { return nil }
@@ -6552,8 +8316,8 @@ private final class MacNDISender {
                 xres: Int32(width),
                 yres: Int32(height),
                 FourCC: MacNDISender.fourCC("BGRA"),
-                frame_rate_N: 30000,
-                frame_rate_D: 1000,
+                frame_rate_N: frameRate.numerator,
+                frame_rate_D: frameRate.denominator,
                 picture_aspect_ratio: Float(width) / Float(height),
                 frame_format_type: 1,
                 timecode: Int64.max,
@@ -6577,13 +8341,191 @@ private final class MacNDISender {
     }
 }
 
+private struct MacRunOfShowLiveOverviewTile: View {
+    let show: RunOfShowDocument
+    let now: Date
+    var scale: Double = 1.0
+
+    private var items: [RunOfShowItem] { show.sortedItems }
+    private var currentIndex: Int? {
+        let activeID = show.isLiveActive ? show.liveCurrentItemID : items.first?.id
+        return show.itemIndex(for: activeID)
+    }
+    private var currentItem: RunOfShowItem? {
+        currentIndex.flatMap { items.indices.contains($0) ? items[$0] : nil }
+    }
+    private var nextItem: RunOfShowItem? {
+        currentIndex.flatMap { index in
+            let nextIndex = index + 1
+            return items.indices.contains(nextIndex) ? items[nextIndex] : nil
+        }
+    }
+    private var remainingSeconds: Int {
+        currentItem.map { show.isLiveActive ? show.currentRemainingSeconds(at: now) : $0.durationSeconds } ?? 0
+    }
+    private var overrunSeconds: Int {
+        show.isLiveActive ? show.currentOverrunSeconds(at: now) : 0
+    }
+    private var isOverrun: Bool { overrunSeconds > 0 }
+    private var projectedEndTime: Date {
+        show.isLiveActive
+            ? show.projectedEndTime(at: now)
+            : show.scheduledStart.addingTimeInterval(TimeInterval(show.totalDurationSeconds))
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            liveSidebar
+            liveMain
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color(red: 0.08, green: 0.09, blue: 0.11))
+        .clipShape(RoundedRectangle(cornerRadius: 12 * scale, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12 * scale, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private var liveSidebar: some View {
+        VStack(spacing: 0) {
+            countdownBlock
+            rundownList
+        }
+        .frame(width: 155 * scale)
+    }
+
+    private var countdownBlock: some View {
+        VStack(spacing: 6 * scale) {
+            Text(isOverrun ? runOfShowOverrunClock(seconds: overrunSeconds) : runOfShowFormattedClock(seconds: remainingSeconds))
+                .font(.system(size: 34 * scale, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.65)
+            Text(show.isLiveActive ? "Show should end \(projectedEndTime.formatted(date: .omitted, time: .shortened))" : "live not started")
+                .font(.system(size: 10 * scale, weight: .medium))
+                .foregroundStyle(Color.white.opacity(0.82))
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 8 * scale)
+        .padding(.vertical, 16 * scale)
+        .background(isOverrun ? Color(red: 0.79, green: 0.17, blue: 0.2) : Color(red: 0.2, green: 0.68, blue: 0.36))
+    }
+
+    private var rundownList: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(items.prefix(6).enumerated()), id: \.element.id) { index, item in
+                rundownRow(item: item, index: index)
+            }
+            if items.count > 6 {
+                Text("+\(items.count - 6) more")
+                    .font(.system(size: 10 * scale, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.5))
+                    .padding(.horizontal, 10 * scale)
+                    .padding(.vertical, 7 * scale)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color(red: 0.1, green: 0.11, blue: 0.14))
+    }
+
+    private func rundownRow(item: RunOfShowItem, index: Int) -> some View {
+        let isCurrent = item.id == currentItem?.id
+        return Text(item.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : item.title)
+            .font(.system(size: 11 * scale, weight: isCurrent ? .semibold : .regular))
+            .foregroundStyle(isCurrent ? Color.white : Color.white.opacity(0.68))
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10 * scale)
+            .padding(.vertical, 7 * scale)
+            .background(isCurrent ? Color.orange.opacity(0.2) : (index.isMultiple(of: 2) ? Color.white.opacity(0.03) : Color.clear))
+    }
+
+    private var liveMain: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            overviewLiveSection(label: "NOW", title: currentItem?.title, subtitle: currentItem.map(summary), accentLine: true)
+                .background(Color(red: 0.11, green: 0.12, blue: 0.15))
+            notesSection
+            overviewLiveSection(label: "NEXT", title: nextItem?.title, subtitle: nextItem.map(summary) ?? "End of show", accentLine: false)
+                .frame(maxHeight: .infinity, alignment: .topLeading)
+                .background(Color(red: 0.09, green: 0.1, blue: 0.13))
+        }
+    }
+
+    private var notesSection: some View {
+        let notes = currentItem?.notes.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return VStack(alignment: .leading, spacing: 6 * scale) {
+            Text("ITEM NOTES")
+                .font(.system(size: 10 * scale, weight: .semibold))
+                .foregroundStyle(Color.white.opacity(0.65))
+            Text(notes.isEmpty ? "No item notes" : notes)
+                .font(.system(size: 12 * scale))
+                .foregroundStyle(Color.white.opacity(0.86))
+                .lineLimit(3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(9 * scale)
+                .background(Color.white.opacity(0.06))
+                .clipShape(RoundedRectangle(cornerRadius: 8 * scale, style: .continuous))
+        }
+        .padding(14 * scale)
+        .background(Color(red: 0.11, green: 0.12, blue: 0.15))
+    }
+
+    private func overviewLiveSection(label: String, title: String?, subtitle: String?, accentLine: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 8 * scale) {
+            Text(label)
+                .font(.system(size: 10 * scale, weight: .bold))
+                .foregroundStyle(Color.white.opacity(0.7))
+                .padding(.horizontal, 10 * scale)
+                .padding(.vertical, 5 * scale)
+                .background(Color.white.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 6 * scale, style: .continuous))
+
+            Text(title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? title ?? "" : (label == "NOW" ? "No active item" : "No next item"))
+                .font(.system(size: 22 * scale, weight: .light))
+                .foregroundStyle(.white)
+                .lineLimit(2)
+                .minimumScaleFactor(0.7)
+
+            if let subtitle {
+                Text(subtitle)
+                    .font(.system(size: 11 * scale))
+                    .foregroundStyle(Color.white.opacity(0.64))
+                    .lineLimit(1)
+            }
+        }
+        .padding(14 * scale)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .overlay(alignment: .bottom) {
+            if accentLine {
+                Rectangle()
+                    .fill(Color(red: 0.2, green: 0.68, blue: 0.36))
+                    .frame(height: max(1, 2 * scale))
+            }
+        }
+    }
+
+    private func summary(for item: RunOfShowItem) -> String {
+        "\(item.formattedDuration) • \(item.person.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "No person assigned" : item.person)"
+    }
+}
+
 private struct MacOverviewGridNDIPreview: View {
     let tiles: [MacOverviewTileData]
     let outputName: String
     let isActive: Bool
     let scale: Double
+    var outputSize: CGSize? = nil
     var allowsTileScrolling = false
     var sizesToContent = false
+    private let outerPaddingBase: Double = 20
+    private let headerHeightBase: Double = 40
+    private let headerSpacingBase: Double = 16
+    private let tileGapBase: Double = 14
 
     private var columns: [GridItem] {
         [
@@ -6593,59 +8535,8 @@ private struct MacOverviewGridNDIPreview: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16 * scale) {
-            HStack(alignment: .center) {
-                VStack(alignment: .leading, spacing: 4 * scale) {
-                    Text(outputName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "ProdConnect Overview" : outputName)
-                        .font(.system(size: 28 * scale, weight: .bold))
-                        .foregroundStyle(.white)
-                    Text("\(tiles.count) selected window\(tiles.count == 1 ? "" : "s")")
-                        .font(.system(size: 12 * scale, weight: .medium))
-                        .foregroundStyle(Color.white.opacity(0.68))
-                }
-                Spacer()
-                Text(isActive ? "LIVE" : "PREVIEW")
-                    .font(.system(size: 10 * scale, weight: .bold))
-                    .padding(.horizontal, 10 * scale)
-                    .padding(.vertical, 6 * scale)
-                    .background((isActive ? Color.green : Color.gray).opacity(0.22))
-                    .clipShape(Capsule())
-                    .foregroundStyle(isActive ? Color.green : Color.white.opacity(0.75))
-            }
-
-            if tiles.isEmpty {
-                VStack(spacing: 10 * scale) {
-                    Image(systemName: "square.grid.2x2")
-                        .font(.system(size: 34 * scale))
-                        .foregroundStyle(Color.white.opacity(0.5))
-                    Text("No windows selected")
-                        .font(.system(size: 22 * scale, weight: .semibold))
-                        .foregroundStyle(.white)
-                    Text("Select windows in Settings to populate this overview.")
-                        .font(.system(size: 13 * scale))
-                        .foregroundStyle(Color.white.opacity(0.64))
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                let leftTiles = tiles.enumerated().filter { $0.offset % 2 == 0 }.map(\.element)
-                let rightTiles = tiles.enumerated().filter { $0.offset % 2 == 1 }.map(\.element)
-                HStack(alignment: .top, spacing: 14 * scale) {
-                    VStack(spacing: 14 * scale) {
-                        ForEach(leftTiles) { tile in
-                            overviewTile(tile)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                    VStack(spacing: 14 * scale) {
-                        ForEach(rightTiles) { tile in
-                            overviewTile(tile)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                }
-            }
-        }
-        .padding(20 * scale)
+        overviewContent(effectiveScale)
+        .padding(outerPaddingBase * effectiveScale)
         .frame(maxWidth: .infinity, maxHeight: sizesToContent ? nil : .infinity, alignment: .topLeading)
         .background(
             LinearGradient(
@@ -6659,138 +8550,258 @@ private struct MacOverviewGridNDIPreview: View {
         )
     }
 
+    private var effectiveScale: Double {
+        guard let outputSize else { return scale }
+        let contentHeight = measuredContentHeight(at: scale)
+        guard contentHeight > outputSize.height, contentHeight > 0 else { return scale }
+        return max(0.35, scale * (outputSize.height / contentHeight))
+    }
+
+    private func measuredContentHeight(at candidateScale: Double) -> Double {
+        let leftTiles = tiles.enumerated().filter { $0.offset % 2 == 0 }.map(\.element)
+        let rightTiles = tiles.enumerated().filter { $0.offset % 2 == 1 }.map(\.element)
+        let leftHeight = measuredColumnHeight(leftTiles, scale: candidateScale)
+        let rightHeight = measuredColumnHeight(rightTiles, scale: candidateScale)
+        let gridHeight = tiles.isEmpty ? 220 * candidateScale : max(leftHeight, rightHeight)
+        return (outerPaddingBase * 2 + headerHeightBase + headerSpacingBase) * candidateScale + gridHeight
+    }
+
+    private func measuredColumnHeight(_ columnTiles: [MacOverviewTileData], scale candidateScale: Double) -> Double {
+        guard !columnTiles.isEmpty else { return 0 }
+        let tileHeights = columnTiles.reduce(0) { total, tile in
+            total + storedTileHeight(tile) * candidateScale
+        }
+        return tileHeights + Double(max(columnTiles.count - 1, 0)) * tileGapBase * candidateScale
+    }
+
+    private func overviewContent(_ contentScale: Double) -> some View {
+        VStack(alignment: .leading, spacing: headerSpacingBase * contentScale) {
+            overviewHeader(contentScale)
+            overviewGrid(contentScale)
+        }
+    }
+
+    private func overviewHeader(_ contentScale: Double) -> some View {
+        HStack(alignment: .center) {
+            VStack(alignment: .leading, spacing: 4 * contentScale) {
+                Text(outputName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "ProdConnect Overview" : outputName)
+                    .font(.system(size: 28 * contentScale, weight: .bold))
+                    .foregroundStyle(.white)
+                Text("\(tiles.count) selected window\(tiles.count == 1 ? "" : "s")")
+                    .font(.system(size: 12 * contentScale, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.68))
+            }
+            Spacer()
+            Text(isActive ? "LIVE" : "PREVIEW")
+                .font(.system(size: 10 * contentScale, weight: .bold))
+                .padding(.horizontal, 10 * contentScale)
+                .padding(.vertical, 6 * contentScale)
+                .background((isActive ? Color.green : Color.gray).opacity(0.22))
+                .clipShape(Capsule())
+                .foregroundStyle(isActive ? Color.green : Color.white.opacity(0.75))
+        }
+        .frame(minHeight: headerHeightBase * contentScale)
+    }
+
+    @ViewBuilder
+    private func overviewGrid(_ contentScale: Double) -> some View {
+        if tiles.isEmpty {
+            VStack(spacing: 10 * contentScale) {
+                Image(systemName: "square.grid.2x2")
+                    .font(.system(size: 34 * contentScale))
+                    .foregroundStyle(Color.white.opacity(0.5))
+                Text("No windows selected")
+                    .font(.system(size: 22 * contentScale, weight: .semibold))
+                    .foregroundStyle(.white)
+                Text("Select windows in Settings to populate this overview.")
+                    .font(.system(size: 13 * contentScale))
+                    .foregroundStyle(Color.white.opacity(0.64))
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            let leftTiles = tiles.enumerated().filter { $0.offset % 2 == 0 }.map(\.element)
+            let rightTiles = tiles.enumerated().filter { $0.offset % 2 == 1 }.map(\.element)
+            HStack(alignment: .top, spacing: tileGapBase * contentScale) {
+                VStack(spacing: tileGapBase * contentScale) {
+                    ForEach(leftTiles) { tile in
+                        overviewTile(tile, scale: contentScale)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                VStack(spacing: tileGapBase * contentScale) {
+                    ForEach(rightTiles) { tile in
+                        overviewTile(tile, scale: contentScale)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+        }
+    }
+
     private var tileRows: [[MacOverviewTileData]] {
         stride(from: 0, to: tiles.count, by: 2).map { index in
             Array(tiles[index..<min(index + 2, tiles.count)])
         }
     }
 
-    private func overviewTile(_ tile: MacOverviewTileData) -> some View {
-        VStack(alignment: .leading, spacing: 10 * scale) {
-            HStack(spacing: 10 * scale) {
+    private func overviewTile(_ tile: MacOverviewTileData, scale tileScale: Double? = nil) -> some View {
+        let renderScale = tileScale ?? scale
+        return VStack(alignment: .leading, spacing: 10 * renderScale) {
+            HStack(spacing: 10 * renderScale) {
                 Image(systemName: tile.systemImage)
-                    .font(.system(size: 15 * scale, weight: .semibold))
+                    .font(.system(size: 15 * renderScale, weight: .semibold))
                     .foregroundStyle(tile.accent)
-                    .frame(width: 28 * scale, height: 28 * scale)
+                    .frame(width: 28 * renderScale, height: 28 * renderScale)
                     .background(tile.accent.opacity(0.16))
-                    .clipShape(RoundedRectangle(cornerRadius: 7 * scale, style: .continuous))
-                VStack(alignment: .leading, spacing: 2 * scale) {
+                    .clipShape(RoundedRectangle(cornerRadius: 7 * renderScale, style: .continuous))
+                VStack(alignment: .leading, spacing: 2 * renderScale) {
                     Text(tile.title)
-                        .font(.system(size: 18 * scale, weight: .bold))
+                        .font(.system(size: 18 * renderScale, weight: .bold))
                         .foregroundStyle(.white)
                         .lineLimit(1)
                     Text(tile.subtitle)
-                        .font(.system(size: 11 * scale, weight: .medium))
+                        .font(.system(size: 11 * renderScale, weight: .medium))
                         .foregroundStyle(Color.white.opacity(0.62))
                         .lineLimit(1)
                 }
                 Spacer(minLength: 0)
             }
 
-            if let show = tile.stagePlotShow {
-                MacStagePlotCanvas(show: show, scale: scale)
-                    .padding(4 * scale)
+            if let show = tile.runOfShowLiveShow {
+                MacRunOfShowLiveOverviewTile(show: show, now: tile.runOfShowLiveNow, scale: renderScale)
+            } else if let show = tile.stagePlotShow {
+                MacStagePlotCanvas(show: show, scale: renderScale)
+                    .padding(4 * renderScale)
+            } else if tile.timecodeDisplay != nil {
+                ndiTimecodeDisplay(tile, renderScale: renderScale)
             } else if let channel = tile.smaartChannel {
-                ndiSmaartMeter(channel, extraRows: tile.columnRows, connectionStatus: tile.smaartConnectionStatus)
+                ndiSmaartMeter(channel, extraRows: tile.columnRows, connectionStatus: tile.smaartConnectionStatus, renderScale: renderScale)
             } else if !tile.columnRows.isEmpty {
-                ndiColumnRows(tile.columnRows)
+                ndiColumnRows(tile.columnRows, renderScale: renderScale)
             } else if tile.rows.isEmpty {
                 Text("No items to show")
-                    .font(.system(size: 12 * scale))
+                    .font(.system(size: 12 * renderScale))
                     .foregroundStyle(Color.white.opacity(0.56))
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             } else {
                 if allowsTileScrolling {
                     ScrollView {
-                        tileRows(tile.rows)
+                        tileRows(tile.rows, renderScale: renderScale)
                     }
                     .scrollIndicators(.visible)
                 } else {
-                    tileRows(Array(tile.rows.prefix(8)))
+                    tileRows(Array(tile.rows.prefix(8)), renderScale: renderScale)
                 }
             }
         }
-        .padding(14 * scale)
-        .frame(maxWidth: .infinity, minHeight: storedTileHeight(tile) * scale, maxHeight: storedTileHeight(tile) * scale, alignment: .topLeading)
+        .padding(14 * renderScale)
+        .frame(maxWidth: .infinity, minHeight: storedTileHeight(tile) * renderScale, maxHeight: storedTileHeight(tile) * renderScale, alignment: .topLeading)
         .background(Color.white.opacity(0.055))
-        .clipShape(RoundedRectangle(cornerRadius: 12 * scale, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 12 * renderScale, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 12 * scale, style: .continuous)
+            RoundedRectangle(cornerRadius: 12 * renderScale, style: .continuous)
                 .stroke(tile.accent.opacity(0.24), lineWidth: 1)
         )
     }
 
-    private func ndiSmaartMeter(_ channel: SmaartChannel, extraRows: [[String]], connectionStatus: SmaartConnectionStatus) -> some View {
-        VStack(alignment: .leading, spacing: 9 * scale) {
+    private func ndiTimecodeDisplay(_ tile: MacOverviewTileData, renderScale: Double) -> some View {
+        VStack(alignment: .leading, spacing: 14 * renderScale) {
+            Text(tile.timecodeDisplay ?? "--:--:--:--")
+                .font(.system(size: 54 * renderScale, weight: .bold, design: .monospaced))
+                .monospacedDigit()
+                .foregroundStyle(tile.timecodeIsReceiving ? Color.green : Color.orange)
+                .lineLimit(1)
+                .minimumScaleFactor(0.28)
+            HStack(spacing: 10 * renderScale) {
+                Text(tile.timecodeFrameRate.isEmpty ? "SMPTE" : tile.timecodeFrameRate)
+                    .font(.system(size: 12 * renderScale, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.62))
+                Circle()
+                    .fill(tile.timecodeIsReceiving ? Color.green : Color.orange)
+                    .frame(width: 8 * renderScale, height: 8 * renderScale)
+                Text(tile.timecodeStatus)
+                    .font(.system(size: 12 * renderScale))
+                    .foregroundStyle(Color.white.opacity(0.62))
+                    .lineLimit(1)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+    }
+
+    private func ndiSmaartMeter(_ channel: SmaartChannel, extraRows: [[String]], connectionStatus: SmaartConnectionStatus, renderScale: Double? = nil) -> some View {
+        let meterScale = renderScale ?? scale
+        return VStack(alignment: .leading, spacing: 9 * meterScale) {
             Text(channel.name)
-                .font(.system(size: 14 * scale, weight: .semibold))
+                .font(.system(size: 14 * meterScale, weight: .semibold))
                 .foregroundStyle(.white)
                 .lineLimit(1)
 
             Text(String(format: "%.1f", channel.dB))
-                .font(.system(size: 48 * scale, weight: .bold, design: .rounded))
+                .font(.system(size: 48 * meterScale, weight: .bold, design: .rounded))
                 .monospacedDigit()
                 .foregroundStyle(channel.levelColor?.color ?? .white)
                 .lineLimit(1)
                 .minimumScaleFactor(0.55)
 
             Text("Current dB SPL")
-                .font(.system(size: 11 * scale, weight: .medium))
+                .font(.system(size: 11 * meterScale, weight: .medium))
                 .foregroundStyle(Color.white.opacity(0.62))
 
-            HStack(spacing: 8 * scale) {
-                ndiSmaartMetric(label: "Peak", value: channel.compactPeak)
-                ndiSmaartMetric(label: "Avg 10 min", value: channel.average10MinDB.map { String(format: "%.1f", $0) } ?? "—")
+            HStack(spacing: 8 * meterScale) {
+                ndiSmaartMetric(label: "Peak", value: channel.compactPeak, renderScale: meterScale)
+                ndiSmaartMetric(label: "Avg 10 min", value: channel.average10MinDB.map { String(format: "%.1f", $0) } ?? "—", renderScale: meterScale)
                 Circle()
                     .fill(connectionStatus.indicatorColor)
-                    .frame(width: 10 * scale, height: 10 * scale)
+                    .frame(width: 10 * meterScale, height: 10 * meterScale)
             }
 
             if !extraRows.isEmpty {
-                ndiColumnRows(extraRows)
-                    .padding(.top, 4 * scale)
+                ndiColumnRows(extraRows, renderScale: meterScale)
+                    .padding(.top, 4 * meterScale)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    private func ndiSmaartMetric(label: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 2 * scale) {
+    private func ndiSmaartMetric(label: String, value: String, renderScale: Double? = nil) -> some View {
+        let metricScale = renderScale ?? scale
+        return VStack(alignment: .leading, spacing: 2 * metricScale) {
             Text(label)
-                .font(.system(size: 9 * scale, weight: .bold))
+                .font(.system(size: 9 * metricScale, weight: .bold))
                 .textCase(.uppercase)
                 .foregroundStyle(Color.white.opacity(0.58))
             Text(value)
-                .font(.system(size: 18 * scale, weight: .bold, design: .rounded))
+                .font(.system(size: 18 * metricScale, weight: .bold, design: .rounded))
                 .monospacedDigit()
                 .foregroundStyle(.white)
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 9 * scale)
-        .padding(.vertical, 7 * scale)
-        .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 7 * scale, style: .continuous))
+        .padding(.horizontal, 9 * metricScale)
+        .padding(.vertical, 7 * metricScale)
+        .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 7 * metricScale, style: .continuous))
     }
 
     private func storedTileHeight(_ tile: MacOverviewTileData) -> Double {
         let saved = UserDefaults.standard.double(forKey: "prodconnect.overviewTileHeight.\(tile.id)")
-        return saved > 0 ? saved : 280
+        return saved > 0 ? min(saved, 1800) : 280
     }
 
-    private func ndiColumnRows(_ columnRows: [[String]]) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+    private func ndiColumnRows(_ columnRows: [[String]], renderScale: Double? = nil) -> some View {
+        let rowScale = renderScale ?? scale
+        return VStack(alignment: .leading, spacing: 0) {
             ForEach(Array(columnRows.enumerated()), id: \.offset) { _, cols in
                 HStack(spacing: 0) {
                     ForEach(Array(cols.enumerated()), id: \.offset) { colIndex, cell in
                         Text(cell.isEmpty ? "—" : cell)
-                            .font(.system(size: 12 * scale, weight: colIndex == 0 ? .semibold : .regular))
+                            .font(.system(size: 12 * rowScale, weight: colIndex == 0 ? .semibold : .regular))
                             .foregroundStyle(colIndex == 0 ? Color.white : Color.white.opacity(0.75))
                             .lineLimit(1)
-                            .frame(maxWidth: colIndex == 0 ? .infinity : 110 * scale, alignment: .leading)
+                            .frame(maxWidth: colIndex == 0 ? .infinity : 110 * rowScale, alignment: .leading)
                     }
                 }
-                .padding(.vertical, 5 * scale)
+                .padding(.vertical, 5 * rowScale)
                 .overlay(alignment: .bottom) {
                     Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1)
                 }
@@ -6798,15 +8809,16 @@ private struct MacOverviewGridNDIPreview: View {
         }
     }
 
-    private func tileRows(_ rows: [String]) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+    private func tileRows(_ rows: [String], renderScale: Double? = nil) -> some View {
+        let rowScale = renderScale ?? scale
+        return VStack(alignment: .leading, spacing: 0) {
             ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
                 Text(row.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : row)
-                    .font(.system(size: 12 * scale, weight: index == 0 ? .semibold : .regular))
+                    .font(.system(size: 12 * rowScale, weight: index == 0 ? .semibold : .regular))
                     .foregroundStyle(index == 0 ? Color.white : Color.white.opacity(0.78))
                     .lineLimit(1)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.vertical, 6 * scale)
+                    .padding(.vertical, 6 * rowScale)
                     .overlay(alignment: .bottom) {
                         Rectangle()
                             .fill(Color.white.opacity(0.06))
@@ -7583,6 +9595,189 @@ private struct MacTicketsNDIPreview: View {
     }
 }
 
+private struct MacMicboardNDIPreview: View {
+    let show: RunOfShowDocument?
+    let patchsheetItems: [RunOfShowMicboardItem]
+    let outputName: String
+    let isActive: Bool
+    let scale: Double
+
+    private var titleText: String {
+        let title = show?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return title.isEmpty ? "Micboard" : title
+    }
+
+    private var dateText: String {
+        guard let date = show?.scheduledStart else { return "" }
+        return date.formatted(date: .long, time: .omitted)
+    }
+
+    var body: some View {
+        let assignments = patchsheetItems + (show?.sortedMicboardItems.filter { !$0.id.hasPrefix("patchsheet-") } ?? [])
+
+        return VStack(alignment: .leading, spacing: 22 * scale) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 7 * scale) {
+                    Text(titleText)
+                        .font(.system(size: 34 * scale, weight: .bold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                    Text(dateText)
+                        .font(.system(size: 18 * scale, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.58))
+                }
+                Spacer()
+                Text(isActive ? "LIVE" : "PREVIEW")
+                    .font(.system(size: 10 * scale, weight: .bold))
+                    .padding(.horizontal, 10 * scale)
+                    .padding(.vertical, 6 * scale)
+                    .background((isActive ? Color.green : Color.gray).opacity(0.22))
+                    .clipShape(Capsule())
+                    .foregroundStyle(isActive ? Color.green : Color.white.opacity(0.75))
+            }
+
+            if assignments.isEmpty {
+                VStack(spacing: 12 * scale) {
+                    Image(systemName: "music.mic")
+                        .font(.system(size: 46 * scale, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.44))
+                    Text("No micboard assignments")
+                        .font(.system(size: 24 * scale, weight: .bold))
+                        .foregroundStyle(.white)
+                    Text("Add performers, microphones, and in-ear mixes in Run of Show.")
+                        .font(.system(size: 14 * scale, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.6))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                GeometryReader { proxy in
+                    let columns = max(1, min(assignments.count, 8))
+                    HStack(spacing: 0) {
+                        ForEach(assignments) { assignment in
+                            micboardColumn(assignment)
+                                .frame(width: proxy.size.width / CGFloat(columns))
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                }
+            }
+        }
+        .padding(24 * scale)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(red: 0.03, green: 0.06, blue: 0.13),
+                    Color(red: 0.08, green: 0.12, blue: 0.20),
+                    Color(red: 0.05, green: 0.08, blue: 0.14)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+    }
+
+    private func micboardColumn(_ item: RunOfShowMicboardItem) -> some View {
+        VStack(spacing: 0) {
+            micboardImageBlock(item)
+                .aspectRatio(2.12, contentMode: .fit)
+                .clipShape(RoundedRectangle(cornerRadius: 8 * scale, style: .continuous))
+                .padding(.horizontal, 14 * scale)
+                .padding(.top, 14 * scale)
+            VStack(spacing: 18 * scale) {
+                VStack(spacing: 6 * scale) {
+                    Text(item.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Unassigned" : item.name)
+                        .font(.system(size: 25 * scale, weight: .bold))
+                        .foregroundStyle(.white)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.55)
+                    Text(item.role.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? " " : item.role)
+                        .font(.system(size: 13 * scale, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.55))
+                        .lineLimit(1)
+                }
+                Spacer()
+                if !item.microphone.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    assignmentBadge(label: "Microphone", value: item.microphone)
+                }
+                if !item.inEarMonitor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    assignmentBadge(label: "In-Ear Monitor", value: item.inEarMonitor)
+                }
+            }
+            .padding(.horizontal, 18 * scale)
+            .padding(.vertical, 22 * scale)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(Color.white.opacity(0.035))
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(width: 1)
+        }
+    }
+
+    private func micboardImageBlock(_ item: RunOfShowMicboardItem) -> some View {
+        GeometryReader { proxy in
+            ZStack {
+                LinearGradient(
+                    colors: [
+                        Color.white.opacity(0.12),
+                        Color.white.opacity(0.035)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                if let url = URL(string: item.imageURLString.trimmingCharacters(in: .whitespacesAndNewlines)),
+                   !item.imageURLString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   let image = MacMicboardImageCache.shared.image(for: url) {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: proxy.size.width, height: proxy.size.height)
+                        .clipped()
+                } else {
+                    Text(initials(for: item.name))
+                        .font(.system(size: 38 * scale, weight: .bold))
+                        .foregroundStyle(Color.white.opacity(0.72))
+                        .frame(width: proxy.size.width, height: proxy.size.height)
+                }
+            }
+        }
+        .clipped()
+    }
+
+    private func assignmentBadge(label: String, value: String) -> some View {
+        VStack(spacing: 7 * scale) {
+            Text(label)
+                .font(.system(size: 10 * scale, weight: .bold))
+                .textCase(.uppercase)
+                .foregroundStyle(Color.white.opacity(0.58))
+                .lineLimit(1)
+            Text(value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "-" : value)
+                .font(.system(size: 20 * scale, weight: .bold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.62)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 10 * scale)
+        .padding(.vertical, 10 * scale)
+        .background(Color.black.opacity(0.14), in: RoundedRectangle(cornerRadius: 8 * scale, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+    }
+
+    private func initials(for name: String) -> String {
+        let parts = name.split(separator: " ").prefix(2)
+        let result = parts.compactMap { $0.first }.map(String.init).joined()
+        return result.isEmpty ? "?" : result.uppercased()
+    }
+}
+
 private struct MacRunOfShowLiveNDIPreview: View {
     let show: RunOfShowDocument?
     let outputName: String
@@ -7747,6 +9942,31 @@ private func runOfShowOverrunClock(seconds: Int) -> String {
     return String(format: "-%02d:%02d", minutes, remainingSeconds)
 }
 
+private func makeMicboardItems(
+    fromAudioPatchRows patches: [PatchRow],
+    storedItems: [RunOfShowMicboardItem] = [],
+    startingPosition: Int = 0
+) -> [RunOfShowMicboardItem] {
+    let storedItemsByID = Dictionary(uniqueKeysWithValues: storedItems.map { ($0.id, $0) })
+    return patches
+        .filter { $0.category == "Audio" && $0.micboardEnabled }
+        .sorted(by: PatchRow.autoSort)
+        .enumerated()
+        .map { offset, patch in
+            let id = "patchsheet-\(patch.id)"
+            let storedItem = storedItemsByID[id]
+            return RunOfShowMicboardItem(
+                id: id,
+                name: patch.name,
+                role: patch.notes,
+                microphone: patch.micboardMicrophone,
+                inEarMonitor: patch.micboardInEarMonitor,
+                imageURLString: storedItem?.imageURLString ?? "",
+                position: startingPosition + offset
+            )
+        }
+}
+
 private struct MacEditPatchView: View {
     @EnvironmentObject private var store: ProdConnectStore
     @Environment(\.dismiss) private var dismiss
@@ -7786,6 +10006,13 @@ private struct MacEditPatchView: View {
                     TextField("Notes", text: $patch.notes, axis: .vertical)
                         .lineLimit(2...6)
                         .disabled(!canEdit)
+
+                    if patch.category == "Audio" {
+                        TextField("Microphone", text: $patch.micboardMicrophone)
+                            .disabled(!canEdit)
+                        TextField("Monitor", text: $patch.micboardInEarMonitor)
+                            .disabled(!canEdit)
+                    }
 
                     if store.locations.isEmpty {
                         TextField("Campus/Location", text: $patch.campus).disabled(!canEdit)
@@ -7911,9 +10138,16 @@ private struct MacRunOfShowView: View {
     @State private var pendingExportFilename: String?
     @State private var pendingExportContentType: UTType?
     @State private var isShowingExportSheet = false
+    @State private var uploadingMicboardItemIDs: Set<String> = []
+    @State private var micboardUploadProgressByItemID: [String: Double] = [:]
+    @State private var micboardUploadError: String?
 
     private var canEdit: Bool {
         store.canEditRunOfShow
+    }
+
+    private var hasMicboardFeature: Bool {
+        store.user?.normalizedSubscriptionTier != "free"
     }
 
     private var shows: [RunOfShowDocument] {
@@ -7923,6 +10157,14 @@ private struct MacRunOfShowView: View {
     private var selectedShow: RunOfShowDocument? {
         guard let selectedShowID else { return shows.first }
         return shows.first(where: { $0.id == selectedShowID }) ?? shows.first
+    }
+
+    private func patchsheetMicboardItems(for show: RunOfShowDocument) -> [RunOfShowMicboardItem] {
+        makeMicboardItems(fromAudioPatchRows: store.patchsheet, storedItems: show.micboardItems)
+    }
+
+    private func manualMicboardItems(for show: RunOfShowDocument) -> [RunOfShowMicboardItem] {
+        show.sortedMicboardItems.filter { !$0.id.hasPrefix("patchsheet-") }
     }
 
     var body: some View {
@@ -8019,6 +10261,7 @@ private struct MacRunOfShowView: View {
                     showHeader(show)
                     timelineGrid(for: show)
                     stagePlotPanel(for: show)
+                    micboardPanel(for: show)
                     livePanel(for: show)
                 }
                 .padding(20)
@@ -8264,6 +10507,243 @@ private struct MacRunOfShowView: View {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(Color.white.opacity(0.06), lineWidth: 1)
         )
+    }
+
+    private func micboardPanel(for show: RunOfShowDocument) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Micboard")
+                        .font(.title2.weight(.semibold))
+                    Text("\(show.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled Show" : show.title) • \(show.scheduledStart.formatted(date: .abbreviated, time: .omitted))")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    addMicboardItem(to: show)
+                } label: {
+                    Label("Add Performer", systemImage: "plus")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canEdit || !hasMicboardFeature)
+            }
+
+            if !hasMicboardFeature {
+                ContentUnavailableView(
+                    "Micboard Requires a Paid Subscription",
+                    systemImage: "music.mic",
+                    description: Text("Upgrade the team subscription to build microphone and in-ear monitor assignments.")
+                )
+            } else if patchsheetMicboardItems(for: show).isEmpty && manualMicboardItems(for: show).isEmpty {
+                ContentUnavailableView(
+                    "No Micboard Assignments",
+                    systemImage: "music.mic",
+                    description: Text("Check Micboard on audio patchsheet rows, or add performers here.")
+                )
+            } else {
+                ScrollView(.horizontal, showsIndicators: true) {
+                    HStack(alignment: .top, spacing: 12) {
+                        ForEach(patchsheetMicboardItems(for: show)) { item in
+                            micboardPatchsheetCard(show: show, item: item)
+                                .frame(width: 245)
+                        }
+                        ForEach(manualMicboardItems(for: show)) { item in
+                            micboardEditorCard(show: show, item: item)
+                                .frame(width: 245)
+                                .draggable(item.id) {
+                                    Text(item.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Micboard Assignment" : item.name)
+                                        .padding(8)
+                                }
+                                .dropDestination(for: String.self) { ids, _ in
+                                    guard canEdit, let draggedID = ids.first else { return false }
+                                    moveMicboardItem(show, fromID: draggedID, toID: item.id)
+                                    return true
+                                }
+                        }
+                    }
+                    .padding(.bottom, 4)
+                }
+            }
+        }
+        .padding(18)
+        .background(Color.white.opacity(0.02))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+    }
+
+    private func micboardPatchsheetCard(show: RunOfShowDocument, item: RunOfShowMicboardItem) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            micboardPhotoPreview(item)
+                .frame(height: 104)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+            micboardReadOnlyField("Name", value: item.name)
+            micboardReadOnlyField("Notes", value: item.role)
+            if !item.microphone.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                micboardReadOnlyField("Microphone", value: item.microphone)
+            }
+            if !item.inEarMonitor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                micboardReadOnlyField("In-Ear Monitor", value: item.inEarMonitor)
+            }
+
+            Label("Linked from audio patchsheet", systemImage: "link")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            if uploadingMicboardItemIDs.contains(item.id) {
+                ProgressView(value: micboardUploadProgressByItemID[item.id] ?? 0)
+                    .progressViewStyle(.linear)
+            }
+
+            if let micboardUploadError, !micboardUploadError.isEmpty {
+                Text(micboardUploadError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+            }
+
+            Button("Upload Image") {
+                pickMicboardImage(for: show, itemID: item.id)
+            }
+            .buttonStyle(.bordered)
+            .disabled(!canEdit || uploadingMicboardItemIDs.contains(item.id))
+        }
+        .padding(12)
+        .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.accentColor.opacity(0.18), lineWidth: 1)
+        )
+    }
+
+    private func micboardEditorCard(show: RunOfShowDocument, item: RunOfShowMicboardItem) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            micboardPhotoPreview(item)
+            .frame(height: 104)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+            micboardTextField("Name", value: item.name) { value in
+                updateMicboardItem(show, itemID: item.id) { $0.name = value }
+            }
+            micboardTextField("Role", value: item.role) { value in
+                updateMicboardItem(show, itemID: item.id) { $0.role = value }
+            }
+            micboardTextField("Microphone", value: item.microphone) { value in
+                updateMicboardItem(show, itemID: item.id) { $0.microphone = value }
+            }
+            micboardTextField("In-Ear Monitor", value: item.inEarMonitor) { value in
+                updateMicboardItem(show, itemID: item.id) { $0.inEarMonitor = value }
+            }
+            micboardTextField("Photo URL", value: item.imageURLString) { value in
+                updateMicboardItem(show, itemID: item.id) { $0.imageURLString = value }
+            }
+
+            if uploadingMicboardItemIDs.contains(item.id) {
+                ProgressView(value: micboardUploadProgressByItemID[item.id] ?? 0)
+                    .progressViewStyle(.linear)
+            }
+
+            if let micboardUploadError, !micboardUploadError.isEmpty {
+                Text(micboardUploadError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+            }
+
+            HStack {
+                Button("Upload Image") {
+                    pickMicboardImage(for: show, itemID: item.id)
+                }
+                .buttonStyle(.bordered)
+                .disabled(!canEdit || uploadingMicboardItemIDs.contains(item.id))
+
+                Button("Delete", role: .destructive) {
+                    deleteMicboardItem(show, itemID: item.id)
+                }
+                .buttonStyle(.bordered)
+                .disabled(!canEdit)
+                Spacer()
+                Text("#\(item.position + 1)")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.white.opacity(0.07), lineWidth: 1)
+        )
+    }
+
+    private func micboardReadOnlyField(_ title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+            Text(value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "-" : value)
+                .font(.body)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 7)
+                .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+    }
+
+    private func micboardPhotoPreview(_ item: RunOfShowMicboardItem) -> some View {
+        ZStack {
+            LinearGradient(
+                colors: [Color.accentColor.opacity(0.26), Color.white.opacity(0.05)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            if let url = URL(string: item.imageURLString.trimmingCharacters(in: .whitespacesAndNewlines)),
+               !item.imageURLString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image
+                            .resizable()
+                            .scaledToFill()
+                    case .failure:
+                        Text(micboardInitials(for: item.name))
+                            .font(.system(size: 30, weight: .bold))
+                            .foregroundStyle(.white.opacity(0.82))
+                    default:
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                }
+            } else {
+                Text(micboardInitials(for: item.name))
+                    .font(.system(size: 30, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.82))
+            }
+        }
+        .clipped()
+    }
+
+    private func micboardTextField(_ title: String, value: String, onChange: @escaping (String) -> Void) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+            TextField(title, text: Binding(get: { value }, set: onChange))
+                .textFieldStyle(.roundedBorder)
+                .disabled(!canEdit)
+        }
+    }
+
+    private func micboardInitials(for name: String) -> String {
+        let result = name.split(separator: " ").prefix(2).compactMap(\.first).map(String.init).joined()
+        return result.isEmpty ? "?" : result.uppercased()
     }
 
     private func stagePlotHeader(_ show: RunOfShowDocument) -> some View {
@@ -8645,6 +11125,12 @@ private struct MacRunOfShowView: View {
                 .buttonStyle(.bordered)
                 .disabled(!show.isLiveActive || !canEdit)
 
+                Button("Complete") {
+                    completeLive(show)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!show.isLiveActive || !canEdit)
+
                 Button("Reset") {
                     resetLive(show)
                 }
@@ -8656,6 +11142,10 @@ private struct MacRunOfShowView: View {
                 liveSnapshotView(show: show, now: context.date)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                eventTrackingView(show: show, now: context.date)
+            }
         }
         .padding(18)
         .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { now in
@@ -8716,6 +11206,197 @@ private struct MacRunOfShowView: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .stroke(Color.white.opacity(0.08), lineWidth: 1)
         )
+    }
+
+    private func eventTrackingView(show: RunOfShowDocument, now: Date) -> some View {
+        let records = show.liveEventTrackingRecords.sorted {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.startedAt < $1.startedAt
+        }
+        let activeItem = show.isLiveActive ? show.liveCurrentItemID.flatMap { id in show.sortedItems.first(where: { $0.id == id }) } : nil
+        let activeActualSeconds = activeItem.map { show.actualRuntimeSeconds(for: $0.id, at: now) ?? 0 }
+        let activeItemID = activeItem?.id
+        let completedActualTotal = records
+            .filter { $0.itemID != activeItemID }
+            .reduce(0) { $0 + $1.actualSeconds }
+        let actualTotal = completedActualTotal + (activeActualSeconds ?? 0)
+        let overage = actualTotal - show.totalDurationSeconds
+
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Event Tracking")
+                        .font(.headline)
+                    Text(show.liveTrackingCompletedAt.map { "Completed \($0.formatted(date: .abbreviated, time: .shortened))" } ?? "Live run metrics")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Label(show.liveTrackingCompletedAt == nil ? "Tracking" : "Complete", systemImage: show.liveTrackingCompletedAt == nil ? "record.circle" : "checkmark.circle.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(show.liveTrackingCompletedAt == nil ? .orange : .green)
+            }
+
+            HStack(spacing: 10) {
+                trackingSummaryCard(title: "Planned", value: formatDurationLabel(seconds: show.totalDurationSeconds), accent: .secondary)
+                trackingSummaryCard(title: "Actual", value: formatDurationLabel(seconds: actualTotal), accent: .primary)
+                trackingSummaryCard(title: "Overage", value: signedDurationLabel(seconds: overage), accent: overage > 0 ? .orange : .green)
+                trackingSummaryCard(title: "Items", value: "\(records.count) / \(show.sortedItems.count)", accent: .primary)
+            }
+
+            VStack(spacing: 0) {
+                trackingHeaderRow
+                ForEach(records.filter { $0.itemID != activeItemID }) { record in
+                    trackingRecordRow(record)
+                }
+                if let activeItem, let activeActualSeconds {
+                    trackingActiveRow(item: activeItem, actualSeconds: activeActualSeconds)
+                }
+                if records.isEmpty && activeItem == nil {
+                    Text("Start Run of Show Live to capture item timing and SPL metrics.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                }
+            }
+            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+            )
+
+            if !show.liveTrackingSessions.isEmpty {
+                savedTrackingSessionsView(show.liveTrackingSessions)
+            }
+        }
+    }
+
+    private func savedTrackingSessionsView(_ sessions: [RunOfShowTrackingSession]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Saved Sessions")
+                .font(.subheadline.weight(.semibold))
+            ForEach(sessions.prefix(6)) { session in
+                DisclosureGroup {
+                    VStack(spacing: 0) {
+                        trackingHeaderRow
+                        ForEach(session.records) { record in
+                            trackingRecordRow(record)
+                        }
+                    }
+                    .padding(.top, 8)
+                } label: {
+                    HStack(spacing: 12) {
+                        Text(session.completedAt.formatted(date: .abbreviated, time: .shortened))
+                            .font(.caption.weight(.semibold))
+                            .frame(width: 135, alignment: .leading)
+                        Text("Actual \(formatDurationLabel(seconds: session.actualSeconds))")
+                            .font(.caption)
+                        Text("Overage \(signedDurationLabel(seconds: session.actualSeconds - session.plannedSeconds))")
+                            .font(.caption)
+                            .foregroundStyle(session.actualSeconds > session.plannedSeconds ? .orange : .green)
+                        Text("\(session.records.count) items")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                }
+                .padding(10)
+                .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+        }
+    }
+
+    private func trackingSummaryCard(title: String, value: String, accent: Color) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title.uppercased())
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(accent)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var trackingHeaderRow: some View {
+        HStack(spacing: 10) {
+            trackingItemHeaderCell("Item")
+            trackingCell("Planned", width: 70, weight: .bold, color: .secondary)
+            trackingCell("Actual", width: 70, weight: .bold, color: .secondary)
+            trackingCell("+/-", width: 58, weight: .bold, color: .secondary)
+            trackingCell("SPL Peak", width: 76, weight: .bold, color: .secondary)
+            trackingCell("SPL Avg", width: 70, weight: .bold, color: .secondary)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.primary.opacity(0.04))
+    }
+
+    private func trackingItemHeaderCell(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 12, weight: .bold, design: .rounded))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func trackingRecordRow(_ record: RunOfShowEventTrackingRecord) -> some View {
+        let delta = record.actualSeconds - record.plannedSeconds
+        return HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(record.title)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                if !record.subtitle.isEmpty {
+                    Text(record.subtitle)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            trackingCell(formatDurationLabel(seconds: record.plannedSeconds), width: 70)
+            trackingCell(formatDurationLabel(seconds: record.actualSeconds), width: 70)
+            trackingCell(signedDurationLabel(seconds: delta), width: 58, color: delta > 0 ? .orange : (delta < 0 ? .green : .secondary))
+            trackingCell(splValue(record.splPeakDB), width: 76, color: record.splPeakDB == nil ? .secondary : .orange)
+            trackingCell(splValue(record.splAverageDB), width: 70, color: record.splAverageDB == nil ? .secondary : .green)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Color.primary.opacity(0.06)).frame(height: 1)
+        }
+    }
+
+    private func trackingActiveRow(item: RunOfShowItem, actualSeconds: Int) -> some View {
+        let delta = actualSeconds - item.durationSeconds
+        return HStack(spacing: 10) {
+            Text(item.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : item.title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.orange)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            trackingCell(formatDurationLabel(seconds: item.durationSeconds), width: 70)
+            trackingCell(formatDurationLabel(seconds: actualSeconds), width: 70, color: .orange)
+            trackingCell(signedDurationLabel(seconds: delta), width: 58, color: delta > 0 ? .orange : .green)
+            trackingCell("-", width: 76, color: .secondary)
+            trackingCell("-", width: 70, color: .secondary)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+    }
+
+    private func trackingCell(_ text: String, width: CGFloat?, weight: Font.Weight = .regular, color: Color = .primary) -> some View {
+        Text(text)
+            .font(.system(size: 12, weight: weight, design: .rounded))
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .frame(width: width, alignment: .leading)
     }
 
     private func liveSidebar(show: RunOfShowDocument, items: [RunOfShowItem], currentItemID: String?, remainingSeconds: Int, overrunSeconds: Int, isOverrun: Bool, projectedEndTime: Date) -> some View {
@@ -9491,8 +12172,17 @@ private struct MacRunOfShowView: View {
     }
 
     private func moveLive(_ show: RunOfShowDocument, direction: Int) {
+        let spl = SmaartAPIController.shared.trackingSnapshot(since: show.currentLiveTrackingStartedAt())
         updateShow(show) { mutable in
-            mutable.moveLiveSession(direction: direction, at: Date())
+            mutable.moveLiveSession(direction: direction, at: Date(), splPeakDB: spl.peakDB, splAverageDB: spl.averageDB)
+        }
+    }
+
+    private func completeLive(_ show: RunOfShowDocument) {
+        let spl = SmaartAPIController.shared.trackingSnapshot(since: show.currentLiveTrackingStartedAt())
+        runOfShowControls.suppressAutoStart(for: show.id)
+        updateShow(show) { mutable in
+            mutable.completeLiveSession(at: Date(), splPeakDB: spl.peakDB, splAverageDB: spl.averageDB)
         }
     }
 
@@ -9572,6 +12262,183 @@ private struct MacRunOfShowView: View {
         let minutes = max(seconds, 0) / 60
         let remainingSeconds = max(seconds, 0) % 60
         return String(format: "%d:%02d", minutes, remainingSeconds)
+    }
+
+    private func formatDurationLabel(seconds: Int) -> String {
+        let clamped = max(seconds, 0)
+        let hours = clamped / 3600
+        let minutes = (clamped % 3600) / 60
+        if hours > 0 {
+            return "\(hours)h \(minutes)m"
+        }
+        return "\(minutes)m"
+    }
+
+    private func signedDurationLabel(seconds: Int) -> String {
+        if seconds == 0 { return "-" }
+        let sign = seconds > 0 ? "+" : "-"
+        return "\(sign)\(formatDurationLabel(seconds: abs(seconds)))"
+    }
+
+    private func splValue(_ value: Double?) -> String {
+        guard let value else { return "-" }
+        return String(format: "%.1f", value)
+    }
+
+    private func addMicboardItem(to show: RunOfShowDocument) {
+        guard hasMicboardFeature else { return }
+        updateShow(show) { mutable in
+            let nextPosition = mutable.micboardItems.count
+            mutable.micboardItems.append(
+                RunOfShowMicboardItem(
+                    name: "New Performer",
+                    role: "Vocalist",
+                    microphone: "",
+                    inEarMonitor: "",
+                    position: nextPosition
+                )
+            )
+        }
+    }
+
+    private func pickMicboardImage(for show: RunOfShowDocument, itemID: String) {
+        guard hasMicboardFeature, canEdit else { return }
+        micboardUploadError = nil
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = [.image]
+
+        let handleSelection: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else { return }
+            uploadingMicboardItemIDs.insert(itemID)
+            micboardUploadProgressByItemID[itemID] = 0
+            uploadMicboardImage(from: url, showID: show.id, itemID: itemID) { result in
+                DispatchQueue.main.async {
+                    uploadingMicboardItemIDs.remove(itemID)
+                    micboardUploadProgressByItemID[itemID] = nil
+                    switch result {
+                    case .success(let urlString):
+                        updateMicboardImageURL(show, itemID: itemID, urlString: urlString)
+                    case .failure(let error):
+                        micboardUploadError = "Image upload failed: \(error.localizedDescription)"
+                    }
+                }
+            }
+        }
+
+        if let keyWindow = NSApp.keyWindow {
+            panel.beginSheetModal(for: keyWindow, completionHandler: handleSelection)
+        } else {
+            handleSelection(panel.runModal())
+        }
+    }
+
+    private func uploadMicboardImage(from localURL: URL, showID: String, itemID: String, completion: @escaping (Result<String, Error>) -> Void) {
+        let safeName = localURL.lastPathComponent.replacingOccurrences(of: " ", with: "_")
+        let path = "micboardImages/\(showID)/\(itemID)-\(UUID().uuidString)-\(safeName)"
+        let storageRef = Storage.storage().reference().child(path)
+        let metadata = StorageMetadata()
+        metadata.contentType = micboardImageContentType(for: localURL)
+        let didAccess = localURL.startAccessingSecurityScopedResource()
+
+        let uploadTask = storageRef.putFile(from: localURL, metadata: metadata)
+        uploadTask.observe(.progress) { snapshot in
+            DispatchQueue.main.async {
+                micboardUploadProgressByItemID[itemID] = snapshot.progress?.fractionCompleted ?? 0
+            }
+        }
+        uploadTask.observe(.failure) { snapshot in
+            if didAccess {
+                localURL.stopAccessingSecurityScopedResource()
+            }
+            completion(.failure(snapshot.error ?? NSError(
+                domain: "ProdConnectMicboardUpload",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Upload failed."]
+            )))
+        }
+        uploadTask.observe(.success) { _ in
+            if didAccess {
+                localURL.stopAccessingSecurityScopedResource()
+            }
+            storageRef.downloadURL { url, error in
+                if let error {
+                    completion(.failure(error))
+                } else if let absoluteString = url?.absoluteString {
+                    completion(.success(absoluteString))
+                } else {
+                    completion(.failure(NSError(
+                        domain: "ProdConnectMicboardUpload",
+                        code: 2,
+                        userInfo: [NSLocalizedDescriptionKey: "Upload finished, but no download URL was returned."]
+                    )))
+                }
+            }
+        }
+    }
+
+    private func micboardImageContentType(for url: URL) -> String {
+        if let type = UTType(filenameExtension: url.pathExtension),
+           let mimeType = type.preferredMIMEType {
+            return mimeType
+        }
+        return "image/jpeg"
+    }
+
+    private func updateMicboardItem(_ show: RunOfShowDocument, itemID: String, change: (inout RunOfShowMicboardItem) -> Void) {
+        guard hasMicboardFeature else { return }
+        updateShow(show) { mutable in
+            guard let index = mutable.micboardItems.firstIndex(where: { $0.id == itemID }) else { return }
+            change(&mutable.micboardItems[index])
+        }
+    }
+
+    private func updateMicboardImageURL(_ show: RunOfShowDocument, itemID: String, urlString: String) {
+        guard hasMicboardFeature else { return }
+        updateShow(show) { mutable in
+            if let index = mutable.micboardItems.firstIndex(where: { $0.id == itemID }) {
+                mutable.micboardItems[index].imageURLString = urlString
+                return
+            }
+
+            mutable.micboardItems.append(
+                RunOfShowMicboardItem(
+                    id: itemID,
+                    imageURLString: urlString,
+                    position: mutable.micboardItems.count
+                )
+            )
+        }
+    }
+
+    private func deleteMicboardItem(_ show: RunOfShowDocument, itemID: String) {
+        guard hasMicboardFeature else { return }
+        updateShow(show) { mutable in
+            mutable.micboardItems.removeAll { $0.id == itemID }
+            mutable.micboardItems = mutable.sortedMicboardItems.enumerated().map { offset, item in
+                var updated = item
+                updated.position = offset
+                return updated
+            }
+        }
+    }
+
+    private func moveMicboardItem(_ show: RunOfShowDocument, fromID: String, toID: String) {
+        guard hasMicboardFeature, fromID != toID else { return }
+        updateShow(show) { mutable in
+            var items = mutable.sortedMicboardItems
+            guard let fromIndex = items.firstIndex(where: { $0.id == fromID }),
+                  let toIndex = items.firstIndex(where: { $0.id == toID }) else { return }
+            let moved = items.remove(at: fromIndex)
+            items.insert(moved, at: toIndex)
+            mutable.micboardItems = items.enumerated().map { offset, item in
+                var updated = item
+                updated.position = offset
+                return updated
+            }
+        }
     }
 
     private func addStagePlotItem(to show: RunOfShowDocument, role: RunOfShowStagePlotRole) {
@@ -16801,7 +19668,7 @@ private struct MacCustomizeView: View {
 
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Poll Interval (seconds)").font(.caption).foregroundStyle(.secondary)
-                        TextField("0.25", text: $smaartPollInterval)
+                        TextField("0.10", text: $smaartPollInterval)
                             .textFieldStyle(.roundedBorder)
                             .frame(width: 80)
                     }
@@ -17073,7 +19940,7 @@ private struct MacCustomizeView: View {
         s.port = Int(smaartPort.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 9090
         s.apiPath = smaartPath.trimmingCharacters(in: .whitespacesAndNewlines)
         s.password = smaartPassword
-        s.pollIntervalSeconds = max(0.1, Double(smaartPollInterval) ?? 0.25)
+        s.pollIntervalSeconds = max(0.05, Double(smaartPollInterval) ?? 0.1)
         smaartController.applySettings(s)
     }
 
@@ -17618,7 +20485,7 @@ private struct MacCustomizeView: View {
             serialNumber: serialNumber,
             campus: campus,
             assetId: stringValue(asset["asset_tag"]) ?? stringValue(asset["display_id"]) ?? "",
-            maintenanceNotes: stringValue(asset["description"]) ?? "",
+            maintenanceNotes: freshserviceAssetNotes(from: asset),
             createdBy: "Freshservice Import"
         )
 
@@ -17665,6 +20532,20 @@ private struct MacCustomizeView: View {
         ]
         .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
         .first { !$0.isEmpty }
+    }
+
+    private func freshserviceAssetNotes(from asset: [String: Any]) -> String {
+        [
+            typeFieldValue(from: asset, prefix: "notes"),
+            typeFieldValue(from: asset, prefix: "note"),
+            typeFieldValue(from: asset, prefix: "comments"),
+            typeFieldValue(from: asset, prefix: "comment"),
+            stringValue(asset["notes"]),
+            stringValue(asset["note"]),
+            stringValue(asset["description"])
+        ]
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .first { !$0.isEmpty } ?? ""
     }
 
     private func mapFreshserviceTicket(_ ticket: [String: Any]) -> SupportTicket? {

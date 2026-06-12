@@ -6589,14 +6589,14 @@ struct CustomizeView: View {
 
     private func saveSmaartSettings() {
         let port = Int(smaartPort.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 9090
-        let interval = Double(smaartPollInterval.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0.25
+        let interval = Double(smaartPollInterval.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0.1
         let settings = SmaartSettings(
             isEnabled: smaartEnabled,
             host: smaartHost.trimmingCharacters(in: .whitespacesAndNewlines),
             port: port,
             apiPath: smaartPath.trimmingCharacters(in: .whitespacesAndNewlines),
             password: smaartPassword,
-            pollIntervalSeconds: max(0.1, interval)
+            pollIntervalSeconds: max(0.05, interval)
         )
         SmaartAPIController.shared.applySettings(settings)
         smaartStatusMessage = settings.isEnabled ? "Smaart connection saved." : "Smaart integration disabled."
@@ -7277,6 +7277,17 @@ struct EditPatchView: View {
                         TextField("Notes", text: $patch.notes, axis: .vertical)
                             .lineLimit(2...6)
                             .disabled(!canEdit)
+                    }
+
+                    if patch.category == "Audio" {
+                        editorField("Microphone") {
+                            TextField("Microphone", text: $patch.micboardMicrophone)
+                                .disabled(!canEdit)
+                        }
+                        editorField("Monitor") {
+                            TextField("Monitor", text: $patch.micboardInEarMonitor)
+                                .disabled(!canEdit)
+                        }
                     }
 
                     if store.locations.isEmpty {
@@ -14356,7 +14367,7 @@ private struct IntegrationsView: View {
             serialNumber: stringValue(asset["serial_number"]) ?? "",
             campus: campus,
             assetId: stringValue(asset["asset_tag"]) ?? stringValue(asset["display_id"]) ?? "",
-            maintenanceNotes: stringValue(asset["description"]) ?? "",
+            maintenanceNotes: freshserviceAssetNotes(from: asset),
             createdBy: "Freshservice Import"
         )
 
@@ -14397,6 +14408,20 @@ private struct IntegrationsView: View {
         ]
         .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
         .first { !$0.isEmpty }
+    }
+
+    private func freshserviceAssetNotes(from asset: [String: Any]) -> String {
+        [
+            typeFieldValue(from: asset, prefix: "notes"),
+            typeFieldValue(from: asset, prefix: "note"),
+            typeFieldValue(from: asset, prefix: "comments"),
+            typeFieldValue(from: asset, prefix: "comment"),
+            stringValue(asset["notes"]),
+            stringValue(asset["note"]),
+            stringValue(asset["description"])
+        ]
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .first { !$0.isEmpty } ?? ""
     }
 
     private func mapFreshserviceTicket(_ ticket: [String: Any]) -> SupportTicket? {
@@ -14790,9 +14815,6 @@ private func availableMainAppSections(for store: ProdConnectStore) -> [MainAppSe
     if isPrivilegedUser || store.user?.canSeeGear == true {
         sections.append(.assets)
     }
-    if isPrivilegedUser && (store.user?.hasChatAndTrainingFeatures ?? false) {
-        sections.append(.integrations)
-    }
     if isPrivilegedUser || store.user?.canSeeChecklists == true {
         sections.append(.checklist)
     }
@@ -14976,7 +14998,7 @@ private struct SmaartSettings: Codable {
     var port: Int = 9090
     var apiPath: String = ""
     var password: String = ""
-    var pollIntervalSeconds: Double = 0.25
+    var pollIntervalSeconds: Double = 0.1
 
     private static let defaultsKey = "prodconnect.smaart.settings.v1"
 
@@ -15011,8 +15033,11 @@ private final class SmaartAPIController: ObservableObject {
     @Published var settings: SmaartSettings = SmaartSettings.load()
 
     private var pollingTask: Task<Void, Never>?
+    private var webSocketTask: URLSessionWebSocketTask?
     private var recentSamplesByChannelID: [String: [(date: Date, value: Double)]] = [:]
     private var peakByChannelID: [String: Double] = [:]
+    private var lastChannelPublishAt = Date.distantPast
+    private let channelPublishInterval: TimeInterval = 1.0 / 23.0
     private let session: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 3.0
@@ -15025,22 +15050,51 @@ private final class SmaartAPIController: ObservableObject {
         restart()
     }
 
+    func trackingSnapshot(since startDate: Date? = nil) -> (peakDB: Double?, averageDB: Double?) {
+        guard let channel = channels.first else { return (nil, nil) }
+        if let startDate {
+            let values = recentSamplesByChannelID[channel.id, default: []]
+                .filter { $0.date >= startDate }
+                .map(\.value)
+            if !values.isEmpty {
+                let peak = values.max()
+                let average = values.reduce(0, +) / Double(values.count)
+                return (peak, average)
+            }
+        }
+        let peak = channel.peakDB > -900 ? channel.peakDB : nil
+        let average = channel.average10MinDB ?? (channel.dB > -900 ? channel.dB : nil)
+        return (peak, average)
+    }
+
     func restart() {
         pollingTask?.cancel()
         pollingTask = nil
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        webSocketTask = nil
         channels = []
         recentSamplesByChannelID = [:]
         peakByChannelID = [:]
+        lastChannelPublishAt = .distantPast
         connectionStatus = .disconnected
         guard settings.isEnabled, settings.resolvedURL != nil else { return }
         connectionStatus = .connecting
-        pollingTask = Task {
-            while !Task.isCancelled {
-                await poll()
-                let milliseconds = max(100, Int(settings.pollIntervalSeconds * 1000))
-                try? await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000)
+        if shouldUseSmaartWebSocket {
+            pollingTask = Task { await streamSmaartWebSocket() }
+        } else {
+            pollingTask = Task {
+                while !Task.isCancelled {
+                    await poll()
+                    let milliseconds = max(50, Int(settings.pollIntervalSeconds * 1000))
+                    try? await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000)
+                }
             }
         }
+    }
+
+    private var shouldUseSmaartWebSocket: Bool {
+        let path = settings.apiPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        return path.isEmpty || path == "/"
     }
 
     private func poll() async {
@@ -15095,7 +15149,7 @@ private final class SmaartAPIController: ObservableObject {
     private func updateChannels(_ newChannels: [SmaartChannel]) {
         let now = Date()
         let cutoff = now.addingTimeInterval(-600)
-        channels = newChannels.map { channel in
+        let updatedChannels = newChannels.map { channel in
             var samples = recentSamplesByChannelID[channel.id, default: []]
             if channel.dB > -900 {
                 samples.append((date: now, value: channel.dB))
@@ -15114,6 +15168,244 @@ private final class SmaartAPIController: ObservableObject {
                 average10MinDB: channel.average10MinDB ?? rollingAverage,
                 levelColor: channel.levelColor
             )
+        }
+        if channels.isEmpty || now.timeIntervalSince(lastChannelPublishAt) >= channelPublishInterval {
+            channels = updatedChannels
+            lastChannelPublishAt = now
+        }
+    }
+
+    private final class ContinuationGate<Value> {
+        private let lock = NSLock()
+        private var hasResumed = false
+        private let continuation: CheckedContinuation<Value, Never>
+
+        init(_ continuation: CheckedContinuation<Value, Never>) {
+            self.continuation = continuation
+        }
+
+        func resume(returning value: Value) {
+            lock.lock()
+            let shouldResume = !hasResumed
+            hasResumed = true
+            lock.unlock()
+            guard shouldResume else { return }
+            continuation.resume(returning: value)
+        }
+    }
+
+    private enum SmaartWebSocketReceiveResult {
+        case message(URLSessionWebSocketTask.Message)
+        case failure(String)
+    }
+
+    private struct SmaartStreamEndpoint {
+        let name: String
+        let path: String
+    }
+
+    private func streamSmaartWebSocket() async {
+        guard let rootURL = settings.resolvedURL else {
+            connectionStatus = .error("Invalid Smaart URL")
+            return
+        }
+
+        while !Task.isCancelled {
+            let endpoints = await smaartMetricStreamEndpoints(rootURL: rootURL)
+            let urls = endpoints.compactMap { webSocketURL(for: $0.path, rootURL: rootURL) }
+            var parsedAnyReading = false
+
+            for wsURL in urls {
+                guard !Task.isCancelled else { return }
+                var request = URLRequest(url: wsURL)
+                request.timeoutInterval = 3.0
+                if !settings.password.isEmpty {
+                    let credential = Data(":\(settings.password)".utf8).base64EncodedString()
+                    request.setValue("Basic \(credential)", forHTTPHeaderField: "Authorization")
+                }
+
+                let task = session.webSocketTask(with: request)
+                webSocketTask = task
+                task.resume()
+                _ = await sendWebSocketString(#"{"action":"set","properties":[{"targetFPS":23}]}"#, on: task, timeoutSeconds: 1.0)
+                connectionStatus = .connecting
+
+                while !Task.isCancelled {
+                    switch await receiveWebSocketMessage(task, timeoutSeconds: 5.0) {
+                    case .message(let message):
+                        let data: Data
+                        switch message {
+                        case .string(let text):
+                            data = Data(text.utf8)
+                        case .data(let messageData):
+                            data = messageData
+                        @unknown default:
+                            continue
+                        }
+                        let parsed = parseSmaartResponse(data)
+                        if !parsed.isEmpty {
+                            updateChannels(parsed)
+                            connectionStatus = .connected
+                            parsedAnyReading = true
+                        } else if !parsedAnyReading {
+                            break
+                        }
+                    case .failure(let message):
+                        if !parsedAnyReading || message.localizedCaseInsensitiveContains("cancel") || message.localizedCaseInsensitiveContains("closed") {
+                            break
+                        }
+                    }
+                }
+
+                task.cancel(with: .goingAway, reason: nil)
+                if webSocketTask === task {
+                    webSocketTask = nil
+                }
+                if parsedAnyReading { break }
+            }
+
+            if !Task.isCancelled {
+                connectionStatus = channels.isEmpty
+                    ? .error(urls.isEmpty ? "No active calibrated SPL inputs were returned by Smaart" : "Connected to Smaart, but no SPL meter stream was found")
+                    : .connected
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    private func webSocketURL(for path: String, rootURL: URL) -> URL? {
+        if path.hasPrefix("ws://") || path.hasPrefix("wss://") {
+            return URL(string: path)
+        }
+        guard var components = URLComponents(url: rootURL, resolvingAgainstBaseURL: false) else { return nil }
+        components.scheme = "ws"
+        let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
+        if normalizedPath.contains("%") {
+            components.percentEncodedPath = normalizedPath
+        } else {
+            components.path = normalizedPath
+        }
+        components.query = nil
+        return components.url
+    }
+
+    private func smaartMetricStreamEndpoints(rootURL: URL) async -> [SmaartStreamEndpoint] {
+        guard let responseData = await sendSmaartAPIRequest(
+            ["action": "get", "target": "activeCalibratedInputs"],
+            rootURL: rootURL,
+            apiPaths: ["/api/v4/", "/api/v3/"],
+            expectedResponse: { data in
+                !self.extractSmaartStreamEndpoints(from: data).isEmpty
+            }
+        ) else { return [] }
+        return extractSmaartStreamEndpoints(from: responseData)
+    }
+
+    private func sendSmaartAPIRequest(
+        _ payload: [String: Any],
+        rootURL: URL,
+        apiPaths: [String],
+        expectedResponse: (Data) -> Bool
+    ) async -> Data? {
+        guard let body = try? JSONSerialization.data(withJSONObject: payload),
+              let requestText = String(data: body, encoding: .utf8)
+        else { return nil }
+
+        for apiPath in apiPaths {
+            guard var components = URLComponents(url: rootURL, resolvingAgainstBaseURL: false) else { continue }
+            components.scheme = "ws"
+            components.path = apiPath
+            components.query = nil
+            guard let apiURL = components.url else { continue }
+
+            var request = URLRequest(url: apiURL)
+            request.timeoutInterval = 3.0
+            if !settings.password.isEmpty {
+                let credential = Data(":\(settings.password)".utf8).base64EncodedString()
+                request.setValue("Basic \(credential)", forHTTPHeaderField: "Authorization")
+            }
+
+            let task = session.webSocketTask(with: request)
+            task.resume()
+
+            if await sendWebSocketString(requestText, on: task, timeoutSeconds: 3.0) != nil {
+                task.cancel(with: .goingAway, reason: nil)
+                continue
+            }
+            var didHitTerminalReceiveFailure = false
+            for _ in 1...8 {
+                switch await receiveWebSocketMessage(task, timeoutSeconds: 4.0) {
+                case .message(let message):
+                    let data: Data
+                    switch message {
+                    case .string(let text):
+                        data = Data(text.utf8)
+                    case .data(let messageData):
+                        data = messageData
+                    @unknown default:
+                        continue
+                    }
+                    if expectedResponse(data) {
+                        task.cancel(with: .goingAway, reason: nil)
+                        return data
+                    }
+                case .failure:
+                    didHitTerminalReceiveFailure = true
+                }
+                if didHitTerminalReceiveFailure { break }
+            }
+            task.cancel(with: .goingAway, reason: nil)
+        }
+        return nil
+    }
+
+    private func extractSmaartStreamEndpoints(from data: Data) -> [SmaartStreamEndpoint] {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let response = json["response"] as? [String: Any],
+              let devices = response["devices"] as? [[String: Any]]
+        else { return [] }
+
+        return devices.flatMap { device -> [SmaartStreamEndpoint] in
+            let deviceName = device["deviceName"] as? String ?? "Smaart"
+            let channels = device["activeCalibratedChannels"] as? [[String: Any]] ?? []
+            return channels.compactMap { channel in
+                guard let endpoint = channel["streamEndpoint"] as? String, !endpoint.isEmpty else { return nil }
+                let channelName = channel["channelName"] as? String ?? deviceName
+                return SmaartStreamEndpoint(name: channelName, path: endpoint)
+            }
+        }
+    }
+
+    private func sendWebSocketString(_ text: String, on task: URLSessionWebSocketTask, timeoutSeconds: Double) async -> String? {
+        await withCheckedContinuation { continuation in
+            let gate = ContinuationGate<String?>(continuation)
+            let timeout = DispatchWorkItem {
+                gate.resume(returning: "Timed out after \(String(format: "%.1f", timeoutSeconds))s")
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeoutSeconds, execute: timeout)
+            task.send(.string(text)) { error in
+                timeout.cancel()
+                gate.resume(returning: error?.localizedDescription)
+            }
+        }
+    }
+
+    private func receiveWebSocketMessage(_ task: URLSessionWebSocketTask, timeoutSeconds: Double) async -> SmaartWebSocketReceiveResult {
+        await withCheckedContinuation { continuation in
+            let gate = ContinuationGate<SmaartWebSocketReceiveResult>(continuation)
+            let timeout = DispatchWorkItem {
+                gate.resume(returning: .failure("Timed out after \(String(format: "%.1f", timeoutSeconds))s"))
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeoutSeconds, execute: timeout)
+            task.receive { result in
+                timeout.cancel()
+                switch result {
+                case .success(let message):
+                    gate.resume(returning: .message(message))
+                case .failure(let error):
+                    gate.resume(returning: .failure(error.localizedDescription))
+                }
+            }
         }
     }
 
@@ -15175,6 +15467,47 @@ private final class SmaartAPIController: ObservableObject {
 
         func extractAverage(_ dictionary: [String: Any]) -> Double? {
             number(dictionary["LAeq 10"]) ?? number(dictionary["Leq 10"]) ?? number(dictionary["LCeq 10"])
+        }
+
+        func normalizedMetricName(_ value: String) -> String {
+            value
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+                .replacingOccurrences(of: "_", with: " ")
+                .replacingOccurrences(of: "-", with: " ")
+                .replacingOccurrences(of: "  ", with: " ")
+        }
+
+        func collectMetricValues(_ metrics: [[String: Any]]) -> [String: Double] {
+            var metricValues: [String: Double] = [:]
+            let nameKeys = ["name", "label", "title", "metric", "meter", "type", "id"]
+            let valueKeys = ["value", "db", "dB", "level", "levelDb", "level_db", "spl", "SPL"]
+
+            for metric in metrics {
+                for (key, value) in metric {
+                    if let numeric = number(value) {
+                        metricValues[key] = numeric
+                        metricValues[normalizedMetricName(key)] = numeric
+                    }
+                }
+
+                let metricName = nameKeys.compactMap { metric[$0] as? String }.first
+                let metricValue = valueKeys.compactMap { number(metric[$0]) }.first
+                if let metricName, let metricValue {
+                    metricValues[metricName] = metricValue
+                    metricValues[normalizedMetricName(metricName)] = metricValue
+                }
+            }
+
+            return metricValues
+        }
+
+        func metricValue(_ values: [String: Double], _ names: [String]) -> Double? {
+            for name in names {
+                if let value = values[name] { return value }
+                if let value = values[normalizedMetricName(name)] { return value }
+            }
+            return nil
         }
 
         func extractLevelColor(_ dictionary: [String: Any]) -> SmaartLevelColor? {
@@ -15241,6 +15574,34 @@ private final class SmaartAPIController: ObservableObject {
         }
 
         guard let root = json as? [String: Any] else { return [] }
+        if let metrics = root["metrics"] as? [[String: Any]] {
+            let metricValues = collectMetricValues(metrics)
+            let current = metricValue(metricValues, [
+                "SPL A Slow",
+                "SPL Slow",
+                "SPL A Fast",
+                "SPL Fast",
+                "SPL",
+                "LAeq 1",
+                "Leq 1"
+            ])
+            if let current {
+                let peak = metricValue(metricValues, ["Peak A", "LCpeak", "Peak"]) ?? -999.0
+                let average10 = metricValue(metricValues, ["LAeq 10", "Leq 10", "LCeq 10"])
+                let name = (root["channelName"] as? String) ??
+                    (root["deviceName"] as? String) ??
+                    "SPL"
+                return [SmaartChannel(
+                    id: "smaart-\(name)",
+                    name: name,
+                    dB: current,
+                    peakDB: peak,
+                    average10MinDB: average10,
+                    levelColor: extractLevelColor(root)
+                )]
+            }
+        }
+
         for key in ["meters", "channels", "data", "result", "inputs", "outputs", "levels", "measurements", "payload", "value", "values", "message", "response", "meterArray"] {
             if let array = root[key] as? [[String: Any]] {
                 return array.enumerated().map { index, dictionary in
@@ -16366,6 +16727,12 @@ private struct RunOfShowTabView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(!show.isLiveActive || !canEdit)
 
+                Button("Complete") {
+                    completeLive(show)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!show.isLiveActive || !canEdit)
+
                 Button("Reset") {
                     resetLive(show)
                 }
@@ -16375,6 +16742,10 @@ private struct RunOfShowTabView: View {
 
             TimelineView(.periodic(from: .now, by: 1)) { context in
                 liveSnapshot(show: show, now: context.date)
+            }
+
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                eventTrackingView(show: show, now: context.date)
             }
         }
         .padding()
@@ -16844,6 +17215,168 @@ private struct RunOfShowTabView: View {
         .background(Color.black)
     }
 
+    private func eventTrackingView(show: RunOfShowDocument, now: Date) -> some View {
+        let records = show.liveEventTrackingRecords.sorted {
+            if $0.position != $1.position { return $0.position < $1.position }
+            return $0.startedAt < $1.startedAt
+        }
+        let activeItem = show.isLiveActive ? show.liveCurrentItemID.flatMap { id in show.sortedItems.first(where: { $0.id == id }) } : nil
+        let activeActualSeconds = activeItem.map { show.actualRuntimeSeconds(for: $0.id, at: now) ?? 0 }
+        let activeItemID = activeItem?.id
+        let completedActualTotal = records
+            .filter { $0.itemID != activeItemID }
+            .reduce(0) { $0 + $1.actualSeconds }
+        let actualTotal = completedActualTotal + (activeActualSeconds ?? 0)
+        let overage = actualTotal - show.totalDurationSeconds
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Event Tracking")
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                    Text(show.liveTrackingCompletedAt.map { "Completed \($0.formatted(date: .abbreviated, time: .shortened))" } ?? "Live run metrics")
+                        .font(.caption)
+                        .foregroundStyle(Color.white.opacity(0.58))
+                }
+                Spacer()
+                Text(show.liveTrackingCompletedAt == nil ? "Tracking" : "Complete")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(show.liveTrackingCompletedAt == nil ? .orange : .green)
+            }
+
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 2), spacing: 8) {
+                trackingSummaryCard(title: "Planned", value: formatDurationLabel(seconds: show.totalDurationSeconds), color: .white)
+                trackingSummaryCard(title: "Actual", value: formatDurationLabel(seconds: actualTotal), color: .white)
+                trackingSummaryCard(title: "Overage", value: signedDurationLabel(seconds: overage), color: overage > 0 ? .orange : .green)
+                trackingSummaryCard(title: "Items", value: "\(records.count) / \(show.sortedItems.count)", color: .white)
+            }
+
+            VStack(spacing: 0) {
+                ForEach(records.filter { $0.itemID != activeItemID }) { record in
+                    trackingRecordRow(record)
+                }
+                if let activeItem, let activeActualSeconds {
+                    trackingActiveRow(item: activeItem, actualSeconds: activeActualSeconds)
+                }
+                if records.isEmpty && activeItem == nil {
+                    Text("Start Live to capture timing and SPL metrics.")
+                        .font(.caption)
+                        .foregroundStyle(Color.white.opacity(0.62))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                }
+            }
+            .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            if !show.liveTrackingSessions.isEmpty {
+                savedTrackingSessionsView(show.liveTrackingSessions)
+            }
+        }
+        .padding(14)
+        .background(Color(red: 0.08, green: 0.09, blue: 0.11), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private func savedTrackingSessionsView(_ sessions: [RunOfShowTrackingSession]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Saved Sessions")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+            ForEach(sessions.prefix(4)) { session in
+                DisclosureGroup {
+                    VStack(spacing: 0) {
+                        ForEach(session.records) { record in
+                            trackingRecordRow(record)
+                        }
+                    }
+                    .padding(.top, 8)
+                } label: {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(session.completedAt.formatted(date: .abbreviated, time: .shortened))
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.white)
+                        HStack {
+                            Text("Actual \(formatDurationLabel(seconds: session.actualSeconds))")
+                            Text("Overage \(signedDurationLabel(seconds: session.actualSeconds - session.plannedSeconds))")
+                            Text("\(session.records.count) items")
+                        }
+                        .font(.caption2)
+                        .foregroundStyle(Color.white.opacity(0.62))
+                    }
+                }
+                .padding(10)
+                .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+        }
+    }
+
+    private func trackingSummaryCard(title: String, value: String, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title.uppercased())
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(Color.white.opacity(0.46))
+            Text(value)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(color)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func trackingRecordRow(_ record: RunOfShowEventTrackingRecord) -> some View {
+        let delta = record.actualSeconds - record.plannedSeconds
+        return VStack(alignment: .leading, spacing: 6) {
+            Text(record.title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+            HStack {
+                trackingMetric("Planned", formatDurationLabel(seconds: record.plannedSeconds))
+                trackingMetric("Actual", formatDurationLabel(seconds: record.actualSeconds))
+                trackingMetric("+/-", signedDurationLabel(seconds: delta), color: delta > 0 ? .orange : (delta < 0 ? .green : Color.white.opacity(0.72)))
+                trackingMetric("Peak", splValue(record.splPeakDB), color: record.splPeakDB == nil ? Color.white.opacity(0.4) : .orange)
+                trackingMetric("Avg", splValue(record.splAverageDB), color: record.splAverageDB == nil ? Color.white.opacity(0.4) : .green)
+            }
+        }
+        .padding(12)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
+        }
+    }
+
+    private func trackingActiveRow(item: RunOfShowItem, actualSeconds: Int) -> some View {
+        let delta = actualSeconds - item.durationSeconds
+        return VStack(alignment: .leading, spacing: 6) {
+            Text(item.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : item.title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.orange)
+            HStack {
+                trackingMetric("Planned", formatDurationLabel(seconds: item.durationSeconds))
+                trackingMetric("Actual", formatDurationLabel(seconds: actualSeconds), color: .orange)
+                trackingMetric("+/-", signedDurationLabel(seconds: delta), color: delta > 0 ? .orange : .green)
+                trackingMetric("Peak", "-", color: Color.white.opacity(0.4))
+                trackingMetric("Avg", "-", color: Color.white.opacity(0.4))
+            }
+        }
+        .padding(12)
+    }
+
+    private func trackingMetric(_ label: String, _ value: String, color: Color = Color.white.opacity(0.72)) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(Color.white.opacity(0.4))
+            Text(value)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(color)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     private func liveSnapshotHeader(remaining: Int, endTimeText: String, currentTitle: String, currentItemSummary: String) -> some View {
         let isOverrun = remaining < 0
         return HStack(spacing: 0) {
@@ -17304,8 +17837,16 @@ private struct RunOfShowTabView: View {
     }
 
     private func moveLive(_ show: RunOfShowDocument, direction: Int) {
+        let spl = SmaartAPIController.shared.trackingSnapshot(since: show.currentLiveTrackingStartedAt())
         updateShow(show) { mutable in
-            mutable.moveLiveSession(direction: direction, at: Date())
+            mutable.moveLiveSession(direction: direction, at: Date(), splPeakDB: spl.peakDB, splAverageDB: spl.averageDB)
+        }
+    }
+
+    private func completeLive(_ show: RunOfShowDocument) {
+        let spl = SmaartAPIController.shared.trackingSnapshot(since: show.currentLiveTrackingStartedAt())
+        updateShow(show) { mutable in
+            mutable.completeLiveSession(at: Date(), splPeakDB: spl.peakDB, splAverageDB: spl.averageDB)
         }
     }
 
@@ -17399,6 +17940,27 @@ private struct RunOfShowTabView: View {
         let minutes = max(seconds, 0) / 60
         let remainingSeconds = max(seconds, 0) % 60
         return String(format: "%d:%02d", minutes, remainingSeconds)
+    }
+
+    private func formatDurationLabel(seconds: Int) -> String {
+        let clamped = max(seconds, 0)
+        let hours = clamped / 3600
+        let minutes = (clamped % 3600) / 60
+        if hours > 0 {
+            return "\(hours)h \(minutes)m"
+        }
+        return "\(minutes)m"
+    }
+
+    private func signedDurationLabel(seconds: Int) -> String {
+        if seconds == 0 { return "-" }
+        let sign = seconds > 0 ? "+" : "-"
+        return "\(sign)\(formatDurationLabel(seconds: abs(seconds)))"
+    }
+
+    private func splValue(_ value: Double?) -> String {
+        guard let value else { return "-" }
+        return String(format: "%.1f", value)
     }
 
     private func addStagePlotItem(to show: RunOfShowDocument, role: RunOfShowStagePlotRole) {
@@ -18035,6 +18597,8 @@ private struct MainTabView: View {
                 outputColumnTitle,
                 "Universe",
                 "Notes",
+                "Microphone",
+                "Monitor",
                 "Category",
                 "Campus",
                 "Room",
@@ -18048,6 +18612,8 @@ private struct MainTabView: View {
                     patch.output,
                     patch.universe ?? "",
                     patch.notes,
+                    patch.micboardMicrophone,
+                    patch.micboardInEarMonitor,
                     patch.category,
                     patch.campus,
                     patch.room,
