@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<installer-gui-script minSpecVersion="1">
+    <title>NDI SDK</title>
+    <license file="NDI SDK License Agreement.rtf"/>
+    <pkg-ref id="com.newtek.NDI.SDK">
+        <bundle-version/>
+    </pkg-ref>
+    <options customize="always" require-scripts="false" rootVolumeOnly="true" hostArchitectures="arm64,x86_64"/>
+    <choices-outline>
+        <line choice="com.newtek.NDI.SDK"/>
+    </choices-outline>
+    <choice id="com.newtek.NDI.SDK" visible="true" customLocation="Library" customLocationAllowAlternateVolumes="false" description="Please choose an install location that is not the root of your drive." title="Set install location">
+        <pkg-ref id="com.newtek.NDI.SDK"/>
+    </choice>
+    <pkg-ref id="com.newtek.NDI.SDK" onConclusion="none" version="6.3.1.0.260217" installKBytes="904307" updateKBytes="0">#NDI_SDK_Component.pkg</pkg-ref>
+    <product version="6.3.1.0.260217"/>
+</installer-gui-script>

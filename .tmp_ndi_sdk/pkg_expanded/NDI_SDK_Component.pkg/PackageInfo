@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<pkg-info overwrite-permissions="true" relocatable="false" identifier="com.newtek.NDI.SDK" postinstall-action="none" version="6.3.1.0.260217" format-version="2" generator-version="InstallCmds-860 (24D81)" auth="root">
+    <payload numberOfFiles="207" installKBytes="904307"/>
+    <bundle-version/>
+    <upgrade-bundle/>
+    <update-bundle/>
+    <atomic-update-bundle/>
+    <strict-identifier/>
+    <relocate/>
+</pkg-info>
