@@ -14965,6 +14965,13 @@ private struct SmaartChannel: Identifiable, Equatable {
     }
 }
 
+private struct SmaartLevelSample: Identifiable, Equatable {
+    let date: Date
+    let value: Double
+
+    var id: TimeInterval { date.timeIntervalSinceReferenceDate }
+}
+
 private enum SmaartConnectionStatus: Equatable {
     case disconnected
     case connecting
@@ -15065,6 +15072,13 @@ private final class SmaartAPIController: ObservableObject {
         let peak = channel.peakDB > -900 ? channel.peakDB : nil
         let average = channel.average10MinDB ?? (channel.dB > -900 ? channel.dB : nil)
         return (peak, average)
+    }
+
+    func levelSamples(for channelID: String, seconds: TimeInterval = 120) -> [SmaartLevelSample] {
+        let cutoff = Date().addingTimeInterval(-seconds)
+        return recentSamplesByChannelID[channelID, default: []]
+            .filter { $0.date >= cutoff }
+            .map { SmaartLevelSample(date: $0.date, value: $0.value) }
     }
 
     func restart() {
@@ -15815,6 +15829,165 @@ private struct IOSOverviewWindow<Content: View>: View {
     }
 }
 
+private struct SmaartLevelGraph: View {
+    let samples: [SmaartLevelSample]
+    let currentDB: Double
+
+    private var validSamples: [SmaartLevelSample] {
+        samples.filter { $0.value > -900 }
+    }
+
+    private var rollingAverageSamples: [SmaartLevelSample] {
+        let samples = validSamples
+        guard samples.count > 2 else { return samples }
+        return samples.enumerated().map { index, sample in
+            let lowerBound = max(0, index - 8)
+            let window = samples[lowerBound...index].map(\.value)
+            let average = window.reduce(0, +) / Double(window.count)
+            return SmaartLevelSample(date: sample.date, value: average)
+        }
+    }
+
+    private var displayRange: ClosedRange<Double> {
+        let values = validSamples.map(\.value) + (currentDB > -900 ? [currentDB] : [])
+        guard let minValue = values.min(), let maxValue = values.max() else {
+            return 40...100
+        }
+        let paddedMin = floor((minValue - 2) * 2) / 2
+        let paddedMax = ceil((maxValue + 2) * 2) / 2
+        if paddedMax - paddedMin < 6 {
+            let midpoint = (paddedMin + paddedMax) / 2
+            return (midpoint - 3)...(midpoint + 3)
+        }
+        return paddedMin...paddedMax
+    }
+
+    private var yAxisLabels: [Double] {
+        let range = displayRange
+        let top = range.upperBound
+        let middle = (range.lowerBound + range.upperBound) / 2
+        let bottom = range.lowerBound
+        return [top, middle, bottom]
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            GeometryReader { proxy in
+                let plotInsets = EdgeInsets(top: 10, leading: 36, bottom: 22, trailing: 10)
+                let plotRect = CGRect(
+                    x: plotInsets.leading,
+                    y: plotInsets.top,
+                    width: max(proxy.size.width - plotInsets.leading - plotInsets.trailing, 1),
+                    height: max(proxy.size.height - plotInsets.top - plotInsets.bottom, 1)
+                )
+                let samples = validSamples
+                let averages = rollingAverageSamples
+                let range = displayRange
+
+                ZStack(alignment: .topLeading) {
+                    Color(.systemBackground)
+
+                    smaartGrid(in: plotRect, range: range)
+
+                    if samples.count > 1 {
+                        tracePath(for: averages, in: plotRect, range: range)
+                            .stroke(Color.blue.opacity(0.82), style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+
+                        tracePath(for: samples, in: plotRect, range: range)
+                            .stroke(Color.green, style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                    } else {
+                        Text("Waiting for Smaart samples")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: plotRect.width, height: plotRect.height)
+                            .position(x: plotRect.midX, y: plotRect.midY)
+                    }
+
+                    ForEach(yAxisLabels, id: \.self) { label in
+                        Text(String(format: "%.1f", label))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .frame(width: 30, alignment: .trailing)
+                            .position(x: 16, y: yPosition(for: label, in: plotRect, range: range))
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+                )
+            }
+            .frame(height: 150)
+
+            HStack(spacing: 12) {
+                graphLegend(color: .green, label: "Live")
+                graphLegend(color: .blue, label: "Rolling avg")
+                Spacer(minLength: 0)
+                Text("Last 2 min")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func smaartGrid(in rect: CGRect, range: ClosedRange<Double>) -> some View {
+        Path { path in
+            for index in 0...4 {
+                let x = rect.minX + rect.width * CGFloat(index) / 4
+                path.move(to: CGPoint(x: x, y: rect.minY))
+                path.addLine(to: CGPoint(x: x, y: rect.maxY))
+            }
+
+            for index in 0...4 {
+                let y = rect.minY + rect.height * CGFloat(index) / 4
+                path.move(to: CGPoint(x: rect.minX, y: y))
+                path.addLine(to: CGPoint(x: rect.maxX, y: y))
+            }
+        }
+        .stroke(Color.primary.opacity(0.22), lineWidth: 0.7)
+    }
+
+    private func tracePath(for samples: [SmaartLevelSample], in rect: CGRect, range: ClosedRange<Double>) -> Path {
+        Path { path in
+            guard let firstDate = samples.first?.date,
+                  let lastDate = samples.last?.date,
+                  firstDate < lastDate
+            else { return }
+
+            let totalDuration = max(lastDate.timeIntervalSince(firstDate), 1)
+            for (index, sample) in samples.enumerated() {
+                let xProgress = sample.date.timeIntervalSince(firstDate) / totalDuration
+                let point = CGPoint(
+                    x: rect.minX + rect.width * CGFloat(xProgress),
+                    y: yPosition(for: sample.value, in: rect, range: range)
+                )
+                if index == 0 {
+                    path.move(to: point)
+                } else {
+                    path.addLine(to: point)
+                }
+            }
+        }
+    }
+
+    private func yPosition(for value: Double, in rect: CGRect, range: ClosedRange<Double>) -> CGFloat {
+        let clamped = min(max(value, range.lowerBound), range.upperBound)
+        let progress = (clamped - range.lowerBound) / max(range.upperBound - range.lowerBound, 0.1)
+        return rect.maxY - rect.height * CGFloat(progress)
+    }
+
+    private func graphLegend(color: Color, label: String) -> some View {
+        HStack(spacing: 5) {
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(color)
+                .frame(width: 16, height: 3)
+            Text(label)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
 private struct OverviewTabView: View {
     @EnvironmentObject private var store: ProdConnectStore
     @AppStorage(iOSOverviewSourcesStorageKey) private var overviewSourcesRawValue = defaultIOSOverviewSourcesRawValue
@@ -16027,6 +16200,11 @@ private struct OverviewTabView: View {
             Text("Current dB SPL")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            SmaartLevelGraph(
+                samples: smaartController.levelSamples(for: channel.id),
+                currentDB: channel.dB
+            )
 
             HStack(spacing: 10) {
                 smaartMetric(label: "Peak", value: channel.compactPeak)

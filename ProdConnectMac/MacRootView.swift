@@ -555,6 +555,7 @@ private enum MacRoute: String, CaseIterable, Identifiable {
     case checklists
     case ideas
     case overview
+    case smaartMultiview
     case customize
     case users
     case account
@@ -572,6 +573,7 @@ private enum MacRoute: String, CaseIterable, Identifiable {
         case .checklists: return "Checklist"
         case .ideas: return "Ideas"
         case .overview: return "Overview"
+        case .smaartMultiview: return "Venue Monitor"
         case .customize: return "Settings"
         case .users: return "Users"
         case .account: return "Account"
@@ -589,6 +591,7 @@ private enum MacRoute: String, CaseIterable, Identifiable {
         case .checklists: return "checklist"
         case .ideas: return "lightbulb"
         case .overview: return "square.grid.2x2"
+        case .smaartMultiview: return "waveform.path.ecg.rectangle"
         case .customize: return "slider.horizontal.3"
         case .users: return "person.3"
         case .account: return "person.crop.circle"
@@ -688,6 +691,8 @@ struct MacRootView: View {
                 return store.canUseTickets
             case .overview:
                 return store.user?.normalizedSubscriptionTier != "free"
+            case .smaartMultiview:
+                return (store.user?.subscriptionTierRank ?? 0) >= 3
             case .users:
                 return store.user?.isAdmin == true || store.user?.isOwner == true
             default:
@@ -870,6 +875,9 @@ struct MacRootView: View {
             MacOverviewMultiview()
                 .environmentObject(store)
                 .environmentObject(ndiSettings)
+        case .smaartMultiview:
+            MacSmaartMultiview()
+                .environmentObject(store)
         case .customize:
             MacSettingsView()
                 .environmentObject(store)
@@ -912,21 +920,18 @@ private struct MacSidebarRouteDropDelegate: DropDelegate {
     let persistRoutes: ([MacRoute]) -> Void
 
     func dropEntered(info: DropInfo) {
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
         guard let draggingRoute,
               draggingRoute != targetRoute,
               let fromIndex = routes.firstIndex(of: draggingRoute),
-              let toIndex = routes.firstIndex(of: targetRoute) else {
-            self.draggingRoute = nil
-            return false
-        }
+              let toIndex = routes.firstIndex(of: targetRoute) else { return }
 
         var reordered = routes
         let moved = reordered.remove(at: fromIndex)
         reordered.insert(moved, at: toIndex)
         persistRoutes(reordered)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
         self.draggingRoute = nil
         return true
     }
@@ -3125,6 +3130,13 @@ struct SmaartChannel: Identifiable, Equatable {
     }
 }
 
+struct SmaartLevelSample: Identifiable, Equatable {
+    let date: Date
+    let value: Double
+
+    var id: TimeInterval { date.timeIntervalSinceReferenceDate }
+}
+
 enum SmaartConnectionStatus: Equatable {
     case disconnected
     case connecting
@@ -3150,7 +3162,7 @@ enum SmaartConnectionStatus: Equatable {
     }
 }
 
-struct SmaartSettings: Codable {
+struct SmaartSettings: Codable, Equatable {
     var isEnabled: Bool = false
     var host: String = "localhost"
     var port: Int = 9090
@@ -3200,10 +3212,11 @@ final class SmaartAPIController: ObservableObject {
         config.timeoutIntervalForRequest = 3.0
         return URLSession(configuration: config)
     }()
-
-    func applySettings(_ newSettings: SmaartSettings) {
+    func applySettings(_ newSettings: SmaartSettings, persist: Bool = true) {
         settings = newSettings
-        settings.save()
+        if persist {
+            settings.save()
+        }
         restart()
     }
 
@@ -3222,6 +3235,13 @@ final class SmaartAPIController: ObservableObject {
         let peak = channel.peakDB > -900 ? channel.peakDB : nil
         let average = channel.average10MinDB ?? (channel.dB > -900 ? channel.dB : nil)
         return (peak, average)
+    }
+
+    func levelSamples(for channelID: String, seconds: TimeInterval = 120) -> [SmaartLevelSample] {
+        let cutoff = Date().addingTimeInterval(-seconds)
+        return recentSamplesByChannelID[channelID, default: []]
+            .filter { $0.date >= cutoff }
+            .map { SmaartLevelSample(date: $0.date, value: $0.value) }
     }
 
     func restart() {
@@ -3273,11 +3293,6 @@ final class SmaartAPIController: ObservableObject {
                         return
                     }
                     lastRawResponse = wsResponse.preview
-                }
-                if !wsResponses.isEmpty {
-                    channels = []
-                    connectionStatus = .error("Connected to Smaart WebSocket, but no SPL channels parsed — see raw response")
-                    return
                 }
             }
 
@@ -3331,8 +3346,50 @@ final class SmaartAPIController: ObservableObject {
                 return
             }
             let parsed = parseSmaartResponse(data)
+            if !parsed.isEmpty {
+                updateChannels(parsed)
+                connectionStatus = .connected
+                return
+            }
+
+            if settings.apiPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+               settings.apiPath.trimmingCharacters(in: .whitespacesAndNewlines) == "/" {
+                for apiResponse in await apiV3CommandResponses(from: url) {
+                    let parsed = parseSmaartResponse(apiResponse.data)
+                    if !parsed.isEmpty {
+                        lastRawResponse = apiResponse.preview
+                        updateChannels(parsed)
+                        connectionStatus = .connected
+                        return
+                    }
+                }
+
+                var triedURLs: [URL] = []
+                for candidateURL in await candidateDataURLs(from: url, html: responseText) {
+                    triedURLs.append(candidateURL)
+                    guard let (jsonData, _) = try? await fetchData(from: candidateURL) else { continue }
+                    let text = String(data: jsonData, encoding: .utf8) ?? ""
+                    guard !isHTML(text) else { continue }
+                    let parsed = parseSmaartResponse(jsonData)
+                    if !parsed.isEmpty {
+                        lastRawResponse = text.count > 800 ? String(text.prefix(800)) + "…" : text
+                        updateChannels(parsed)
+                        connectionStatus = .connected
+                        return
+                    }
+                    lastRawResponse = text.count > 800 ? String(text.prefix(800)) + "…" : text
+                }
+
+                if !triedURLs.isEmpty {
+                    lastRawResponse = await smaartDebugSummary(rootURL: url, html: responseText, triedURLs: triedURLs)
+                }
+                channels = []
+                connectionStatus = .error("Connected to Smaart, but no SPL channels were found — see raw response")
+                return
+            }
+
             updateChannels(parsed)
-            connectionStatus = parsed.isEmpty ? .error("Connected but no channels parsed — see raw response") : .connected
+            connectionStatus = .error("Connected but no channels parsed — see raw response")
             _ = finalURL
         } catch {
             if !Task.isCancelled {
@@ -3551,7 +3608,8 @@ final class SmaartAPIController: ObservableObject {
                 } else {
                     connectionStatus = .connected
                 }
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                let retryDelaySeconds: UInt64 = channels.isEmpty ? 10 : 1
+                try? await Task.sleep(nanoseconds: retryDelaySeconds * 1_000_000_000)
             }
         }
     }
@@ -3576,7 +3634,7 @@ final class SmaartAPIController: ObservableObject {
         guard let responseData = await sendSmaartAPIRequest(
             ["action": "get", "target": "activeCalibratedInputs"],
             rootURL: rootURL,
-            apiPaths: ["/api/v4/", "/api/v3/"],
+            apiPaths: ["/api/v3/"],
             expectedResponse: { data in
                 !self.extractSmaartStreamEndpoints(from: data).isEmpty
             }
@@ -3659,23 +3717,66 @@ final class SmaartAPIController: ObservableObject {
     }
 
     private func extractSmaartStreamEndpoints(from data: Data) -> [SmaartStreamEndpoint] {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let response = json["response"] as? [String: Any],
-              let devices = response["devices"] as? [[String: Any]]
-        else { return [] }
+        guard let json = try? JSONSerialization.jsonObject(with: data) else { return [] }
 
-        return devices.flatMap { device -> [SmaartStreamEndpoint] in
-            let deviceName = device["deviceName"] as? String ?? "Smaart"
-            let channels = device["activeCalibratedChannels"] as? [[String: Any]] ?? []
-            return channels.compactMap { channel in
-                guard let endpoint = channel["streamEndpoint"] as? String, !endpoint.isEmpty else { return nil }
-                let channelName = channel["channelName"] as? String ?? deviceName
-                return SmaartStreamEndpoint(name: channelName, path: endpoint)
+        func string(_ value: Any?) -> String? {
+            guard let text = value as? String else { return nil }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+
+        func endpointPath(in dictionary: [String: Any]) -> String? {
+            for key in ["streamEndpoint", "stream_endpoint", "endpoint", "path", "url"] {
+                guard let candidate = string(dictionary[key]) else { continue }
+                let lowercased = candidate.lowercased()
+                if key.localizedCaseInsensitiveContains("stream") ||
+                   lowercased.hasPrefix("ws://") ||
+                   lowercased.hasPrefix("wss://") ||
+                   lowercased.contains("stream") ||
+                   lowercased.contains("spl") ||
+                   lowercased.contains("meter") {
+                    return candidate
+                }
             }
+            return nil
+        }
+
+        func displayName(in dictionary: [String: Any], fallback: String) -> String {
+            string(dictionary["channelName"]) ??
+            string(dictionary["deviceName"]) ??
+            string(dictionary["name"]) ??
+            string(dictionary["label"]) ??
+            string(dictionary["id"]) ??
+            fallback
+        }
+
+        func collectEndpoints(from value: Any, fallbackName: String = "Smaart") -> [SmaartStreamEndpoint] {
+            if let dictionary = value as? [String: Any] {
+                let name = displayName(in: dictionary, fallback: fallbackName)
+                var endpoints: [SmaartStreamEndpoint] = []
+                if let endpoint = endpointPath(in: dictionary) {
+                    endpoints.append(SmaartStreamEndpoint(name: name, path: endpoint))
+                }
+                for nestedValue in dictionary.values {
+                    endpoints.append(contentsOf: collectEndpoints(from: nestedValue, fallbackName: name))
+                }
+                return endpoints
+            }
+
+            if let array = value as? [Any] {
+                return array.flatMap { collectEndpoints(from: $0, fallbackName: fallbackName) }
+            }
+
+            return []
+        }
+
+        var seen = Set<String>()
+        return collectEndpoints(from: json).filter { endpoint in
+            seen.insert(endpoint.path).inserted
         }
     }
 
-    private func smaartWebSocketURLs(rootURL: URL) async -> [URL] {
+    private func smaartWebSocketURLs(rootURL: URL, includeAssetDiscovery: Bool = true) async -> [URL] {
         var urls: [URL] = []
         func append(_ path: String) {
             guard var components = URLComponents(url: rootURL, resolvingAgainstBaseURL: false) else { return }
@@ -3690,26 +3791,19 @@ final class SmaartAPIController: ObservableObject {
         append("/api/v3/")
         append("/api/v4/")
         append("/api/v3/stream")
-        append("/api/v3/stream/")
         append("/api/v3/SPL")
-        append("/api/v3/spl")
         append("/api/v3/meter")
         append("/api/v3/meters")
         append("/api/v3/meterArray")
         append("/stream")
-        append("/stream/")
         append("/spl")
-        append("/SPL")
         append("/meters")
         append("/meterArray")
-        append("/splStream")
-        append("/meterStream")
-        append("/live")
-        append("/live/spl")
 
-        if let rootData = try? await fetchData(from: rootURL).0,
+        if includeAssetDiscovery,
+           let rootData = try? await fetchData(from: rootURL).0,
            let html = String(data: rootData, encoding: .utf8) {
-            for assetURL in assetURLs(in: html, relativeTo: rootURL).prefix(8) {
+            for assetURL in assetURLs(in: html, relativeTo: rootURL).prefix(3) {
                 guard let (assetData, _) = try? await fetchData(from: assetURL),
                       let assetText = String(data: assetData, encoding: .utf8)
                 else { continue }
@@ -3841,10 +3935,13 @@ final class SmaartAPIController: ObservableObject {
         }
     }
 
-    private func receiveWebSocketMessage(_ task: URLSessionWebSocketTask, timeoutSeconds: Double) async -> SmaartWebSocketReceiveResult {
+    private func receiveWebSocketMessage(_ task: URLSessionWebSocketTask, timeoutSeconds: Double, cancelOnTimeout: Bool = true) async -> SmaartWebSocketReceiveResult {
         await withCheckedContinuation { continuation in
             let gate = ContinuationGate<SmaartWebSocketReceiveResult>(continuation)
             let timeout = DispatchWorkItem {
+                if cancelOnTimeout {
+                    task.cancel(with: .goingAway, reason: nil)
+                }
                 gate.resume(returning: .failure("Timed out after \(String(format: "%.1f", timeoutSeconds))s"))
             }
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeoutSeconds, execute: timeout)
@@ -3855,6 +3952,19 @@ final class SmaartAPIController: ObservableObject {
                     gate.resume(returning: .message(message))
                 case .failure(let error):
                     gate.resume(returning: .failure(error.localizedDescription))
+                }
+            }
+        }
+    }
+
+    private func receiveWebSocketMessage(_ task: URLSessionWebSocketTask) async -> SmaartWebSocketReceiveResult {
+        await withCheckedContinuation { continuation in
+            task.receive { result in
+                switch result {
+                case .success(let message):
+                    continuation.resume(returning: .message(message))
+                case .failure(let error):
+                    continuation.resume(returning: .failure(error.localizedDescription))
                 }
             }
         }
@@ -4142,6 +4252,7 @@ final class SmaartAPIController: ObservableObject {
             (d["channel"] as? String) ??
             (d["label"] as? String) ??
             (d["input"] as? String) ??
+            (d["metric"] as? String) ??
             "Ch \(index + 1)"
         }
 
@@ -4194,6 +4305,35 @@ final class SmaartAPIController: ObservableObject {
         }
 
         if let root = json as? [String: Any] {
+            if let loggedData = root["loggedData"] as? [[String: Any]],
+               let latest = loggedData.last,
+               let db = number(latest["value"]) {
+                let name = (root["metric"] as? String) ??
+                    (root["name"] as? String) ??
+                    (root["channelName"] as? String) ??
+                    "SPL"
+                return [SmaartChannel(
+                    id: "smaart-logged-\(name)",
+                    name: name,
+                    dB: db,
+                    peakDB: db,
+                    levelColor: extractLevelColor(latest)
+                )]
+            }
+
+            if let db = number(root["value"]),
+               let metricName = root["metric"] as? String {
+                let peak = extractPeak(root, fallback: db)
+                return [SmaartChannel(
+                    id: "smaart-metric-\(metricName)",
+                    name: metricName,
+                    dB: db,
+                    peakDB: peak,
+                    average10MinDB: number(root["average"]) ?? number(root["avg"]),
+                    levelColor: extractLevelColor(root)
+                )]
+            }
+
             if let metrics = root["metrics"] as? [[String: Any]] {
                 let metricValues = collectMetricValues(metrics)
                 let current = metricValue(metricValues, [
@@ -4656,7 +4796,7 @@ final class MacNDISettingsController: ObservableObject {
             let selectedRunOfShow = runOfShow(for: feed)
             if feed.sourceType == .overview {
                 feedController.liveOverviewTilesProvider = { [weak self] in
-                    self?.overviewTiles(for: feed, rowLimit: nil, now: Date()) ?? []
+                    self?.overviewTiles(for: feed, rowLimit: 20, now: Date()) ?? []
                 }
             }
             feedController.update(
@@ -4664,7 +4804,7 @@ final class MacNDISettingsController: ObservableObject {
                     isActive: feed.isLive,
                     title: feed.title,
                     sourceType: feed.sourceType,
-                    overviewTiles: feed.sourceType == .overview ? overviewTiles(for: feed, rowLimit: nil, now: Date()) : [],
+                    overviewTiles: feed.sourceType == .overview ? overviewTiles(for: feed, rowLimit: 20, now: Date()) : [],
                     category: feed.category,
                     runOfShow: selectedRunOfShow,
                     micboardItems: micboardItems(for: selectedRunOfShow),
@@ -4723,11 +4863,11 @@ final class MacNDISettingsController: ObservableObject {
     }
 
     fileprivate func overviewTiles(for feed: MacNDIFeedConfiguration) -> [MacOverviewTileData] {
-        overviewTiles(for: feed, rowLimit: nil, now: Date())
+        overviewTiles(for: feed, rowLimit: 30, now: Date())
     }
 
     fileprivate func overviewTiles(for feed: MacNDIFeedConfiguration, now: Date) -> [MacOverviewTileData] {
-        overviewTiles(for: feed, rowLimit: nil, now: now)
+        overviewTiles(for: feed, rowLimit: 30, now: now)
     }
 
     private func overviewTiles(for feed: MacNDIFeedConfiguration, rowLimit: Int?, now: Date) -> [MacOverviewTileData] {
@@ -4812,8 +4952,14 @@ final class MacNDISettingsController: ObservableObject {
         }
 
         if source.id == MacNDIOverviewSourceID.smaart {
-            let smaartChannels = SmaartAPIController.shared.channels
-            let status = SmaartAPIController.shared.connectionStatus
+            let controller = SmaartAPIController.shared
+            let smaartChannels = controller.channels
+            let status = controller.connectionStatus
+            let samplesByChannelID = Dictionary(
+                uniqueKeysWithValues: smaartChannels.map { channel in
+                    (channel.id, controller.levelSamples(for: channel.id))
+                }
+            )
             let selectedChannelID = UserDefaults.standard.string(forKey: MacOverviewTileData.smaartSelectedChannelDefaultsKey)
             let selectedChannel = selectedChannelID.flatMap { id in
                 smaartChannels.first(where: { $0.id == id })
@@ -4836,7 +4982,8 @@ final class MacNDISettingsController: ObservableObject {
                 }),
                 smaartChannel: selectedChannel,
                 smaartChannels: smaartChannels,
-                smaartConnectionStatus: status
+                smaartConnectionStatus: status,
+                smaartSamplesByChannelID: samplesByChannelID
             )
         }
 
@@ -4970,6 +5117,15 @@ final class MacNDISettingsController: ObservableObject {
                 systemImage: route.icon,
                 accent: .indigo,
                 rows: limitedRows(members.map { $0.displayName.isEmpty ? $0.email : $0.displayName }, rowLimit: rowLimit)
+            )
+        case .smaartMultiview:
+            return MacOverviewTileData(
+                id: source.id,
+                title: route.title,
+                subtitle: "Premium venue monitoring",
+                systemImage: route.icon,
+                accent: .green,
+                rows: ["Multiple SPL feeds", "Live levels and graph history"]
             )
         case .overview, .customize, .account:
             return MacOverviewTileData(id: source.id, title: route.title, subtitle: "Settings", systemImage: route.icon, accent: .gray, rows: [])
@@ -5203,6 +5359,22 @@ struct MacLTCAudioSourceDescriptor: Identifiable, Equatable {
     let name: String
 }
 
+#if canImport(CoreMIDI)
+private func copiedMIDIPackets(from packetList: UnsafePointer<MIDIPacketList>) -> [[UInt8]] {
+    var packets: [[UInt8]] = []
+    var packet = packetList.pointee.packet
+    for _ in 0..<packetList.pointee.numPackets {
+        let length = Int(packet.length)
+        let bytes = withUnsafeBytes(of: packet.data) { rawBuffer in
+            Array(rawBuffer.prefix(length))
+        }
+        packets.append(bytes)
+        packet = MIDIPacketNext(&packet).pointee
+    }
+    return packets
+}
+#endif
+
 enum MacExternalTimecodeInputMode: String, CaseIterable, Identifiable {
     case mtc
     case ltc
@@ -5422,8 +5594,13 @@ final class MacExternalTimecodeController: ObservableObject {
     private func configureMIDI() {
         MIDIClientCreateWithBlock("ProdConnect External Timecode MIDI" as CFString, &midiClient) { _ in }
         MIDIInputPortCreateWithBlock(midiClient, "ProdConnect Timecode Input" as CFString, &inputPort) { [weak self] packetList, _ in
-            guard let self else { return }
-            self.handle(packetList: packetList)
+            let packets = copiedMIDIPackets(from: packetList)
+            Task { @MainActor in
+                guard let self else { return }
+                for bytes in packets {
+                    self.handle(bytes: bytes)
+                }
+            }
         }
         if selectedMIDISourceID == nil {
             selectedMIDISourceID = midiSources.first?.id
@@ -5450,18 +5627,6 @@ final class MacExternalTimecodeController: ObservableObject {
            let source = midiSourceRef(for: connectedSourceID) {
             MIDIPortDisconnectSource(inputPort, source)
             self.connectedSourceID = nil
-        }
-    }
-
-    private func handle(packetList: UnsafePointer<MIDIPacketList>) {
-        var packet = packetList.pointee.packet
-        for _ in 0..<packetList.pointee.numPackets {
-            let length = Int(packet.length)
-            let bytes = withUnsafeBytes(of: packet.data) { rawBuffer in
-                Array(rawBuffer.prefix(length))
-            }
-            handle(bytes: bytes)
-            packet = MIDIPacketNext(&packet).pointee
         }
     }
 
@@ -5543,6 +5708,8 @@ private struct MacLTCDecodedTimecode {
 private final class MacLTCAudioCaptureProcessor: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
     private var decoder = MacLTCDecoder()
     private let onUpdate: @Sendable (MacLTCDecodedTimecode?, Double) -> Void
+    private var lastUpdateSentAt: TimeInterval = 0
+    private let minimumUpdateInterval: TimeInterval = 0.1
 
     init(onUpdate: @escaping @Sendable (MacLTCDecodedTimecode?, Double) -> Void) {
         self.onUpdate = onUpdate
@@ -5561,6 +5728,9 @@ private final class MacLTCAudioCaptureProcessor: NSObject, AVCaptureAudioDataOut
         let rms = sqrt(squaredSum / Double(samples.count))
         let level = min(1.0, max(0.0, rms * 4.0))
         let decoded = decoder.process(samples: samples, sampleRate: streamDescription.mSampleRate)
+        let now = Date.timeIntervalSinceReferenceDate
+        guard decoded != nil || now - lastUpdateSentAt >= minimumUpdateInterval else { return }
+        lastUpdateSentAt = now
         onUpdate(decoded, level)
     }
 
@@ -6002,8 +6172,13 @@ final class MacRunOfShowControlController: ObservableObject {
     private func configureMIDI() {
         MIDIClientCreateWithBlock("ProdConnect Run Of Show MIDI" as CFString, &midiClient) { _ in }
         MIDIInputPortCreateWithBlock(midiClient, "ProdConnect Input" as CFString, &inputPort) { [weak self] packetList, _ in
-            guard let self else { return }
-            self.handle(packetList: packetList)
+            let packets = copiedMIDIPackets(from: packetList)
+            Task { @MainActor in
+                guard let self else { return }
+                for bytes in packets {
+                    self.handle(bytes: bytes)
+                }
+            }
         }
         if selectedMIDISourceID == nil {
             selectedMIDISourceID = midiSources.first?.id
@@ -6025,18 +6200,6 @@ final class MacRunOfShowControlController: ObservableObject {
 
         MIDIPortConnectSource(inputPort, source, nil)
         connectedSourceID = selectedUniqueID
-    }
-
-    private func handle(packetList: UnsafePointer<MIDIPacketList>) {
-        var packet = packetList.pointee.packet
-        for _ in 0..<packetList.pointee.numPackets {
-            let length = Int(packet.length)
-            let bytes = withUnsafeBytes(of: packet.data) { rawBuffer in
-                Array(rawBuffer.prefix(length))
-            }
-            handle(bytes: bytes)
-            packet = MIDIPacketNext(&packet).pointee
-        }
     }
 
     private func handle(bytes: [UInt8]) {
@@ -6359,8 +6522,13 @@ final class MacAutomaticMessagingController: ObservableObject {
     private func configureMIDI() {
         MIDIClientCreateWithBlock("ProdConnect Automatic Messaging MIDI" as CFString, &midiClient) { _ in }
         MIDIInputPortCreateWithBlock(midiClient, "ProdConnect Messaging Input" as CFString, &inputPort) { [weak self] packetList, _ in
-            guard let self else { return }
-            self.handle(packetList: packetList)
+            let packets = copiedMIDIPackets(from: packetList)
+            Task { @MainActor in
+                guard let self else { return }
+                for bytes in packets {
+                    self.handle(bytes: bytes)
+                }
+            }
         }
         if selectedMIDISourceID == nil {
             selectedMIDISourceID = midiSources.first?.id
@@ -6382,18 +6550,6 @@ final class MacAutomaticMessagingController: ObservableObject {
 
         MIDIPortConnectSource(inputPort, source, nil)
         connectedSourceID = selectedUniqueID
-    }
-
-    private func handle(packetList: UnsafePointer<MIDIPacketList>) {
-        var packet = packetList.pointee.packet
-        for _ in 0..<packetList.pointee.numPackets {
-            let length = Int(packet.length)
-            let bytes = withUnsafeBytes(of: packet.data) { rawBuffer in
-                Array(rawBuffer.prefix(length))
-            }
-            handle(bytes: bytes)
-            packet = MIDIPacketNext(&packet).pointee
-        }
     }
 
     private func handle(bytes: [UInt8]) {
@@ -6487,7 +6643,7 @@ private struct MacOverviewMultiview: View {
             }
 
             ScrollView {
-                TimelineView(.periodic(from: .now, by: 0.1)) { context in
+                TimelineView(.periodic(from: .now, by: 1.0)) { context in
                     overviewTilesGrid(tiles: ndiSettings.overviewTiles(for: displayFeed, now: context.date))
                 }
                 .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -6565,6 +6721,723 @@ private struct MacOverviewMultiview: View {
             get: { ndiSettings.feeds[index][keyPath: keyPath] },
             set: { ndiSettings.updateFeedValue($0, at: index, keyPath: keyPath) }
         )
+    }
+}
+
+private struct MacSmaartLevelGraph: View {
+    let samples: [SmaartLevelSample]
+    let currentDB: Double
+    var scale: Double = 1
+    var foregroundColor: Color = .primary
+    var secondaryColor: Color = .secondary
+    var backgroundColor: Color = Color.black.opacity(0.08)
+    var gridColor: Color = Color.primary.opacity(0.18)
+    var height: Double = 150
+    var timeWindow: TimeInterval = 120
+
+    private var validSamples: [SmaartLevelSample] {
+        let cutoff = Date().addingTimeInterval(-timeWindow)
+        return samples.filter { $0.value > -900 && $0.date >= cutoff }
+    }
+
+    private var rollingAverageSamples: [SmaartLevelSample] {
+        let samples = validSamples
+        guard samples.count > 2 else { return samples }
+        return samples.enumerated().map { index, sample in
+            let lowerBound = max(0, index - 8)
+            let window = samples[lowerBound...index].map(\.value)
+            let average = window.reduce(0, +) / Double(window.count)
+            return SmaartLevelSample(date: sample.date, value: average)
+        }
+    }
+
+    private var displayRange: ClosedRange<Double> {
+        let values = validSamples.map(\.value) + (currentDB > -900 ? [currentDB] : [])
+        guard let minValue = values.min(), let maxValue = values.max() else {
+            return 40...100
+        }
+        let paddedMin = floor((minValue - 2) * 2) / 2
+        let paddedMax = ceil((maxValue + 2) * 2) / 2
+        if paddedMax - paddedMin < 6 {
+            let midpoint = (paddedMin + paddedMax) / 2
+            return (midpoint - 3)...(midpoint + 3)
+        }
+        return paddedMin...paddedMax
+    }
+
+    private var yAxisLabels: [Double] {
+        let range = displayRange
+        return [range.upperBound, (range.lowerBound + range.upperBound) / 2, range.lowerBound]
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6 * scale) {
+            GeometryReader { proxy in
+                let plotInsets = EdgeInsets(top: 8 * scale, leading: 36 * scale, bottom: 18 * scale, trailing: 8 * scale)
+                let plotRect = CGRect(
+                    x: plotInsets.leading,
+                    y: plotInsets.top,
+                    width: max(proxy.size.width - plotInsets.leading - plotInsets.trailing, 1),
+                    height: max(proxy.size.height - plotInsets.top - plotInsets.bottom, 1)
+                )
+                let samples = validSamples
+                let averages = rollingAverageSamples
+                let range = displayRange
+                let endDate = Date()
+                let startDate = endDate.addingTimeInterval(-timeWindow)
+
+                ZStack(alignment: .topLeading) {
+                    backgroundColor
+
+                    gridPath(in: plotRect)
+                        .stroke(gridColor, lineWidth: max(0.6, 0.7 * scale))
+
+                    if samples.count > 1 {
+                        tracePath(for: averages, in: plotRect, range: range, startDate: startDate, endDate: endDate)
+                            .stroke(Color.blue.opacity(0.84), style: StrokeStyle(lineWidth: max(1.2, 2 * scale), lineCap: .round, lineJoin: .round))
+
+                        tracePath(for: samples, in: plotRect, range: range, startDate: startDate, endDate: endDate)
+                            .stroke(Color.green, style: StrokeStyle(lineWidth: max(1.2, 2 * scale), lineCap: .round, lineJoin: .round))
+                    } else {
+                        Text("Waiting for Smaart samples")
+                            .font(.system(size: 11 * scale, weight: .medium))
+                            .foregroundStyle(secondaryColor)
+                            .frame(width: plotRect.width, height: plotRect.height)
+                            .position(x: plotRect.midX, y: plotRect.midY)
+                    }
+
+                    ForEach(yAxisLabels, id: \.self) { label in
+                        Text(String(format: "%.1f", label))
+                            .font(.system(size: 9 * scale, weight: .medium, design: .monospaced))
+                            .foregroundStyle(secondaryColor)
+                            .frame(width: 30 * scale, alignment: .trailing)
+                            .position(x: 16 * scale, y: yPosition(for: label, in: plotRect, range: range))
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 8 * scale, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
+                        .stroke(foregroundColor.opacity(0.12), lineWidth: max(0.7, scale))
+                )
+            }
+            .frame(height: height * scale)
+
+            HStack(spacing: 12 * scale) {
+                graphLegend(color: .green, label: "Live")
+                graphLegend(color: .blue, label: "Rolling avg")
+                Spacer(minLength: 0)
+                Text("Last 2 min")
+                    .font(.system(size: 10 * scale, weight: .semibold))
+                    .foregroundStyle(secondaryColor)
+            }
+        }
+    }
+
+    private func gridPath(in rect: CGRect) -> Path {
+        Path { path in
+            for index in 0...4 {
+                let x = rect.minX + rect.width * CGFloat(index) / 4
+                path.move(to: CGPoint(x: x, y: rect.minY))
+                path.addLine(to: CGPoint(x: x, y: rect.maxY))
+            }
+            for index in 0...4 {
+                let y = rect.minY + rect.height * CGFloat(index) / 4
+                path.move(to: CGPoint(x: rect.minX, y: y))
+                path.addLine(to: CGPoint(x: rect.maxX, y: y))
+            }
+        }
+    }
+
+    private func tracePath(for samples: [SmaartLevelSample], in rect: CGRect, range: ClosedRange<Double>, startDate: Date, endDate: Date) -> Path {
+        Path { path in
+            let totalDuration = max(endDate.timeIntervalSince(startDate), 1)
+            let windowedSamples = samples.filter { $0.date >= startDate && $0.date <= endDate }
+            guard windowedSamples.count > 1 else { return }
+
+            for (index, sample) in windowedSamples.enumerated() {
+                let xProgress = sample.date.timeIntervalSince(startDate) / totalDuration
+                let point = CGPoint(
+                    x: rect.minX + rect.width * CGFloat(xProgress),
+                    y: yPosition(for: sample.value, in: rect, range: range)
+                )
+                if index == 0 {
+                    path.move(to: point)
+                } else {
+                    path.addLine(to: point)
+                }
+            }
+        }
+    }
+
+    private func yPosition(for value: Double, in rect: CGRect, range: ClosedRange<Double>) -> CGFloat {
+        let clamped = min(max(value, range.lowerBound), range.upperBound)
+        let progress = (clamped - range.lowerBound) / max(range.upperBound - range.lowerBound, 0.1)
+        return rect.maxY - rect.height * CGFloat(progress)
+    }
+
+    private func graphLegend(color: Color, label: String) -> some View {
+        HStack(spacing: 5 * scale) {
+            RoundedRectangle(cornerRadius: 2 * scale, style: .continuous)
+                .fill(color)
+                .frame(width: 16 * scale, height: max(2, 3 * scale))
+            Text(label)
+                .font(.system(size: 10 * scale, weight: .semibold))
+                .foregroundStyle(secondaryColor)
+        }
+    }
+}
+
+private struct MacSmaartMultiviewFeed: Identifiable, Codable, Equatable {
+    var id: String = UUID().uuidString
+    var name: String = "Smaart Feed"
+    var isEnabled: Bool = true
+    var host: String = "localhost"
+    var port: Int = 9090
+    var apiPath: String = ""
+    var password: String = ""
+    var pollIntervalSeconds: Double = 0.1
+
+    var settings: SmaartSettings {
+        SmaartSettings(
+            isEnabled: isEnabled,
+            host: host,
+            port: port,
+            apiPath: apiPath,
+            password: password,
+            pollIntervalSeconds: pollIntervalSeconds
+        )
+    }
+
+    var subtitle: String {
+        let trimmedPath = apiPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let path = trimmedPath.isEmpty ? "auto" : trimmedPath
+        return "\(host):\(port) • \(path)"
+    }
+}
+
+@MainActor
+private final class MacSmaartMultiviewModel: ObservableObject {
+    static let shared = MacSmaartMultiviewModel()
+
+    @Published private(set) var feeds: [MacSmaartMultiviewFeed] = []
+
+    private var controllersByFeedID: [String: SmaartAPIController] = [:]
+    private var appliedSettingsByFeedID: [String: SmaartSettings] = [:]
+    private static let defaultsKey = "prodconnect.mac.smaartMultiview.feeds.v1"
+
+    init() {
+        feeds = Self.loadFeeds()
+        syncControllers()
+    }
+
+    func controller(for feed: MacSmaartMultiviewFeed) -> SmaartAPIController {
+        controllerInstance(for: feed)
+    }
+
+    func addFeed(_ feed: MacSmaartMultiviewFeed) {
+        feeds.append(feed)
+        Self.saveFeeds(feeds)
+        _ = ensureController(for: feed)
+    }
+
+    func updateFeed(_ feed: MacSmaartMultiviewFeed) {
+        guard let index = feeds.firstIndex(where: { $0.id == feed.id }) else { return }
+        feeds[index] = feed
+        Self.saveFeeds(feeds)
+        applySettingsIfNeeded(feed.settings, to: ensureController(for: feed), feedID: feed.id, force: true)
+    }
+
+    func moveFeed(fromID: String, toID: String) {
+        guard fromID != toID,
+              let fromIndex = feeds.firstIndex(where: { $0.id == fromID }),
+              let toIndex = feeds.firstIndex(where: { $0.id == toID })
+        else { return }
+
+        var reordered = feeds
+        let moved = reordered.remove(at: fromIndex)
+        reordered.insert(moved, at: toIndex)
+        feeds = reordered
+        Self.saveFeeds(feeds)
+    }
+
+    func deleteFeed(_ feed: MacSmaartMultiviewFeed) {
+        feeds.removeAll { $0.id == feed.id }
+        controllersByFeedID[feed.id]?.applySettings(SmaartSettings(isEnabled: false), persist: false)
+        controllersByFeedID[feed.id] = nil
+        appliedSettingsByFeedID[feed.id] = nil
+        Self.saveFeeds(feeds)
+    }
+
+    func restartAll() {
+        syncControllers(forceRestart: true)
+    }
+
+    private func syncControllers(forceRestart: Bool = false) {
+        let activeIDs = Set(feeds.map(\.id))
+        for removedID in controllersByFeedID.keys.filter({ !activeIDs.contains($0) }) {
+            controllersByFeedID[removedID]?.applySettings(SmaartSettings(isEnabled: false), persist: false)
+            controllersByFeedID[removedID] = nil
+            appliedSettingsByFeedID[removedID] = nil
+        }
+
+        for feed in feeds {
+            let controller = controllerInstance(for: feed)
+            applySettingsIfNeeded(feed.settings, to: controller, feedID: feed.id, force: forceRestart)
+        }
+    }
+
+    private func ensureController(for feed: MacSmaartMultiviewFeed) -> SmaartAPIController {
+        let controller = controllerInstance(for: feed)
+        applySettingsIfNeeded(feed.settings, to: controller, feedID: feed.id)
+        return controller
+    }
+
+    private func controllerInstance(for feed: MacSmaartMultiviewFeed) -> SmaartAPIController {
+        if let controller = controllersByFeedID[feed.id] {
+            return controller
+        }
+
+        let controller = SmaartAPIController()
+        controllersByFeedID[feed.id] = controller
+        return controller
+    }
+
+    private func applySettingsIfNeeded(_ settings: SmaartSettings, to controller: SmaartAPIController, feedID: String, force: Bool = false) {
+        guard force || appliedSettingsByFeedID[feedID] != settings else { return }
+        appliedSettingsByFeedID[feedID] = settings
+        controller.applySettings(settings, persist: false)
+    }
+
+    private static func loadFeeds() -> [MacSmaartMultiviewFeed] {
+        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+              let decoded = try? JSONDecoder().decode([MacSmaartMultiviewFeed].self, from: data)
+        else { return [] }
+        return decoded
+    }
+
+    private static func saveFeeds(_ feeds: [MacSmaartMultiviewFeed]) {
+        guard let data = try? JSONEncoder().encode(feeds) else { return }
+        UserDefaults.standard.set(data, forKey: defaultsKey)
+    }
+}
+
+private struct MacSmaartMultiview: View {
+    @EnvironmentObject private var store: ProdConnectStore
+    @StateObject private var model = MacSmaartMultiviewModel.shared
+    @State private var editingFeed: MacSmaartMultiviewFeed?
+    @State private var draggingFeedID: String?
+
+    private var hasFeatureAccess: Bool {
+        (store.user?.subscriptionTierRank ?? 0) >= 3
+    }
+
+    private var columns: [GridItem] {
+        [GridItem(.adaptive(minimum: 360, maximum: 560), spacing: 16, alignment: .top)]
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            header
+
+            if hasFeatureAccess {
+                if model.feeds.isEmpty {
+                    ContentUnavailableView {
+                        Label("No Venue Feeds", systemImage: "waveform.path.ecg.rectangle")
+                    } description: {
+                        Text("Add Smaart SPL webserver feeds to monitor them together.")
+                    } actions: {
+                        Button("Add Feed") {
+                            editingFeed = MacSmaartMultiviewFeed()
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollView {
+                        LazyVGrid(columns: columns, alignment: .leading, spacing: 16) {
+                            ForEach(model.feeds) { feed in
+                                MacSmaartFeedMonitorCard(
+                                    feed: feed,
+                                    controller: model.controller(for: feed),
+                                    onEdit: { editingFeed = feed },
+                                    onDelete: { model.deleteFeed(feed) },
+                                    isDragging: draggingFeedID == feed.id,
+                                    isDropTarget: draggingFeedID != nil && draggingFeedID != feed.id
+                                )
+                                .onDrag {
+                                    draggingFeedID = feed.id
+                                    return NSItemProvider(object: feed.id as NSString)
+                                }
+                                .onDrop(
+                                    of: [.text],
+                                    delegate: MacSmaartFeedDropDelegate(
+                                        targetFeedID: feed.id,
+                                        feeds: model.feeds,
+                                        draggingFeedID: $draggingFeedID,
+                                        moveFeed: model.moveFeed(fromID:toID:)
+                                    )
+                                )
+                            }
+                        }
+                        .padding(.bottom, 24)
+                    }
+                }
+            } else {
+                ContentUnavailableView {
+                    Label("Premium Feature", systemImage: "lock.fill")
+                } description: {
+                    Text("Venue Monitor is available with Premium and Premium W/Ticketing.")
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .padding(24)
+        .navigationTitle("Venue Monitor")
+        .toolbar {
+            ToolbarItemGroup {
+                Button {
+                    model.restartAll()
+                } label: {
+                    Label("Reconnect All", systemImage: "arrow.clockwise")
+                }
+                .disabled(!hasFeatureAccess || model.feeds.isEmpty)
+
+                Button {
+                    editingFeed = MacSmaartMultiviewFeed()
+                } label: {
+                    Label("Add Feed", systemImage: "plus")
+                }
+                .disabled(!hasFeatureAccess)
+            }
+        }
+        .sheet(item: $editingFeed) { feed in
+            MacSmaartFeedEditor(
+                initialFeed: feed,
+                onCancel: { editingFeed = nil },
+                onSave: { savedFeed in
+                    if model.feeds.contains(where: { $0.id == savedFeed.id }) {
+                        model.updateFeed(savedFeed)
+                    } else {
+                        model.addFeed(savedFeed)
+                    }
+                    editingFeed = nil
+                }
+            )
+        }
+    }
+
+    private var header: some View {
+        HStack(alignment: .center, spacing: 14) {
+            Image(systemName: "waveform.path.ecg.rectangle")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(Color.green)
+                .frame(width: 46, height: 46)
+                .background(Color.green.opacity(0.16), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Venue Monitor")
+                    .font(.largeTitle.bold())
+                Text("Monitor multiple Smaart SPL feeds across a venue on one screen.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            Button {
+                model.restartAll()
+            } label: {
+                Label("Reconnect All", systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(.bordered)
+            .disabled(!hasFeatureAccess || model.feeds.isEmpty)
+
+            Button {
+                editingFeed = MacSmaartMultiviewFeed()
+            } label: {
+                Label("Add Feed", systemImage: "plus")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!hasFeatureAccess)
+        }
+    }
+}
+
+private struct MacSmaartFeedMonitorCard: View {
+    let feed: MacSmaartMultiviewFeed
+    @ObservedObject var controller: SmaartAPIController
+    let onEdit: () -> Void
+    let onDelete: () -> Void
+    var isDragging = false
+    var isDropTarget = false
+
+    private var visibleChannels: [SmaartChannel] {
+        controller.channels.isEmpty
+            ? []
+            : controller.channels.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 10) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(feed.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Smaart Feed" : feed.name)
+                        .font(.headline)
+                        .lineLimit(1)
+                    Text(feed.subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(controller.connectionStatus.indicatorColor)
+                        .frame(width: 10, height: 10)
+                    Menu {
+                        Button("Edit", action: onEdit)
+                        Button("Reconnect") {
+                            controller.restart()
+                        }
+                        Divider()
+                        Button("Delete", role: .destructive, action: onDelete)
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                }
+            }
+
+            if !feed.isEnabled {
+                Text("Feed disabled")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            } else if visibleChannels.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(controller.connectionStatus.label)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    ProgressView()
+                        .controlSize(.small)
+                        .opacity(controller.connectionStatus == .connecting ? 1 : 0)
+                }
+                .frame(maxWidth: .infinity, minHeight: 180, alignment: .center)
+            } else {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(visibleChannels) { channel in
+                        MacSmaartFeedChannelPanel(
+                            channel: channel,
+                            samples: controller.levelSamples(for: channel.id),
+                            status: controller.connectionStatus
+                        )
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .background(Color.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(isDropTarget ? Color.accentColor.opacity(0.75) : controller.connectionStatus.indicatorColor.opacity(0.25), lineWidth: isDropTarget ? 2 : 1)
+        )
+        .overlay(alignment: .top) {
+            if isDropTarget {
+                Capsule()
+                    .fill(Color.accentColor)
+                    .frame(width: 72, height: 4)
+                    .offset(y: -2)
+            }
+        }
+        .opacity(isDragging ? 0.58 : 1)
+    }
+}
+
+private struct MacSmaartFeedDropDelegate: DropDelegate {
+    let targetFeedID: String
+    let feeds: [MacSmaartMultiviewFeed]
+    @Binding var draggingFeedID: String?
+    let moveFeed: (String, String) -> Void
+
+    func dropEntered(info: DropInfo) {
+        guard let draggingFeedID,
+              draggingFeedID != targetFeedID,
+              feeds.contains(where: { $0.id == draggingFeedID }),
+              feeds.contains(where: { $0.id == targetFeedID })
+        else { return }
+
+        moveFeed(draggingFeedID, targetFeedID)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggingFeedID = nil
+        return true
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+}
+
+private struct MacSmaartFeedChannelPanel: View {
+    let channel: SmaartChannel
+    let samples: [SmaartLevelSample]
+    let status: SmaartConnectionStatus
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(channel.name)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                Spacer()
+                Text(String(format: "%.1f", channel.dB))
+                    .font(.system(size: 34, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(channel.displayColor)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.55)
+            }
+
+            MacSmaartLevelGraph(
+                samples: samples,
+                currentDB: channel.dB,
+                foregroundColor: .primary,
+                secondaryColor: .secondary,
+                backgroundColor: Color.white.opacity(0.045),
+                gridColor: Color.primary.opacity(0.18),
+                height: 126
+            )
+
+            HStack(spacing: 10) {
+                smaartMetric("Peak", channel.compactPeak)
+                smaartMetric("Avg 10 min", channel.average10MinDB.map { String(format: "%.1f", $0) } ?? "—")
+                Circle()
+                    .fill(status.indicatorColor)
+                    .frame(width: 10, height: 10)
+            }
+        }
+        .padding(12)
+        .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func smaartMetric(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label)
+                .font(.caption2.weight(.semibold))
+                .textCase(.uppercase)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.headline.monospacedDigit())
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(9)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+private struct MacSmaartFeedEditor: View {
+    let initialFeed: MacSmaartMultiviewFeed
+    let onCancel: () -> Void
+    let onSave: (MacSmaartMultiviewFeed) -> Void
+
+    @State private var draft: MacSmaartMultiviewFeed
+    @State private var portText: String
+    @State private var pollIntervalText: String
+
+    init(
+        initialFeed: MacSmaartMultiviewFeed,
+        onCancel: @escaping () -> Void,
+        onSave: @escaping (MacSmaartMultiviewFeed) -> Void
+    ) {
+        self.initialFeed = initialFeed
+        self.onCancel = onCancel
+        self.onSave = onSave
+        self._draft = State(initialValue: initialFeed)
+        self._portText = State(initialValue: "\(initialFeed.port)")
+        self._pollIntervalText = State(initialValue: String(format: "%.2f", initialFeed.pollIntervalSeconds))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text(initialFeed.name == "Smaart Feed" ? "Add Smaart Feed" : "Edit Smaart Feed")
+                    .font(.title2.bold())
+                Spacer()
+            }
+
+            Toggle("Enabled", isOn: $draft.isEnabled)
+
+            formField("Name") {
+                TextField("FOH SPL", text: $draft.name)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            HStack(spacing: 10) {
+                formField("Host") {
+                    TextField("localhost", text: $draft.host)
+                        .textFieldStyle(.roundedBorder)
+                }
+
+                formField("Port") {
+                    TextField("9090", text: $portText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 92)
+                }
+            }
+
+            formField("API Path") {
+                TextField("Auto-detect", text: $draft.apiPath)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            formField("Password") {
+                SecureField("Optional", text: $draft.password)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            formField("Poll Interval") {
+                TextField("0.10", text: $pollIntervalText)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 92)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") {
+                    var saved = draft
+                    saved.name = saved.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? "Smaart Feed"
+                        : saved.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                    saved.host = saved.host.trimmingCharacters(in: .whitespacesAndNewlines)
+                    saved.port = Int(portText.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 9090
+                    saved.apiPath = saved.apiPath.trimmingCharacters(in: .whitespacesAndNewlines)
+                    saved.pollIntervalSeconds = max(0.05, Double(pollIntervalText.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0.1)
+                    onSave(saved)
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(draft.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(22)
+        .frame(width: 460)
+    }
+
+    private func formField<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            content()
+        }
     }
 }
 
@@ -6782,6 +7655,15 @@ private struct MacOverviewTileCard: View {
             Text("Current dB SPL")
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(.secondary)
+
+            MacSmaartLevelGraph(
+                samples: tile.smaartSamplesByChannelID[channel.id] ?? [],
+                currentDB: channel.dB,
+                foregroundColor: .primary,
+                secondaryColor: .secondary,
+                backgroundColor: Color.white.opacity(0.06),
+                gridColor: Color.primary.opacity(0.2)
+            )
 
             HStack(spacing: 10) {
                 smaartMetric(label: "Peak", value: channel.compactPeak)
@@ -7785,6 +8667,7 @@ private struct MacOverviewTileData: Identifiable {
     var smaartChannel: SmaartChannel? = nil
     var smaartChannels: [SmaartChannel] = []
     var smaartConnectionStatus: SmaartConnectionStatus = .disconnected
+    var smaartSamplesByChannelID: [String: [SmaartLevelSample]] = [:]
     var timecodeDisplay: String? = nil
     var timecodeFrameRate: String = ""
     var timecodeStatus: String = ""
@@ -8675,7 +9558,13 @@ private struct MacOverviewGridNDIPreview: View {
             } else if tile.timecodeDisplay != nil {
                 ndiTimecodeDisplay(tile, renderScale: renderScale)
             } else if let channel = tile.smaartChannel {
-                ndiSmaartMeter(channel, extraRows: tile.columnRows, connectionStatus: tile.smaartConnectionStatus, renderScale: renderScale)
+                ndiSmaartMeter(
+                    channel,
+                    samples: tile.smaartSamplesByChannelID[channel.id] ?? [],
+                    extraRows: tile.columnRows,
+                    connectionStatus: tile.smaartConnectionStatus,
+                    renderScale: renderScale
+                )
             } else if !tile.columnRows.isEmpty {
                 ndiColumnRows(tile.columnRows, renderScale: renderScale)
             } else if tile.rows.isEmpty {
@@ -8728,7 +9617,7 @@ private struct MacOverviewGridNDIPreview: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
 
-    private func ndiSmaartMeter(_ channel: SmaartChannel, extraRows: [[String]], connectionStatus: SmaartConnectionStatus, renderScale: Double? = nil) -> some View {
+    private func ndiSmaartMeter(_ channel: SmaartChannel, samples: [SmaartLevelSample], extraRows: [[String]], connectionStatus: SmaartConnectionStatus, renderScale: Double? = nil) -> some View {
         let meterScale = renderScale ?? scale
         return VStack(alignment: .leading, spacing: 9 * meterScale) {
             Text(channel.name)
@@ -8746,6 +9635,17 @@ private struct MacOverviewGridNDIPreview: View {
             Text("Current dB SPL")
                 .font(.system(size: 11 * meterScale, weight: .medium))
                 .foregroundStyle(Color.white.opacity(0.62))
+
+            MacSmaartLevelGraph(
+                samples: samples,
+                currentDB: channel.dB,
+                scale: meterScale,
+                foregroundColor: .white,
+                secondaryColor: Color.white.opacity(0.62),
+                backgroundColor: Color.white.opacity(0.055),
+                gridColor: Color.white.opacity(0.24),
+                height: 118
+            )
 
             HStack(spacing: 8 * meterScale) {
                 ndiSmaartMetric(label: "Peak", value: channel.compactPeak, renderScale: meterScale)
